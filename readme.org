@@ -137,6 +137,73 @@ crucible publish                 # export as HTML site
 - [[file:docs/architecture.org][Architecture]]: database schema, search algorithms, and design decisions
 - [[file:docs/skill.org][Skill Guide]]: how the Claude Code skill works and how to customize it
 
+* Using Crucible with Claude Code
+
+Crucible is designed to be used through [[https://claude.com/claude-code][Claude Code]]. After
+installation, Claude automatically knows about your knowledge base and
+uses it to answer questions, distill sources, and maintain the wiki.
+
+** Setup
+
+Running =crucible install= does three things that wire crucible into
+Claude Code:
+
+1. Copies the crucible skill into =~/.claude/skills/crucible/=, which
+   teaches Claude how to ingest sources, write wiki articles, and navigate
+   the graph database.
+2. Generates =MANIFEST.md=, a summary of the knowledge base contents that
+   Claude reads to decide when the wiki is relevant.
+3. Adds a directive to =~/.claude/CLAUDE.md= that tells Claude to check
+   the crucible before answering domain-specific questions.
+
+The skill triggers automatically when you say things like "ingest this",
+"what do we know about", "search the wiki", "add to crucible", or
+"distill this source". You do not need to invoke it explicitly.
+
+** Typical Session
+
+A typical conversation looks like this:
+
+#+BEGIN_EXAMPLE
+You:    What do we know about activation energies on platinum surfaces?
+Claude: [searches the wiki, reads relevant articles]
+        Based on the wiki, there are three articles covering this topic...
+        [synthesized answer with citations to wiki articles]
+
+You:    Ingest this new paper [attaches PDF]
+Claude: [registers the source, reads it, proposes articles]
+        I found three key findings. I propose:
+        - Update the activation-energy concept article with the new data
+        - Create a summary article for this paper
+        Shall I proceed?
+
+You:    Yes
+Claude: [writes the articles, runs crucible sync]
+        Done. Created wiki/summaries/smith2026.org and updated
+        wiki/concepts/activation-energy.org with the new measurements.
+
+You:    That comparison you just made between the two papers is interesting.
+        Capture that as an article.
+Claude: [writes a comparison article with DERIVED_FROM properties]
+#+END_EXAMPLE
+
+The key insight is that your explorations accumulate. Every question you
+ask, every source you ingest, and every insight you capture makes the
+knowledge base richer for next time.
+
+** Browsing Outside Claude Code
+
+You can also browse the wiki in a web browser:
+
+#+BEGIN_SRC bash
+crucible browse
+#+END_SRC
+
+This launches a local HTTP server that renders org-mode articles as HTML
+with working cross-links, citation tooltips, and a navigable sidebar.
+The about page (=/_about=) shows project paths, statistics, and the
+global registry.
+
 * How It Works
 
 ** The Distillation Loop
