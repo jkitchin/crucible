@@ -1,0 +1,17 @@
+#+TITLE: Experiment: Measuring Activation Energy of CO Oxidation
+#+DATE: 2026-04-01
+
+* Experiment Setup
+
+We prepared a Pt(111) surface and measured CO oxidation rates at
+temperatures ranging from 300K to 600K.
+
+* Results
+
+The Arrhenius plot shows a linear relationship with an activation
+energy of 1.05 eV, consistent with literature values citep:jones2023.
+
+* Conclusions
+
+The activation energy is in good agreement with DFT predictions
+from our earlier calculations cite:smith2024.

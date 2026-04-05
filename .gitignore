@@ -1,0 +1,19 @@
+# External sources (copyrighted, not shareable)
+sources/external/
+
+# Database (regenerable from wiki)
+db/crucible.db
+
+# Local settings
+.claude/settings.local.json
+
+# Build artifacts
+wiki/_build/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/

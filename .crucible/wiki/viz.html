@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Crucible Knowledge Graph</title>
+<style>
+  body { margin: 0; background: #1a1a2e; font-family: system-ui, sans-serif; }
+  svg { width: 100vw; height: 100vh; }
+  .node text { font-size: 11px; pointer-events: none; }
+  .link { stroke-opacity: 0.4; }
+  .link.link-type-link { stroke: #888; }
+  .link.link-type-concept { stroke: #444; stroke-dasharray: 3,3; }
+  .link.link-type-derivation { stroke: #e94560; }
+  #tooltip {
+    position: absolute; padding: 8px 12px; background: #16213e;
+    color: #eee; border-radius: 6px; font-size: 13px;
+    pointer-events: none; display: none; max-width: 300px;
+    border: 1px solid #0f3460;
+  }
+  #legend {
+    position: absolute; top: 12px; left: 12px; background: #16213e;
+    color: #eee; padding: 12px; border-radius: 6px; font-size: 12px;
+    border: 1px solid #0f3460;
+  }
+  #legend div { margin: 4px 0; }
+  #legend span { display: inline-block; width: 12px; height: 12px;
+    border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  #search {
+    position: absolute; top: 12px; right: 12px;
+    padding: 8px 12px; border-radius: 6px; border: 1px solid #0f3460;
+    background: #16213e; color: #eee; font-size: 14px; width: 220px;
+  }
+  #search::placeholder { color: #666; }
+</style>
+</head>
+<body>
+<div id="tooltip"></div>
+<div id="legend">
+  <strong>Crucible Knowledge Graph</strong>
+  <div><span style="background:#e94560"></span>Concept article</div>
+  <div><span style="background:#0f3460"></span>Summary</div>
+  <div><span style="background:#533483"></span>Comparison</div>
+  <div><span style="background:#1a8a5c"></span>Method</div>
+  <div><span style="background:#e9a045"></span>Topic tag</div>
+  <div style="margin-top:8px; color:#888">Drag to rearrange. Scroll to zoom.</div>
+</div>
+<input id="search" type="text" placeholder="Search nodes...">
+<svg></svg>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const data = {"nodes": [{"id": 0, "label": "Arrhenius Validation on Platinum Surfaces", "path": ".crucible/wiki/comparisons/arrhenius-validation-on-platinum.org", "type": "comparison", "status": "draft", "group": "comparison"}, {"id": 1, "label": "Activation Energy", "path": ".crucible/wiki/concepts/activation-energy.org", "type": "concept", "status": "draft", "group": "concept"}, {"id": 2, "label": "Summary: CO Oxidation Activation Energy Experiment", "path": ".crucible/wiki/summaries/test-notebook-entry.org", "type": "summary", "status": "draft", "group": "summary"}, {"id": 3, "label": "catalysis", "type": "concept", "group": "concept"}, {"id": 4, "label": "kinetics", "type": "concept", "group": "concept"}, {"id": 5, "label": "platinum", "type": "concept", "group": "concept"}, {"id": 6, "label": "thermodynamics", "type": "concept", "group": "concept"}], "edges": [{"source": 0, "target": 1, "type": "link"}, {"source": 2, "target": 1, "type": "link"}, {"source": 1, "target": 3, "type": "concept"}, {"source": 0, "target": 3, "type": "concept"}, {"source": 2, "target": 3, "type": "concept"}, {"source": 1, "target": 4, "type": "concept"}, {"source": 0, "target": 4, "type": "concept"}, {"source": 0, "target": 5, "type": "concept"}, {"source": 2, "target": 5, "type": "concept"}, {"source": 1, "target": 6, "type": "concept"}, {"source": 1, "target": 0, "type": "derivation"}, {"source": 2, "target": 0, "type": "derivation"}]};
+
+const colors = {
+  concept: "#e94560", summary: "#0f3460", comparison: "#533483",
+  method: "#1a8a5c", "concept": "#e9a045"
+};
+function nodeColor(d) {
+  if (d.type === "concept" && !d.path) return colors["concept"];
+  return colors[d.group] || "#888";
+}
+function nodeRadius(d) {
+  return d.type === "concept" && !d.path ? 6 : 10;
+}
+
+const svg = d3.select("svg");
+const width = window.innerWidth, height = window.innerHeight;
+const g = svg.append("g");
+
+svg.call(d3.zoom().scaleExtent([0.1, 8]).on("zoom", (e) => {
+  g.attr("transform", e.transform);
+}));
+
+const sim = d3.forceSimulation(data.nodes)
+  .force("link", d3.forceLink(data.edges).id(d => d.id).distance(80))
+  .force("charge", d3.forceManyBody().strength(-200))
+  .force("center", d3.forceCenter(width / 2, height / 2))
+  .force("collision", d3.forceCollide().radius(20));
+
+const link = g.append("g").selectAll("line")
+  .data(data.edges).join("line")
+  .attr("class", d => "link link-type-" + d.type)
+  .attr("stroke-width", d => d.type === "derivation" ? 2 : 1);
+
+const node = g.append("g").selectAll("g")
+  .data(data.nodes).join("g")
+  .call(d3.drag()
+    .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+    .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
+    .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
+
+node.append("circle")
+  .attr("r", nodeRadius)
+  .attr("fill", nodeColor)
+  .attr("stroke", "#fff")
+  .attr("stroke-width", 1.5);
+
+node.append("text")
+  .text(d => d.label.length > 25 ? d.label.slice(0, 23) + "..." : d.label)
+  .attr("dx", 14).attr("dy", 4)
+  .attr("fill", "#ccc");
+
+const tooltip = d3.select("#tooltip");
+node.on("mouseover", (e, d) => {
+  let html = "<strong>" + d.label + "</strong>";
+  if (d.type) html += "<br>Type: " + d.type;
+  if (d.status) html += "<br>Status: " + d.status;
+  if (d.path) html += "<br>" + d.path;
+  tooltip.html(html).style("display", "block");
+}).on("mousemove", (e) => {
+  tooltip.style("left", (e.pageX + 12) + "px").style("top", (e.pageY - 12) + "px");
+}).on("mouseout", () => tooltip.style("display", "none"))
+.on("click", (e, d) => {
+  if (d.path) {
+    const rootPath = "/Users/jkitchin/Dropbox/projects/big-ideas/crucible";
+    window.location.href = "vscode://file/" + rootPath + "/" + d.path;
+  }
+});
+node.style("cursor", d => d.path ? "pointer" : "default");
+
+sim.on("tick", () => {
+  link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+      .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+  node.attr("transform", d => "translate(" + d.x + "," + d.y + ")");
+});
+
+d3.select("#search").on("input", function() {
+  const q = this.value.toLowerCase();
+  node.select("circle").attr("opacity", d =>
+    !q || d.label.toLowerCase().includes(q) ? 1 : 0.15);
+  node.select("text").attr("opacity", d =>
+    !q || d.label.toLowerCase().includes(q) ? 1 : 0.1);
+  link.attr("opacity", d => {
+    if (!q) return 1;
+    const sn = data.nodes[typeof d.source === "object" ? d.source.id : d.source];
+    const tn = data.nodes[typeof d.target === "object" ? d.target.id : d.target];
+    return (sn.label.toLowerCase().includes(q) || tn.label.toLowerCase().includes(q)) ? 1 : 0.05;
+  });
+});
+</script>
+</body>
+</html>

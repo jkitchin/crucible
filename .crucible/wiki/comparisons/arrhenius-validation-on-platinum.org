@@ -1,0 +1,32 @@
+#+TITLE: Arrhenius Validation on Platinum Surfaces
+#+FILETAGS: :comparison:catalysis:kinetics:platinum:
+
+* Arrhenius Validation on Platinum Surfaces
+:PROPERTIES:
+:ARTICLE_TYPE: comparison
+:DERIVED_FROM: ../concepts/activation-energy.org ../summaries/test-notebook-entry.org
+:SOURCE_KEYS: test-notebook-entry
+:STATUS: draft
+:CREATED: 2026-04-03
+:END:
+
+The experimental measurements of CO oxidation on Pt(111) provide
+a direct validation of the Arrhenius relationship for this system.
+The measured activation energy of 1.05 eV, obtained from a linear
+Arrhenius plot across the 300-600K range, is consistent with both
+DFT predictions and literature values.
+
+** Consistency Between Theory and Experiment
+
+The agreement between the measured activation energy and
+computational predictions citep:smith2024 supports the use of DFT
+for screening catalyst candidates. The linearity of the Arrhenius
+plot across the full temperature range suggests a single
+rate-limiting step, simplifying kinetic modeling.
+
+** Implications for Catalyst Design
+
+This validation strengthens the case for using computed activation
+energies as descriptors in catalyst screening workflows. See
+[[file:../concepts/activation-energy.org][Activation Energy]] for
+the theoretical background.

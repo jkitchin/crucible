@@ -1,0 +1,257 @@
+#+TITLE: Crucible Tutorial
+#+DATE: [2026-04-03 Fri]
+
+* Introduction
+
+This tutorial walks through the complete crucible workflow: ingesting a
+source, distilling it into wiki articles, searching and navigating the
+knowledge base, and maintaining it over time.
+
+* Prerequisites
+
+Make sure crucible is installed and initialized:
+
+#+BEGIN_SRC bash
+cd /path/to/your/crucible
+pip install -e .
+crucible init --root .
+crucible install
+#+END_SRC
+
+For semantic search, also set up ollama:
+
+#+BEGIN_SRC bash
+ollama pull nomic-embed-text
+#+END_SRC
+
+* Ingesting Your First Source
+
+** From a PDF
+
+#+BEGIN_SRC bash
+crucible ingest paper.pdf
+#+END_SRC
+
+This copies the PDF to =sources/external/pdfs/=, extracts text (via
+pdftotext or pandoc), and registers it in the database. The output shows
+the source ID and where the text was extracted to.
+
+** From the Web
+
+Use pandoc to convert HTML to org-mode, then pipe into crucible:
+
+#+BEGIN_SRC bash
+curl -sL "https://example.com/article" \
+  | pandoc -f html -t org --wrap=none \
+  | crucible ingest - -t "Article Title" --type web --url "https://example.com/article"
+#+END_SRC
+
+** From a Notebook Entry
+
+#+BEGIN_SRC bash
+crucible ingest lab-notes-2026-04-03.org --type notebook --date 2026-04-03
+#+END_SRC
+
+Notebook entries are stored in =sources/notebooks/= and are not gitignored
+(they are your own work).
+
+** Batch Ingestion
+
+#+BEGIN_SRC bash
+crucible ingest "papers/*.pdf"
+crucible ingest "notebooks/**/*.org" --type notebook
+#+END_SRC
+
+After ingesting, check what needs distilling:
+
+#+BEGIN_SRC bash
+crucible undigested
+#+END_SRC
+
+* Distilling Sources into Wiki Articles
+
+This is where Claude does the heavy lifting. In a Claude Code session:
+
+#+BEGIN_EXAMPLE
+You: I just ingested smith2024.pdf. Distill it into the crucible.
+
+Claude: [reads the source, checks existing concepts, proposes a plan]
+  - Summary article: "Smith 2024: CO Oxidation Kinetics on Pt"
+  - New concept: "turnover frequency"
+  - Update existing: "activation-energy.org" with new data point
+  - Cross-links: to arrhenius-equation.org, catalyst-screening.org
+
+You: Looks good, go ahead.
+
+Claude: [writes org files, runs crucible sync and crucible embed]
+#+END_EXAMPLE
+
+The distillation follows a two-step process:
+
+1. *Plan*: Claude reads the source, surveys existing wiki articles, and
+   proposes what to create or update. You review and approve.
+2. *Write*: Claude writes the org files with proper metadata (properties
+   drawers, filetags, citations, cross-links) and syncs the database.
+
+* Searching the Knowledge Base
+
+** Keyword Search
+
+#+BEGIN_SRC bash
+crucible search "activation energy"
+#+END_SRC
+
+Uses FTS5 with porter stemming. Finds exact keyword matches.
+
+** Semantic Search
+
+#+BEGIN_SRC bash
+crucible search "how does temperature affect reaction rate" --mode semantic
+#+END_SRC
+
+Uses vector embeddings to find conceptually related content, even without
+keyword overlap. Requires =crucible embed= to have been run.
+
+** Hybrid Search (Default)
+
+#+BEGIN_SRC bash
+crucible search "catalyst design principles"
+#+END_SRC
+
+When embeddings exist, the default =auto= mode uses hybrid search:
+both FTS and semantic results are combined using Reciprocal Rank Fusion.
+Articles found by both methods rank highest.
+
+** Searching Across Peers
+
+#+BEGIN_SRC bash
+crucible search "neural networks" --all
+#+END_SRC
+
+The =--all= flag searches your local crucible and all registered peers.
+Works with all search modes (FTS, semantic, hybrid).
+
+* Navigating the Wiki
+
+** Browsing Concepts
+
+#+BEGIN_SRC bash
+crucible concepts                       # list all topics
+crucible concept thermodynamics         # articles on a topic
+#+END_SRC
+
+** Following Links
+
+#+BEGIN_SRC bash
+crucible backlinks wiki/concepts/activation-energy.org   # what points here
+crucible sources wiki/concepts/activation-energy.org     # primary sources
+crucible related wiki/concepts/activation-energy.org     # implied connections
+#+END_SRC
+
+The =related= command computes relationships on the fly from shared
+concepts, shared sources, temporal proximity, and explicit links.
+
+** Tracing Knowledge Evolution
+
+#+BEGIN_SRC bash
+crucible history wiki/comparisons/synthesis-article.org
+#+END_SRC
+
+Shows what articles the synthesis was derived from (upstream) and what
+has been derived from it (downstream).
+
+* Capturing Conversation Insights
+
+During a conversation where Claude has been reading and synthesizing
+from the wiki, you can say:
+
+#+BEGIN_EXAMPLE
+You: Capture this as a new article.
+#+END_EXAMPLE
+
+Claude writes an org file with a =:DERIVED_FROM:= property listing the
+wiki articles it read. After =crucible sync=, the derivation chain is
+recorded in the database.
+
+* Maintaining the Wiki
+
+** Health Checks
+
+#+BEGIN_SRC bash
+crucible lint
+#+END_SRC
+
+Reports broken links, orphan articles, missing properties, undigested
+sources, and wiki files not in the database.
+
+** Improvement Suggestions
+
+#+BEGIN_SRC bash
+crucible suggest
+#+END_SRC
+
+Analyzes the wiki graph (including semantic similarity when embeddings
+exist) to recommend:
+- New concept articles for well-referenced topics
+- Missing cross-links between related articles
+- Comparison articles for clusters of similar content
+- Links for orphan articles
+
+** Regenerating the Index
+
+#+BEGIN_SRC bash
+crucible index
+#+END_SRC
+
+Rebuilds =wiki/index.org= with all articles organized by type and concept.
+
+** Publishing as HTML
+
+#+BEGIN_SRC bash
+crucible publish
+#+END_SRC
+
+Exports the wiki as a browsable HTML site via scimax publish.
+
+* Resummarizing a Source
+
+When you revisit a source and want to add to its distillation (because
+you now have more context, or noticed a connection you missed):
+
+#+BEGIN_EXAMPLE
+You: Reread sources/external/pdfs/smith2024.pdf. I think there's a
+     connection to our work on catalyst screening that we missed.
+     Update the summary and add any new concepts.
+
+Claude: [reads the source again, reads existing summary, reads
+         catalyst-screening.org, identifies the gap]
+  - Update: summaries/smith2024.org with new section on screening
+  - New cross-link: to wiki/concepts/catalyst-screening.org
+  - Update: SOURCE_KEYS on catalyst-screening.org to include smith2024
+
+You: Do it.
+
+Claude: [updates the files, runs sync and embed]
+#+END_EXAMPLE
+
+The key point: you do not need a special command. You just tell Claude
+what to look at again and what connection to make. Claude updates the
+existing articles rather than creating duplicates.
+
+* Connecting Multiple Crucibles
+
+#+BEGIN_SRC bash
+# Register a peer
+crucible peer add lab-shared /path/to/lab/crucible
+crucible peer list
+
+# Search across all
+crucible search "topic" --all
+crucible concepts --all
+
+# Remove a peer
+crucible peer remove lab-shared
+#+END_SRC
+
+Peers are queried via separate database connections. Your data stays
+local, their data stays in their crucible. No writes cross boundaries.

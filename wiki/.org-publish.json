@@ -1,0 +1,19 @@
+{
+  "projects": {
+    "crucible-wiki": {
+      "name": "crucible-wiki",
+      "baseDirectory": "./",
+      "publishingDirectory": "/Users/jkitchin/Dropbox/projects/big-ideas/crucible/wiki/_build/html",
+      "recursive": true,
+      "autoSitemap": false,
+      "useDefaultTheme": true,
+      "withToc": true,
+      "sectionNumbers": false,
+      "baseExtension": "org",
+      "publishingFunction": "org-html-publish-to-html",
+      "withAuthor": true,
+      "withCreator": true
+    }
+  },
+  "githubPages": false
+}

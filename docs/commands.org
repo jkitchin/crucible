@@ -1,0 +1,340 @@
+#+TITLE: Crucible Command Reference
+#+DATE: [2026-04-03 Fri]
+
+* Setup Commands
+
+** =crucible init=
+
+Initialize the crucible database. Creates =db/crucible.db= with all tables.
+
+#+BEGIN_SRC bash
+crucible init --root /path/to/crucible
+#+END_SRC
+
+If =--root= is omitted, auto-detects by walking up from cwd looking for
+a directory with =CLAUDE.md= and =db/=.
+
+Safe to re-run: uses =CREATE TABLE IF NOT EXISTS=.
+
+** =crucible install=
+
+Install the Claude Code skill and register in global CLAUDE.md.
+
+#+BEGIN_SRC bash
+crucible install
+#+END_SRC
+
+Does three things:
+1. Copies =skill/SKILL.md= to =~/.claude/skills/crucible/=
+2. Runs =crucible manifest= to generate =wiki/MANIFEST.md=
+3. Adds a directive to =~/.claude/CLAUDE.md= pointing agents at the manifest
+
+Idempotent: re-running updates the existing directive rather than duplicating.
+
+** =crucible uninstall=
+
+Remove the skill and CLAUDE.md directive.
+
+#+BEGIN_SRC bash
+crucible uninstall
+#+END_SRC
+
+* Ingestion Commands
+
+** =crucible ingest=
+
+Ingest a source into the crucible.
+
+#+BEGIN_SRC bash
+crucible ingest SOURCE [OPTIONS]
+#+END_SRC
+
+SOURCE is a file path, glob pattern, or =-= for stdin.
+
+| Option | Description |
+|----------------------------+------------------------------------------------|
+| =-t=, =--title TEXT= | Source title (auto-detected if omitted) |
+| =--type TYPE= | pdf, web, notebook, data, other (auto-detected) |
+| =--shareable/--no-shareable= | Override default shareability |
+| =--url TEXT= | Original URL |
+| =--date TEXT= | ISO date (default: today) |
+| =-a=, =--author TEXT= | Author(s), repeatable |
+| =-f=, =--filename TEXT= | Filename for stdin input |
+
+Examples:
+
+#+BEGIN_SRC bash
+crucible ingest paper.pdf
+crucible ingest paper.pdf -t "Smith 2024" -a "Smith, J." --date 2024-03-15
+crucible ingest "papers/*.pdf"
+crucible ingest lab-notes.org --type notebook
+echo "content" | crucible ingest - -t "Title" --type web
+#+END_SRC
+
+Auto-detection: =.pdf= maps to pdf (external), =.org= to notebook (shareable),
+=.md/.html= to web (external), =.csv/.json/.xlsx/.hdf5= to data (shareable).
+
+* Database Commands
+
+** =crucible sync=
+
+Sync the database from wiki org files.
+
+#+BEGIN_SRC bash
+crucible sync
+#+END_SRC
+
+Two-pass process:
+1. Register/update all articles and concepts from org file metadata
+2. Process inter-article links, source links, and derivation chains
+
+Parses: =#+TITLE=, =#+FILETAGS=, =:ARTICLE_TYPE:=, =:SOURCE_KEYS:=,
+=:DERIVED_FROM:=, =[[file:...]]= links, and full text for FTS.
+
+Idempotent and safe to run repeatedly.
+
+** =crucible embed=
+
+Generate vector embeddings for semantic search.
+
+#+BEGIN_SRC bash
+crucible embed [OPTIONS]
+#+END_SRC
+
+| Option | Description |
+|--------------------+-----------------------------------------------|
+| =-m=, =--model= | Ollama model (default: nomic-embed-text) |
+| =--url= | Ollama API URL (default: localhost:11434) |
+
+Only embeds articles that do not already have embeddings (incremental).
+Re-run after adding new articles.
+
+* Search Commands
+
+** =crucible search=
+
+Search wiki articles.
+
+#+BEGIN_SRC bash
+crucible search QUERY [OPTIONS]
+#+END_SRC
+
+| Option | Description |
+|------------------------+---------------------------------------------------|
+| =-n=, =--limit= | Max results (default: 20) |
+| =--mode MODE= | auto, fts, semantic, or hybrid (default: auto) |
+| =--all= | Search all peers too |
+| =--peer NAME= | Search a specific peer |
+| =-m=, =--model= | Embedding model for semantic modes |
+| =--fts-weight= | FTS weight for hybrid RRF (default: 1.0) |
+| =--semantic-weight= | Semantic weight for hybrid RRF (default: 1.0) |
+
+Modes:
+- *auto*: hybrid if embeddings exist, FTS otherwise
+- *fts*: keyword search only (FTS5 with porter stemming)
+- *semantic*: vector similarity only
+- *hybrid*: FTS + semantic combined with Reciprocal Rank Fusion
+
+* Navigation Commands
+
+** =crucible backlinks=
+
+Show articles that link to the given article.
+
+#+BEGIN_SRC bash
+crucible backlinks wiki/concepts/activation-energy.org
+#+END_SRC
+
+** =crucible sources=
+
+Show primary sources for an article.
+
+#+BEGIN_SRC bash
+crucible sources wiki/concepts/activation-energy.org
+#+END_SRC
+
+** =crucible concepts=
+
+List all concepts with article counts.
+
+#+BEGIN_SRC bash
+crucible concepts [--all]
+#+END_SRC
+
+** =crucible concept=
+
+Show articles covering a specific concept.
+
+#+BEGIN_SRC bash
+crucible concept thermodynamics
+#+END_SRC
+
+** =crucible related=
+
+Show articles related through implied links (shared concepts, shared
+sources, temporal proximity, explicit links).
+
+#+BEGIN_SRC bash
+crucible related wiki/concepts/activation-energy.org
+#+END_SRC
+
+Results are sorted by number of relationship signals (more is stronger).
+
+** =crucible history=
+
+Show the derivation history of an article.
+
+#+BEGIN_SRC bash
+crucible history wiki/comparisons/synthesis.org
+#+END_SRC
+
+Shows upstream (what it was derived from) and downstream (what has been
+derived from it) with timestamps.
+
+* Discovery Commands
+
+** =crucible orphans=
+
+Articles with no incoming links.
+
+#+BEGIN_SRC bash
+crucible orphans
+#+END_SRC
+
+** =crucible undigested=
+
+Sources with no articles distilled from them.
+
+#+BEGIN_SRC bash
+crucible undigested
+#+END_SRC
+
+* Maintenance Commands
+
+** =crucible index=
+
+Regenerate =wiki/index.org= from database state.
+
+#+BEGIN_SRC bash
+crucible index
+#+END_SRC
+
+Organized by article type and by concept.
+
+** =crucible lint=
+
+Check wiki health and report issues.
+
+#+BEGIN_SRC bash
+crucible lint [-j]
+#+END_SRC
+
+Checks: broken file links, missing article files, orphan articles,
+undigested sources, missing concept articles, missing properties/filetags,
+wiki files not in database.
+
+=-j= outputs JSON for agent consumption.
+
+** =crucible suggest=
+
+Suggest improvements to the wiki.
+
+#+BEGIN_SRC bash
+crucible suggest [-j]
+#+END_SRC
+
+Suggestion types:
+- =new_concept_article=: concept in 2+ articles but no dedicated article
+- =missing_link=: related articles with no explicit cross-link
+- =pending_distillation=: sources waiting to be distilled
+- =comparison_opportunity=: 3+ summaries sharing a concept, no comparison
+- =link_orphan=: orphan articles with potential connections
+- =semantic_link=: semantically similar articles (>0.7) without cross-links
+- =semantic_cluster=: groups of 3+ similar articles suggesting synthesis
+
+=-j= outputs JSON for agent consumption.
+
+** =crucible manifest=
+
+Generate a manifest summarizing the knowledge base.
+
+#+BEGIN_SRC bash
+crucible manifest
+#+END_SRC
+
+Writes =wiki/MANIFEST.md= with article counts, concept list, and query
+instructions. Used by agents to decide whether to search this crucible.
+
+* Peer Commands
+
+** =crucible peer add=
+
+Register a peer crucible for cross-querying.
+
+#+BEGIN_SRC bash
+crucible peer add NAME /path/to/peer/crucible
+#+END_SRC
+
+Verifies the peer has a =db/crucible.db= before registering.
+
+** =crucible peer remove=
+
+#+BEGIN_SRC bash
+crucible peer remove NAME
+#+END_SRC
+
+** =crucible peer list=
+
+#+BEGIN_SRC bash
+crucible peer list
+#+END_SRC
+
+Shows all peers with their paths and status (ok/MISSING).
+
+* Export Commands
+
+** =crucible publish=
+
+Publish the wiki as a browsable HTML site via scimax.
+
+#+BEGIN_SRC bash
+crucible publish [OPTIONS]
+#+END_SRC
+
+| Option | Description |
+|-------------------+----------------------------------------------|
+| =-o=, =--output= | Output directory (default: wiki/_build/html) |
+| =--init-only= | Only write config, do not publish |
+
+Regenerates =wiki/index.org= first, then runs =scimax publish=.
+
+** =crucible graph=
+
+Export the article link graph in DOT format.
+
+#+BEGIN_SRC bash
+crucible graph [-o wiki.dot]
+#+END_SRC
+
+Outputs to stdout or file. Render with graphviz: =dot -Tpng wiki.dot -o wiki.png=.
+
+* Meta Commands
+
+** =crucible stats=
+
+Show database statistics.
+
+#+BEGIN_SRC bash
+crucible stats
+#+END_SRC
+
+** =crucible help=
+
+Show detailed help on a topic.
+
+#+BEGIN_SRC bash
+crucible help [TOPIC]
+#+END_SRC
+
+Topics: overview, workflow, ingest, distill, search, sync, maintain,
+org-format. Use =all= for everything.

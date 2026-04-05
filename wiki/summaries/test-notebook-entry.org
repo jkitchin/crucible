@@ -1,0 +1,26 @@
+#+TITLE: Summary: CO Oxidation Activation Energy Experiment
+#+FILETAGS: :summary:catalysis:platinum:
+
+* Summary: CO Oxidation Activation Energy Experiment
+:PROPERTIES:
+:ARTICLE_TYPE: summary
+:SOURCE_KEYS: test-notebook-entry
+:STATUS: draft
+:CREATED: 2026-04-03
+:END:
+
+This experiment measured the activation energy of CO oxidation
+on a Pt(111) surface using temperature-programmed reaction from
+300K to 600K. The measured value of 1.05 eV is consistent with
+both literature values citep:jones2023 and prior DFT calculations
+cite:smith2024.
+
+** Key Findings
+
+The Arrhenius plot was linear across the full temperature range,
+suggesting a single rate-limiting step. The activation energy
+agrees well with computational predictions.
+
+** Related Concepts
+
+See [[file:../concepts/activation-energy.org][Activation Energy]] for background on this property.

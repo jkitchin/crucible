@@ -1,0 +1,42 @@
+#+TITLE: Crucible Wiki Index
+#+DATE: [2026-04-03 Fri]
+#+STARTUP: overview
+
+Auto-generated index of the Crucible knowledge base.
+3 articles, 4 concepts, 3 sources, 1 links.
+
+* Articles by Type
+
+** Concepts (2)
+
+- [[file:wiki/concepts/activation-energy.org][Activation Energy]] /draft/
+- [[file:wiki/index.org][Crucible Wiki Index]] /draft/
+
+** Source Summaries (1)
+
+- [[file:wiki/summaries/test-notebook-entry.org][Summary: CO Oxidation Activation Energy Experiment]] /draft/
+
+* Articles by Concept
+
+** Catalysis (1)
+
+- [[file:wiki/concepts/activation-energy.org][Activation Energy]] [concept]
+
+** Kinetics (2)
+
+- [[file:wiki/concepts/activation-energy.org][Activation Energy]] [concept]
+- [[file:wiki/summaries/test-notebook-entry.org][Summary: CO Oxidation Activation Energy Experiment]] [summary]
+
+** Platinum (1)
+
+- [[file:wiki/summaries/test-notebook-entry.org][Summary: CO Oxidation Activation Energy Experiment]] [summary]
+
+** Thermodynamics (1)
+
+- [[file:wiki/concepts/activation-energy.org][Activation Energy]] [concept]
+
+* Sources
+
+- [other] Neural Networks (external)
+- [web] Test Stdin Article (external)
+- [notebook] Experiment: Measuring Activation Energy of CO Oxidation (shareable)

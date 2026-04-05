@@ -1,0 +1,112 @@
+#+TITLE: Crucible Skill Guide
+#+DATE: [2026-04-03 Fri]
+
+* Overview
+
+The crucible skill (=~/.claude/skills/crucible/SKILL.md=) teaches Claude
+Code how to operate the knowledge base. It provides guidance on:
+
+- Using the =crucible= CLI for ingestion, search, and maintenance
+- How to distill sources into well-structured org-mode articles
+- The two-step plan-then-write workflow
+- How to capture conversation insights as new articles
+- Article format conventions (properties, filetags, citations, links)
+- Wiki maintenance patterns
+
+The skill is installed and uninstalled via the CLI:
+
+#+BEGIN_SRC bash
+crucible install     # copies skill, generates manifest, adds CLAUDE.md directive
+crucible uninstall   # removes skill and CLAUDE.md directive
+#+END_SRC
+
+* How Agent Discovery Works
+
+When =crucible install= runs, it adds a directive to =~/.claude/CLAUDE.md=
+that points agents at the manifest file (=wiki/MANIFEST.md=). The
+manifest contains a compact summary of the knowledge base: article count,
+concept list, source count, and query instructions.
+
+Any Claude Code agent, in any project, sees this directive. When it
+encounters a domain-specific question, it can read the manifest (a few
+hundred tokens) to decide whether the crucible is relevant, then use
+the CLI to search and read articles.
+
+* Trigger Phrases
+
+The skill activates on phrases like:
+
+- "ingest this", "add to crucible", "add source"
+- "distill", "distill this source"
+- "crucible search", "search the wiki", "what do we know about"
+- "find related", "related articles"
+- "capture this", "save this to the wiki", "add this to crucible"
+- "update the wiki", "crucible sync"
+
+* Distillation Workflow
+
+When asked to distill a source, the skill instructs Claude to:
+
+1. Read the ingested source from =sources/=
+2. Check existing wiki state (=crucible concepts=, =crucible search=)
+3. Propose a plan: summary article, concept articles, cross-links
+4. Wait for user approval
+5. Write org files with proper metadata
+6. Run =crucible sync= and =crucible embed=
+
+* Capture Workflow
+
+When the user says "capture this as an article" during a conversation:
+
+1. Claude identifies the insight to capture (not a transcript, a synthesis)
+2. Notes which wiki articles it read during the conversation
+3. Writes an org file with =:DERIVED_FROM:= listing those articles
+4. Runs sync and embed
+
+The =DERIVED_FROM= property creates a derivation chain, tracking how
+knowledge evolves through synthesis over time.
+
+* Resummarization
+
+When the user wants to revisit a source (because new context reveals
+connections that were missed), the skill instructs Claude to:
+
+1. Re-read the original source
+2. Read the existing summary article
+3. Read related wiki articles that provide the new context
+4. Update the existing summary with new sections (not create a duplicate)
+5. Add new cross-links and concept tags
+6. Run sync and embed
+
+No special command is needed. The user just says what to look at again
+and what connection to explore.
+
+* Customizing the Skill
+
+The skill source lives at =skill/SKILL.md= in the crucible project.
+Edit it to change Claude's behavior, then run =crucible install= to
+push the changes to =~/.claude/skills/crucible/=.
+
+Common customizations:
+
+- Add domain-specific trigger phrases
+- Adjust the distillation guidelines for your field
+- Change the article format conventions
+- Add project-specific maintenance patterns
+
+* Tools Available to the Skill
+
+The skill grants Claude access to these tool patterns:
+
+| Pattern | Purpose |
+|---------------------+---------------------------------------|
+| =Bash(crucible*)= | All crucible CLI commands |
+| =Bash(pandoc*)= | Document conversion for ingestion |
+| =Bash(pdftotext*)= | PDF text extraction |
+| =Bash(curl*)= | Fetching web sources |
+| =Read= | Reading source files and wiki articles |
+| =Glob= | Finding files by pattern |
+| =Grep= | Searching file contents |
+| =Write= | Writing wiki articles |
+| =Edit= | Updating existing articles |
+| =WebFetch= | Fetching web content |

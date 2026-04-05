@@ -1,0 +1,29 @@
+#+TITLE: Activation Energy
+#+FILETAGS: :concept:thermodynamics:kinetics:catalysis:
+
+* Activation Energy
+:PROPERTIES:
+:ARTICLE_TYPE: concept
+:SOURCE_KEYS: test-notebook-entry
+:STATUS: draft
+:CREATED: 2026-04-03
+:END:
+
+Activation energy is the minimum energy required for a chemical
+reaction to proceed. In heterogeneous catalysis, it determines
+the temperature dependence of reaction rates through the
+Arrhenius equation.
+
+** Measurement on Pt(111)
+
+Recent experiments on CO oxidation over Pt(111) measured an
+activation energy of 1.05 eV across the 300-600K temperature
+range, consistent with DFT predictions citep:smith2024.
+
+See also [[file:../methods/arrhenius-analysis.org][Arrhenius Analysis]].
+
+** Relationship to Catalyst Design
+
+The activation energy is a key descriptor for catalyst screening.
+Lower activation energies generally indicate more active catalysts,
+though selectivity must also be considered.

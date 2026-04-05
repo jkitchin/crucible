@@ -1,0 +1,8 @@
+# External sources (copyrighted, not shareable)
+sources/external/
+
+# Database (regenerable from wiki)
+crucible.db
+
+# Publish output
+wiki/_build/
