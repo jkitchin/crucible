@@ -204,6 +204,61 @@ with working cross-links, citation tooltips, and a navigable sidebar.
 The about page (=/_about=) shows project paths, statistics, and the
 global registry.
 
+* Use Cases
+
+** Literature Review for a Proposal
+
+When preparing a grant proposal or review paper, you typically need to digest
+dozens of papers and synthesize them into a coherent narrative. Start by
+ingesting a batch of PDFs with =crucible ingest "papers/*.pdf"=, then ask
+Claude to distill each one into summary and concept articles. As the wiki
+grows, =crucible suggest= identifies comparison opportunities where multiple
+summaries share concepts but no cross-source analysis exists yet. You can then
+ask Claude to write comparison articles that synthesize findings across papers,
+and use =crucible search= to quickly find what the wiki knows about specific
+topics. The result is a structured, citation-backed knowledge base you can
+query as you write, rather than a stack of annotated PDFs you have to re-read.
+
+** Lab Notebook as Living Knowledge
+
+Experimental notebook entries often contain insights that only become valuable
+months later when a new experiment connects to an old one. By ingesting
+notebook entries with =crucible ingest entry.org --type notebook=, each
+experiment gets linked to concepts and cross-referenced with prior work. Over
+time, =crucible related= surfaces connections you might not have noticed:
+two experiments six months apart that share a concept, or a measurement that
+contradicts an earlier assumption. Running =crucible viz= produces a
+force-directed graph of your experimental knowledge, making clusters and gaps
+visible at a glance. When you synthesize insights across experiments,
+=crucible history= traces the derivation chain so you can always find which
+raw observations led to which conclusions.
+
+** Research Group Cross-Pollination
+
+In a research group, each member works on their own project but the work often
+overlaps in ways nobody tracks. With crucible, each group member maintains
+their own instance on their own project directory. The PI registers all of
+them with =crucible peer add student-name /path/to/their/crucible=, and can
+then run =crucible search "keyword" --all= to query across every group
+member's knowledge base simultaneously. The results show which crucible each
+hit came from, making it easy to say "talk to Alex, they have three articles
+on that catalyst." Copyrighted sources stay local to each instance (they are
+gitignored), so only the distilled wiki content is visible to peers.
+
+** Preparing for a Student Meeting
+
+Before a one-on-one meeting with a student, a PI can use the student's
+crucible to quickly build context. Running =crucible concepts= shows what
+topics the student has been working on, while =crucible orphans= reveals
+articles that lack connections to the broader knowledge base, often a sign
+of under-explored directions. =crucible lint= flags undigested sources (papers
+the student ingested but never distilled), missing cross-links, and articles
+without proper metadata. =crucible suggest= goes further, recommending new
+concept articles for topics that appear across multiple summaries and
+identifying potential comparison articles. Together, these commands give the PI
+a structured picture of where the student's knowledge base is strong, where
+it has gaps, and what questions to ask.
+
 * How It Works
 
 ** The Distillation Loop
