@@ -98,10 +98,14 @@ Wait for user approval before proceeding.
 **Write phase** - After approval:
 
 1. Write org-mode articles into `wiki/` following the format below
-2. Sync the database:
+2. **Always** sync the database after writing:
    ```bash
    crucible sync
+   crucible manifest
    ```
+   The database and MANIFEST.md are not updated automatically when wiki files
+   change on disk. Without `crucible sync`, the database will be stale and
+   MANIFEST.md will show incorrect counts (e.g. 0 articles even when files exist).
 3. Report what was created/updated
 
 ### Updating Existing Articles

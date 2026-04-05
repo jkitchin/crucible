@@ -637,6 +637,7 @@ def _build_nav_html(articles: list[dict]) -> str:
         '<a href="/_topics">Topics</a>',
         '<a href="/_references">References</a>',
         '<a href="/_graph">Graph</a>',
+        '<a href="/_about">About</a>',
         "</div>",
     ]
 
@@ -800,6 +801,65 @@ def _build_topics_html(concepts: list[dict],
     return "\n".join(parts)
 
 
+def _build_about_html(wiki_dir: Path, db_path: Path, articles: list[dict],
+                      bib: dict[str, dict[str, str]]) -> str:
+    """Build the about page with paths, version, and statistics."""
+    from crucible.database import CrucibleDB, SCHEMA_VERSION
+    from crucible.registry import list_instances
+
+    # Package version
+    try:
+        from importlib.metadata import version as pkg_version
+        version = pkg_version("crucible")
+    except Exception:
+        version = "dev"
+
+    # Stats from database
+    db = CrucibleDB(db_path)
+    stats = db.stats()
+    db_schema = db.schema_version()
+    db.close()
+
+    # Project root (parent of .crucible dir or db dir)
+    project_root = db_path.parent.parent if db_path.parent.name == ".crucible" else db_path.parent.parent
+
+    parts = [
+        f"<h1>About Crucible</h1>",
+        f'<p>Crucible v{html.escape(version)} (schema v{SCHEMA_VERSION})</p>',
+        "<p>LLM-compiled knowledge base with org-mode wiki and graph database</p>",
+        "<h2>Project</h2>",
+        '<table>',
+        f'<tr><td>Root</td><td><code>{html.escape(str(project_root))}</code></td></tr>',
+        f'<tr><td>Wiki</td><td><code>{html.escape(str(wiki_dir))}</code></td></tr>',
+        f'<tr><td>Database</td><td><code>{html.escape(str(db_path))}</code> (schema v{db_schema})</td></tr>',
+        '</table>',
+        "<h2>Statistics</h2>",
+        '<table>',
+        f'<tr><td>Sources</td><td>{stats.get("sources", 0)}</td></tr>',
+        f'<tr><td>Articles</td><td>{stats.get("articles", 0)}</td></tr>',
+        f'<tr><td>Concepts</td><td>{stats.get("concepts", 0)}</td></tr>',
+        f'<tr><td>Links</td><td>{stats.get("article_links", 0)}</td></tr>',
+        f'<tr><td>References</td><td>{len(bib)}</td></tr>',
+        '</table>',
+    ]
+
+    # Global registry
+    instances = list_instances()
+    parts.append("<h2>Global Registry</h2>")
+    parts.append(f'<p>{len(instances)} crucible instance(s)</p>')
+    if instances:
+        parts.append('<table>')
+        parts.append('<tr><th>Name</th><th>Path</th></tr>')
+        for inst in instances:
+            parts.append(
+                f'<tr><td>{html.escape(inst["name"])}</td>'
+                f'<td><code>{html.escape(inst["path"])}</code></td></tr>'
+            )
+        parts.append('</table>')
+
+    return "\n".join(parts)
+
+
 class CrucibleHandler(http.server.BaseHTTPRequestHandler):
     """Request handler for the Crucible wiki browser."""
 
@@ -841,6 +901,12 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
             concept_articles = db.articles_by_concept()
             db.close()
             self._serve_page("Topics", _build_topics_html(concepts, concept_articles))
+        elif path == "/_about":
+            self._serve_page(
+                "About",
+                _build_about_html(self.wiki_dir, self.db_path,
+                                  self.articles, self.bib),
+            )
         elif path == "/_graph":
             viz_path = self.wiki_dir / "viz.html"
             if viz_path.exists():

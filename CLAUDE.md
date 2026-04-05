@@ -49,6 +49,15 @@ Ingestion is a two-step process:
    and cross-links. Present plan for user approval.
 2. **Write**: Execute the approved plan, producing org-mode articles.
 
+### Sync After Writing
+
+The database and MANIFEST.md are not updated automatically when wiki files are
+created or modified. You must run `crucible sync` after writing or editing any
+wiki articles. Without this, the database will be stale and MANIFEST.md will
+show incorrect counts (e.g. 0 articles even when article files exist on disk).
+Always sync before running `crucible search`, `crucible stats`, `crucible index`,
+or `crucible manifest`.
+
 ### Search
 
 The wiki graph database supports:
