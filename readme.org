@@ -36,9 +36,24 @@ Key design principles:
 
 * Installation
 
+From PyPI:
+
 #+BEGIN_SRC bash
-cd /path/to/crucible
+pip install crucible-llm
+#+END_SRC
+
+Or from source for development:
+
+#+BEGIN_SRC bash
+git clone https://github.com/jkitchin/crucible.git
+cd crucible
 pip install -e .
+#+END_SRC
+
+Then initialize a new crucible project and wire it into Claude Code:
+
+#+BEGIN_SRC bash
+cd /path/to/your/project
 crucible init --root .
 crucible install    # installs Claude Code skill + CLAUDE.md directive
 #+END_SRC
@@ -356,4 +371,4 @@ Crucible draws on several sources of inspiration:
 
 * License
 
-TBD
+MIT. See [[file:LICENSE][LICENSE]] for details.

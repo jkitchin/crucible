@@ -1,13 +1,34 @@
 [project]
-name = "crucible"
+name = "crucible-llm"
 version = "0.1.0"
 description = "LLM-compiled knowledge base with org-mode wiki and graph database"
+license = "MIT"
 requires-python = ">=3.11"
+authors = [
+    { name = "John Kitchin", email = "jkitchin@andrew.cmu.edu" },
+]
+keywords = ["knowledge-base", "llm", "org-mode", "wiki", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Text Processing :: Markup",
+]
 dependencies = [
     "click>=8.0",
     "filelock>=3.0",
     "libsql>=0.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jkitchin/crucible"
+Repository = "https://github.com/jkitchin/crucible"
+Issues = "https://github.com/jkitchin/crucible/issues"
 
 [project.scripts]
 crucible = "crucible.cli:cli"
