@@ -43,6 +43,18 @@ def parse_bibtex(text: str) -> dict[str, dict[str, str]]:
     return entries
 
 
+def reconstruct_bibtex(key: str, entry: dict[str, str]) -> str:
+    """Reconstruct a bibtex entry string from parsed fields."""
+    entry_type = entry.get("_type", "misc")
+    fields = []
+    for field, value in entry.items():
+        if field.startswith("_"):
+            continue
+        fields.append(f"  {field} = {{{value}}}")
+    body = ",\n".join(fields)
+    return f"@{entry_type}{{{key},\n{body}\n}}"
+
+
 def format_citation(entry: dict[str, str]) -> str:
     """Format a bib entry as a readable string for tooltips."""
     author = entry.get("author", "")
@@ -536,6 +548,20 @@ a.citation:hover { border-bottom-style: solid; text-decoration: none; }
 .ref-key { font-size: 15px; color: var(--accent); margin-bottom: 4px; }
 .ref-link { font-size: 13px; margin: 2px 0; }
 .ref-link a { word-break: break-all; }
+.ref-bibtex-btn {
+  display: inline-block; font-size: 12px; color: var(--text-dim);
+  margin-top: 6px; padding: 2px 8px; border-radius: 4px;
+  border: 1px solid var(--border); background: transparent;
+  cursor: pointer; font-family: inherit;
+}
+.ref-bibtex-btn:hover { color: var(--link); border-color: var(--link); }
+.ref-bibtex-btn.copied { color: var(--accent); border-color: var(--accent); }
+.ref-bibtex-pre {
+  display: none; margin-top: 8px; padding: 8px 12px;
+  background: var(--bg); border-radius: 4px; font-size: 12px;
+  white-space: pre-wrap; word-break: break-all;
+  border: 1px solid var(--border);
+}
 
 /* Topics page */
 .topic-entry { margin-bottom: 16px; }
@@ -584,6 +610,19 @@ _BROWSE_TEMPLATE = """\
 <main id="content">
   {content}
 </main>
+<script>
+function copyBibtex(btn) {{
+  var pre = btn.nextElementSibling;
+  navigator.clipboard.writeText(pre.textContent).then(function() {{
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(function() {{
+      btn.textContent = 'Copy BibTeX';
+      btn.classList.remove('copied');
+    }}, 2000);
+  }});
+}}
+</script>
 </body>
 </html>
 """
@@ -770,6 +809,12 @@ def _build_references_html(bib: dict[str, dict[str, str]]) -> str:
             parts.append(f'<p class="ref-link">DOI: <a href="{html.escape(doi_url)}" target="_blank">{html.escape(doi)}</a></p>')
         if url:
             parts.append(f'<p class="ref-link">URL: <a href="{html.escape(url)}" target="_blank">{html.escape(url)}</a></p>')
+
+        bibtex_str = html.escape(reconstruct_bibtex(key, entry))
+        parts.append(
+            f'<button class="ref-bibtex-btn" onclick="copyBibtex(this)">Copy BibTeX</button>'
+            f'<pre class="ref-bibtex-pre">{bibtex_str}</pre>'
+        )
 
         parts.append("</div>")
     return "\n".join(parts)

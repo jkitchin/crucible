@@ -1371,6 +1371,264 @@ def delete(path, yes, delete_file):
 
 
 @cli.command()
+@click.argument("source")
+@click.option("--dry-run", "-n", is_flag=True, help="Preview without making changes")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def merge(source, dry_run, yes):
+    """Merge another crucible into this one.
+
+    SOURCE is a path to a crucible project or a name from the
+    global registry. Copies all sources, wiki articles, and
+    references into the current project, then syncs the database.
+
+    Use --dry-run to preview what would be merged.
+    """
+    import os
+
+    root = get_root()
+
+    # Resolve source crucible
+    source_root = _resolve_merge_source(source)
+    if source_root.resolve() == root.resolve():
+        raise click.ClickException("Cannot merge a crucible into itself.")
+
+    click.echo(f"Source: {source_root}")
+    click.echo(f"Target: {root}")
+
+    # Open both databases
+    source_cdir = source_root / CRUCIBLE_DIR
+    source_db = CrucibleDB(source_cdir / "crucible.db")
+    target_db = get_db(root)
+
+    src_stats = source_db.stats()
+    click.echo(
+        f"  {src_stats['sources']} sources, {src_stats['articles']} articles, "
+        f"{src_stats['concepts']} concepts"
+    )
+
+    if dry_run:
+        click.echo("(dry run)")
+    elif not yes:
+        click.confirm("\nProceed with merge?", abort=True)
+
+    click.echo()
+    target_cdir = cdir(root)
+    target_wiki = target_cdir / "wiki"
+    source_wiki = source_cdir / "wiki"
+
+    # --- Phase 1: Sources ---
+    sources_copied = 0
+    sources_skipped = 0
+
+    for src in source_db.list_sources():
+        src_file = source_root / src["path"]
+        try:
+            rel_within = Path(src["path"]).relative_to(CRUCIBLE_DIR)
+        except ValueError:
+            sources_skipped += 1
+            continue
+
+        dest_file = target_cdir / rel_within
+        new_rel = str(Path(CRUCIBLE_DIR) / rel_within)
+
+        # Skip if already in target DB
+        if target_db.get_source_by_path(new_rel):
+            sources_skipped += 1
+            continue
+
+        # Handle filename collision on disk
+        if dest_file.exists():
+            stem, suffix = dest_file.stem, dest_file.suffix
+            counter = 1
+            while dest_file.exists():
+                dest_file = dest_file.parent / f"{stem}_{counter}{suffix}"
+                counter += 1
+            new_rel = str(dest_file.relative_to(root))
+
+        if dry_run:
+            click.echo(f"  source: {src['title']} -> {new_rel}")
+        else:
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            if src_file.exists():
+                shutil.copy2(str(src_file), str(dest_file))
+                txt = src_file.with_suffix(".txt")
+                if txt.exists():
+                    shutil.copy2(str(txt), str(dest_file.with_suffix(".txt")))
+
+            authors = src.get("authors", "[]")
+            if isinstance(authors, str):
+                authors = json.loads(authors)
+            metadata = src.get("metadata", "{}")
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+
+            target_db.add_source(
+                path=new_rel, title=src["title"],
+                source_type=src["source_type"],
+                shareable=bool(src["shareable"]),
+                url=src.get("url"), authors=authors,
+                date=src.get("date"), metadata=metadata,
+            )
+        sources_copied += 1
+
+    # --- Phase 2: Wiki articles ---
+    articles_copied = 0
+    wiki_renames = {}   # wiki-relative old -> new (only for renamed files)
+    copied_files = []   # absolute paths of newly copied org files
+
+    if source_wiki.exists():
+        for org_path in sorted(source_wiki.rglob("*.org")):
+            if org_path.name == "index.org":
+                continue
+
+            rel_within_wiki = org_path.relative_to(source_wiki)
+            dest_path = target_wiki / rel_within_wiki
+
+            if dest_path.exists():
+                stem, suffix = dest_path.stem, dest_path.suffix
+                counter = 1
+                while dest_path.exists():
+                    dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
+                    counter += 1
+                new_rel = str(dest_path.relative_to(target_wiki))
+                wiki_renames[str(rel_within_wiki)] = new_rel
+
+            if dry_run:
+                label = str(dest_path.relative_to(target_wiki))
+                if str(rel_within_wiki) in wiki_renames:
+                    click.echo(f"  article: {rel_within_wiki} -> {label} (renamed)")
+                else:
+                    click.echo(f"  article: {rel_within_wiki}")
+            else:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(org_path), str(dest_path))
+                copied_files.append(dest_path)
+
+            articles_copied += 1
+
+    # Rewrite file links in copied articles for any renames
+    if wiki_renames and not dry_run:
+        rewrites = _rewrite_article_links(copied_files, target_wiki, wiki_renames)
+        if rewrites:
+            click.echo(f"  Rewrote links in {rewrites} file(s)")
+
+    # --- Phase 3: References ---
+    bib_added = 0
+    source_bib = source_cdir / "references.bib"
+    target_bib = target_cdir / "references.bib"
+
+    if source_bib.exists():
+        source_entries = _parse_bib_entries(
+            source_bib.read_text(encoding="utf-8")
+        )
+        target_text = (
+            target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
+        )
+
+        for cite_key, entry_text in source_entries.items():
+            if f"{{{cite_key}," not in target_text:
+                if dry_run:
+                    click.echo(f"  bib: {cite_key}")
+                else:
+                    from crucible.ingest import append_bib_entry
+                    append_bib_entry(root, entry_text, cite_key)
+                bib_added += 1
+
+    source_db.close()
+    target_db.close()
+
+    # --- Phase 4: Sync ---
+    if not dry_run and articles_copied > 0:
+        click.echo()
+        ctx = click.get_current_context()
+        ctx.invoke(sync)
+
+    # --- Summary ---
+    click.echo()
+    verb = "Would merge" if dry_run else "Merged"
+    click.echo(
+        f"{verb}: {sources_copied} sources, {articles_copied} articles, "
+        f"{bib_added} bib entries"
+    )
+    if sources_skipped:
+        click.echo(f"  Skipped {sources_skipped} existing sources")
+    if wiki_renames:
+        click.echo(
+            f"  Renamed {len(wiki_renames)} article(s) to avoid conflicts"
+        )
+
+
+def _resolve_merge_source(source: str) -> Path:
+    """Resolve a merge source by path or registry name."""
+    from crucible.registry import list_instances
+
+    path = Path(source).resolve()
+    if (path / CRUCIBLE_DIR / "crucible.db").exists():
+        return path
+
+    for inst in list_instances():
+        if inst["name"] == source:
+            inst_path = Path(inst["path"])
+            if (inst_path / CRUCIBLE_DIR / "crucible.db").exists():
+                return inst_path
+            raise click.ClickException(
+                f"Registry entry '{source}' points to {inst_path} "
+                f"but no database found there."
+            )
+
+    raise click.ClickException(
+        f"Cannot find crucible: {source}\n"
+        f"Provide a path or a name from `crucible registry list`."
+    )
+
+
+def _rewrite_article_links(
+    copied_files: list[Path], target_wiki: Path, wiki_renames: dict[str, str]
+) -> int:
+    """Rewrite [[file:...]] links in copied articles for renamed files.
+
+    Returns the number of files modified.
+    """
+    import os
+
+    target_wiki_resolved = target_wiki.resolve()
+    count = 0
+
+    for org_file in copied_files:
+        content = org_file.read_text(encoding="utf-8")
+        new_content = content
+
+        for match in re.finditer(r"\[\[file:(.*?)\]", content):
+            link_path = match.group(1)
+            resolved = (org_file.parent / link_path).resolve()
+            try:
+                wiki_rel = str(resolved.relative_to(target_wiki_resolved))
+            except ValueError:
+                continue
+
+            if wiki_rel in wiki_renames:
+                new_target = target_wiki / wiki_renames[wiki_rel]
+                new_link = os.path.relpath(new_target, org_file.parent)
+                new_content = new_content.replace(
+                    f"[[file:{link_path}]", f"[[file:{new_link}]"
+                )
+
+        if new_content != content:
+            org_file.write_text(new_content, encoding="utf-8")
+            count += 1
+
+    return count
+
+
+def _parse_bib_entries(text: str) -> dict[str, str]:
+    """Parse BibTeX text into a dict of cite_key -> full entry text."""
+    entries = {}
+    for match in re.finditer(r"(@\w+\{(\w+),.*?\n\})", text, re.DOTALL):
+        entries[match.group(2)] = match.group(1)
+    return entries
+
+
+@cli.command()
 def stats():
     """Show database statistics."""
     root = get_root()
@@ -2011,6 +2269,13 @@ Suggest (improvement recommendations):
                                - Comparison article opportunities
                                - Ways to link orphan articles
   crucible suggest -j          JSON output (for agent consumption)
+
+Merge another crucible:
+  crucible merge SOURCE        Merge sources, articles, and references
+                               from another crucible into this one.
+                               SOURCE is a path or registry name.
+  crucible merge SOURCE -n     Dry run (preview without changes)
+  crucible merge SOURCE -y     Skip confirmation prompt
 
 Typical maintenance cycle:
   crucible sync                # pick up any changes

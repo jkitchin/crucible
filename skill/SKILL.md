@@ -54,6 +54,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Get suggestions | `crucible suggest` |
 | Export link graph | `crucible graph -o wiki.dot` |
 | Database stats | `crucible stats` |
+| Merge another crucible | `crucible merge SOURCE [-n] [-y]` |
 | Full help | `crucible help all` |
 
 ## Working Directory
@@ -74,7 +75,22 @@ crucible ingest <path> [--type TYPE] [-t "Title"] [--date YYYY-MM-DD] [-a "Autho
 
 For URLs, fetch and convert first:
 ```bash
-curl -sL "URL" | pandoc -f html -t org --wrap=none | crucible ingest - -t "Title" --type web --url "URL"
+curl -sL -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" "URL" | pandoc -f html -t org --wrap=none | crucible ingest - -t "Title" --type web --url "URL"
+```
+
+**Note**: The browser-like `User-Agent` header is required because many
+publisher sites (e.g. ACS, Elsevier) return 403 Forbidden for default
+curl requests. If a site still blocks access, try `WebFetch` as a
+fallback (it uses its own fetching mechanism), or ask the user to
+provide the content manually.
+
+**Non-interactive mode (`claude -p`)**: When running crucible commands
+via `claude -p`, you need `--allowedTools` to grant write permissions.
+For example:
+```bash
+claude -p "ingest and distill this URL" \
+  --allowedTools 'Bash(crucible *)' 'Bash(pandoc*)' 'Bash(curl*)' \
+  --allowedTools 'Read' 'Write' 'Edit' 'Glob' 'Grep' 'WebFetch'
 ```
 
 ### Step 2: Distill (Plan then Write)
@@ -348,6 +364,14 @@ crucible undigested  # see what needs distilling
 crucible search "research question keywords"
 crucible concepts  # browse available topics
 # Read relevant articles, then synthesize
+```
+
+### Merging two crucibles
+```bash
+crucible merge /path/to/other-project      # by path
+crucible merge other-project               # by registry name
+crucible merge other-project --dry-run     # preview first
+crucible merge other-project --yes         # skip confirmation
 ```
 
 ### Generating an index
