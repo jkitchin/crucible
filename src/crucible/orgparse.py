@@ -29,7 +29,7 @@ PROP_DRAWER_RE = re.compile(
 )
 PROP_LINE_RE = re.compile(r"^\s*:([A-Z_]+):\s+(.+?)\s*$", re.MULTILINE)
 FILE_LINK_RE = re.compile(r"\[\[file:([^\]]+?)(?:::.*?)?\](?:\[([^\]]*)\])?\]")
-CITE_RE = re.compile(r"(?:cite[pt]?):([a-zA-Z0-9_:,-]+)")
+CITE_RE = re.compile(r"(?:cite[pt]?):([a-zA-Z0-9_,-]+)")
 
 
 def parse_org(text: str) -> OrgMetadata:
