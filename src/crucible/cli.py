@@ -66,16 +66,30 @@ def _ensure_settings(root: Path) -> bool:
     return True
 
 
-def get_root() -> Path:
-    """Find the project root (walks up looking for .crucible/).
+def _is_project_dir(candidate: Path) -> bool:
+    """True if `candidate` is a crucible project's .crucible/ dir.
 
-    A valid crucible project has .crucible/crucible.db (not just a
-    .crucible/ directory, which could be the global registry at ~/.crucible/).
+    Disambiguates from the global registry at ~/.crucible/, which has
+    registry.json but no wiki/ subdirectory.
+    """
+    return candidate.is_dir() and (candidate / "wiki").is_dir()
+
+
+def get_root() -> Path:
+    """Find the project root (walks up looking for .crucible/wiki/).
+
+    If the project is found but its crucible.db is missing (e.g. after a
+    fresh git clone — the database is gitignored as regenerable), the DB
+    is rebuilt from the committed wiki files and references.bib before
+    returning.
     """
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
         candidate = parent / CRUCIBLE_DIR
-        if candidate.is_dir() and (candidate / "crucible.db").exists():
+        if _is_project_dir(candidate):
+            db_path = candidate / "crucible.db"
+            if not db_path.exists():
+                _auto_rebuild_db(parent)
             return parent
     raise click.ClickException(
         "Not inside a crucible project. Run `crucible init` to create one."
@@ -89,6 +103,26 @@ def cdir(root: Path) -> Path:
 
 def get_db(root: Path) -> CrucibleDB:
     return CrucibleDB(cdir(root) / "crucible.db")
+
+
+def _auto_rebuild_db(root: Path):
+    """Rebuild a missing database from wiki files and references.bib.
+
+    Triggered by get_root() when a crucible project is detected but its
+    DB file is absent. Creates the schema, populates sources from the
+    bib file, runs the sync logic, and regenerates MANIFEST.md and
+    wiki/index.org.
+    """
+    click.echo(
+        "crucible: database missing, rebuilding from wiki...",
+        err=True,
+    )
+    db = get_db(root)
+    db.initialize()
+    try:
+        _rebuild_db_from_wiki(root, db)
+    finally:
+        db.close()
 
 
 @click.group()
@@ -185,8 +219,10 @@ def init(root):
             "# Crucible: external sources (copyrighted, not shareable)\n"
             ".crucible/sources/external/\n"
             "\n"
-            "# Crucible: database (regenerable from wiki)\n"
+            "# Crucible: database (regenerable from wiki via auto-rebuild)\n"
             ".crucible/crucible.db\n"
+            ".crucible/crucible.db-wal\n"
+            ".crucible/crucible.db-shm\n"
             "\n"
             "# Crucible: publish output\n"
             ".crucible/wiki/_build/\n",
@@ -258,9 +294,12 @@ def init(root):
 @click.option("--date", default=None, help="Source date (ISO format, default: today)")
 @click.option("--author", "-a", multiple=True, help="Author(s), can be repeated")
 @click.option("--doi", default=None, help="DOI for the source")
+@click.option("--bibtex", default=None,
+              help="Full BibTeX entry (overrides DOI lookup and auto-generation). "
+                   "Pass a path with --bibtex @file.bib to read from a file.")
 @click.option("--filename", "-f", default=None,
               help="Filename for stdin input (default: derived from title or timestamp)")
-def ingest(source, title, source_type, shareable, url, date, author, doi, filename):
+def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex, filename):
     """Ingest a source into Crucible.
 
     SOURCE is a file path, URL, glob pattern, or - for stdin.
@@ -283,6 +322,14 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, filena
 
     root = get_root()
     db = get_db(root)
+
+    # --bibtex @file.bib reads bibtex from a file (distinguished from a literal
+    # @article{...} entry by checking for '{' before any non-path character).
+    if bibtex and bibtex.startswith("@") and "{" not in bibtex:
+        bib_path = Path(bibtex[1:])
+        if not bib_path.exists():
+            raise click.ClickException(f"BibTeX file not found: {bib_path}")
+        bibtex = bib_path.read_text(encoding="utf-8")
 
     if source == "-":
         # Reading from stdin
@@ -309,6 +356,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, filena
             root=root, db=db, source_path=tmp,
             title=title, source_type=source_type, shareable=shareable,
             url=url, date=date, authors=list(author) if author else None, doi=doi,
+            bibtex=bibtex,
         )
         tmp.unlink()
         tmp.parent.rmdir()
@@ -368,6 +416,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, filena
             root=root, db=db, source_path=tmp_html,
             title=title, source_type="web", shareable=False,
             url=source, date=date, authors=list(author) if author else None,
+            doi=doi, bibtex=bibtex,
         )
         tmp_html.unlink()
         tmp_dir.rmdir()
@@ -387,6 +436,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, filena
                         root=root, db=db, source_path=p,
                         title=None, source_type=source_type, shareable=shareable,
                         url=None, date=date, authors=list(author) if author else None,
+                        doi=doi,
                     )
                     click.echo(f"  [{result['source_id']}] {result['title']} ({result['source_type']})")
                 except Exception as e:
@@ -400,6 +450,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, filena
                 root=root, db=db, source_path=source_path,
                 title=title, source_type=source_type, shareable=shareable,
                 url=url, date=date, authors=list(author) if author else None,
+                doi=doi, bibtex=bibtex,
             )
             _print_ingest_result(result)
 
@@ -420,44 +471,39 @@ def _print_ingest_result(result: dict):
     click.echo("Ready for distillation. Use citep:{} in articles.".format(result['cite_key']))
 
 
-@cli.command()
-def sync():
-    """Sync the database from wiki org files.
+def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
+    """Core sync logic: scan wiki/*.org and reconcile with the DB.
 
-    Scans wiki/ for org files, parses their metadata (title, properties,
-    links, citations), and updates the articles, concepts, and links
-    tables. Run this after Claude writes or updates wiki articles.
+    Returns a stats dict with counts. `on_skip` is called with the path
+    of each file skipped due to concurrent modification (defaults to a
+    no-op so callers that don't want CLI output stay quiet).
     """
-    root = get_root()
-    db = get_db(root)
+    if on_skip is None:
+        on_skip = lambda _p: None  # noqa: E731
+
     wiki_dir = cdir(root) / "wiki"
-
-    # Auto-register in global registry (ensures pre-registry crucibles get registered)
-    from crucible.registry import register as registry_register
-    registry_register(root.name, str(root))
-
     org_files = sorted(wiki_dir.rglob("*.org"))
-    if not org_files:
-        click.echo("No org files found in wiki/.")
-        db.close()
-        return
 
-    # Capture file mtimes before parsing so we can detect concurrent edits
+    stats = {
+        "added": 0,
+        "updated": 0,
+        "links_added": 0,
+        "concepts_added": 0,
+        "skipped": 0,
+        "files": len(org_files),
+    }
+
+    if not org_files:
+        return stats
+
     file_mtimes = {p: p.stat().st_mtime for p in org_files}
 
-    added = 0
-    updated = 0
-    links_added = 0
-    concepts_added = 0
-    skipped = 0
-
     with db.conn.transaction():
-        # Pass 1: register/update all articles and concepts
-        parsed = {}  # org_path -> (article_id, meta)
+        parsed = {}
         for org_path in org_files:
             if org_path.stat().st_mtime != file_mtimes[org_path]:
-                click.echo(f"  Skipping {org_path.name} (modified during sync)")
-                skipped += 1
+                on_skip(org_path)
+                stats["skipped"] += 1
                 continue
 
             meta = parse_org_file(org_path)
@@ -466,9 +512,11 @@ def sync():
 
             existing = db.get_article_by_path(rel_path)
             if existing:
-                db.update_article_fts(existing["id"], rel_path, meta.title, meta.content)
+                db.update_article_fts(
+                    existing["id"], rel_path, meta.title, meta.content
+                )
                 article_id = existing["id"]
-                updated += 1
+                stats["updated"] += 1
             else:
                 article_id = db.add_article(
                     path=rel_path,
@@ -478,18 +526,17 @@ def sync():
                     abstract=meta.properties.get("ABSTRACT", ""),
                     content=meta.content,
                 )
-                added += 1
+                stats["added"] += 1
 
             type_tags = {"concept", "summary", "comparison", "method"}
             for tag in meta.filetags:
                 if tag.lower() not in type_tags:
                     concept_id = db.add_concept(tag.lower())
                     db.link_article_concept(article_id, concept_id)
-                    concepts_added += 1
+                    stats["concepts_added"] += 1
 
             parsed[org_path] = (article_id, meta)
 
-        # Pass 2: inter-article links, source links, derivations
         for org_path, (article_id, meta) in parsed.items():
             for link_target in meta.file_links:
                 target_path = (org_path.parent / link_target).resolve()
@@ -498,7 +545,7 @@ def sync():
                     target_article = db.get_article_by_path(target_rel)
                     if target_article:
                         db.add_article_link(article_id, target_article["id"])
-                        links_added += 1
+                        stats["links_added"] += 1
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
             for key in source_keys:
@@ -521,11 +568,76 @@ def sync():
                 if source_article:
                     db.add_derivation(article_id, source_article["id"])
 
+    return stats
+
+
+def _rebuild_db_from_wiki(root: Path, db: CrucibleDB) -> dict:
+    """Populate a fresh DB from wiki/*.org and references.bib.
+
+    Used by the auto-rebuild path in get_root(). Idempotent — safe to
+    call on a DB that's already populated. Also regenerates MANIFEST.md
+    and wiki/index.org so GitHub-rendered landing pages stay current.
+    """
+    from crucible.ingest import (
+        upsert_sources_from_bib,
+        upsert_sources_from_disk,
+    )
+
+    sources_added = upsert_sources_from_bib(root, db)
+    sources_added += upsert_sources_from_disk(root, db)
+    sync_stats = _sync_wiki_to_db(root, db)
+    _write_manifest(root, db)
+    _write_index(root, db)
+    return {"sources_added": sources_added, **sync_stats}
+
+
+@cli.command()
+def sync():
+    """Sync the database from wiki org files.
+
+    Scans wiki/ for org files, parses their metadata (title, properties,
+    links, citations), and updates the articles, concepts, and links
+    tables. Also upserts sources from references.bib and from the
+    sources/notebooks and sources/data directories so new entries get
+    picked up automatically. Run this after Claude writes or updates
+    wiki articles.
+    """
+    from crucible.ingest import (
+        upsert_sources_from_bib,
+        upsert_sources_from_disk,
+    )
+
+    root = get_root()
+    db = get_db(root)
+
+    # Auto-register in global registry (ensures pre-registry crucibles get registered)
+    from crucible.registry import register as registry_register
+    registry_register(root.name, str(root))
+
+    sources_added = upsert_sources_from_bib(root, db)
+    sources_added += upsert_sources_from_disk(root, db)
+
+    stats = _sync_wiki_to_db(
+        root, db,
+        on_skip=lambda p: click.echo(
+            f"  Skipping {p.name} (modified during sync)"
+        ),
+    )
     db.close()
-    msg = f"Sync complete: {added} added, {updated} updated, "
-    msg += f"{concepts_added} concept links, {links_added} article links"
-    if skipped:
-        msg += f", {skipped} skipped (modified during sync)"
+
+    if stats["files"] == 0 and sources_added == 0:
+        click.echo("No org files found in wiki/.")
+        return
+
+    msg = (
+        f"Sync complete: {stats['added']} added, {stats['updated']} updated, "
+        f"{stats['concepts_added']} concept links, "
+        f"{stats['links_added']} article links"
+    )
+    if sources_added:
+        msg += f", {sources_added} sources from bib"
+    if stats["skipped"]:
+        msg += f", {stats['skipped']} skipped (modified during sync)"
     click.echo(msg)
 
 
@@ -1641,29 +1753,20 @@ def stats():
     click.echo(f"Links:    {s['article_links']}")
 
 
-@cli.command()
-def manifest():
-    """Generate a manifest summarizing the knowledge base.
-
-    Outputs a concise summary that agents can read to decide whether
-    this knowledge base is relevant to their query. Also writes
-    the manifest to wiki/MANIFEST.md for reference from CLAUDE.md.
-    """
+def _render_manifest(root: Path, db: CrucibleDB) -> str:
+    """Return the MANIFEST.md text for the current DB state."""
     from datetime import datetime
 
-    root = get_root()
-    db = get_db(root)
     s = db.stats()
     concept_list = db.list_concepts()
-    source_types = {}
+    source_types: dict[str, int] = {}
     for src in db.list_sources():
         t = src["source_type"]
         source_types[t] = source_types.get(t, 0) + 1
-    article_types = {}
+    article_types: dict[str, int] = {}
     for art in db.list_articles():
         t = art["article_type"]
         article_types[t] = article_types.get(t, 0) + 1
-    db.close()
 
     concepts_str = ", ".join(c["name"] for c in concept_list[:30])
     if len(concept_list) > 30:
@@ -1699,31 +1802,43 @@ def manifest():
         f"crucible help all                 # full CLI reference",
         f"```",
     ]
+    return "\n".join(lines) + "\n"
 
-    text = "\n".join(lines) + "\n"
 
+def _write_manifest(root: Path, db: CrucibleDB) -> Path:
+    """Write wiki/MANIFEST.md from the current DB state."""
+    text = _render_manifest(root, db)
+    manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
+    manifest_path.write_text(text, encoding="utf-8")
+    return manifest_path
+
+
+@cli.command()
+def manifest():
+    """Generate a manifest summarizing the knowledge base.
+
+    Outputs a concise summary that agents can read to decide whether
+    this knowledge base is relevant to their query. Also writes
+    the manifest to wiki/MANIFEST.md for reference from CLAUDE.md.
+    """
+    root = get_root()
+    db = get_db(root)
+    text = _render_manifest(root, db)
+    db.close()
     manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
     manifest_path.write_text(text, encoding="utf-8")
     click.echo(text)
     click.echo(f"Written to {manifest_path}")
 
 
-@cli.command()
-def index():
-    """Generate wiki/index.org from database state.
-
-    Creates an auto-maintained index of all wiki articles, organized
-    by type and by concept, with links to each article.
-    """
+def _render_index(root: Path, db: CrucibleDB) -> str:
+    """Return wiki/index.org text for the current DB state."""
     from datetime import datetime
 
-    root = get_root()
-    db = get_db(root)
     s = db.stats()
     by_type = db.articles_by_type()
     by_concept = db.articles_by_concept()
     source_list = db.list_sources()
-    db.close()
 
     type_labels = {
         "concept": "Concepts",
@@ -1731,6 +1846,17 @@ def index():
         "comparison": "Comparisons",
         "method": "Methods",
     }
+
+    wiki_rel = Path(CRUCIBLE_DIR) / "wiki"
+
+    def _link_path(stored_path: str) -> str:
+        """Convert a db-stored path (relative to project root) into a
+        path relative to wiki/index.org so org file: links resolve."""
+        p = Path(stored_path)
+        try:
+            return p.relative_to(wiki_rel).as_posix()
+        except ValueError:
+            return p.as_posix()
 
     lines = [
         f"#+TITLE: Crucible Wiki Index",
@@ -1755,7 +1881,7 @@ def index():
         lines.append("")
         for a in articles:
             status = f" /{a['status']}/" if a.get("status") else ""
-            lines.append(f"- [[file:{a['path']}][{a['title']}]]{status}")
+            lines.append(f"- [[file:{_link_path(a['path'])}][{a['title']}]]{status}")
         lines.append("")
 
     # Articles by concept
@@ -1766,7 +1892,7 @@ def index():
         lines.append(f"** {concept.title()} ({len(articles)})")
         lines.append("")
         for a in articles:
-            lines.append(f"- [[file:{a['path']}][{a['title']}]] [{a['article_type']}]")
+            lines.append(f"- [[file:{_link_path(a['path'])}][{a['title']}]] [{a['article_type']}]")
         lines.append("")
 
     # Sources
@@ -1780,9 +1906,32 @@ def index():
                 lines.append(f"  {src['url']}")
         lines.append("")
 
+    return "\n".join(lines)
+
+
+def _write_index(root: Path, db: CrucibleDB) -> Path:
+    """Write wiki/index.org from the current DB state."""
+    text = _render_index(root, db)
     index_path = cdir(root) / "wiki" / "index.org"
-    index_path.write_text("\n".join(lines), encoding="utf-8")
-    click.echo(f"Generated {index_path} ({s['articles']} articles, {s['concepts']} concepts)")
+    index_path.write_text(text, encoding="utf-8")
+    return index_path
+
+
+@cli.command()
+def index():
+    """Generate wiki/index.org from database state.
+
+    Creates an auto-maintained index of all wiki articles, organized
+    by type and by concept, with links to each article.
+    """
+    root = get_root()
+    db = get_db(root)
+    s = db.stats()
+    index_path = _write_index(root, db)
+    db.close()
+    click.echo(
+        f"Generated {index_path} ({s['articles']} articles, {s['concepts']} concepts)"
+    )
 
 
 @cli.command()
@@ -1887,7 +2036,7 @@ def lint(json_output):
     bib_keys = set()
     if bib_path.exists():
         import re as _re
-        for m in _re.finditer(r"@\w+\{(\w+),", bib_path.read_text(encoding="utf-8")):
+        for m in _re.finditer(r"@\w+\{([^,\s]+),", bib_path.read_text(encoding="utf-8")):
             bib_keys.add(m.group(1))
 
     for article in db.list_articles():

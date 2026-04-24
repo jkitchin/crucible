@@ -5,11 +5,14 @@ and registering them in the database.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from filelock import FileLock
 
@@ -227,7 +230,11 @@ def generate_cite_key(title: str, authors: list[str] | None, date: str | None) -
 def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
                        date: str | None, url: str | None,
                        source_type: str, doi: str | None = None) -> str:
-    """Generate a BibTeX entry string."""
+    """Generate a minimal BibTeX entry string.
+
+    Used as a fallback when no DOI lookup or user-provided bibtex is available.
+    Contains only the bibliographic fields we know — no crucible-internal metadata.
+    """
     year = (date or "")[:4] or ""
 
     entry_type = {
@@ -247,10 +254,269 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
         lines.append(f"  doi = {{{doi}}},")
     if url:
         lines.append(f"  url = {{{url}}},")
-    if date:
-        lines.append(f"  note = {{Ingested {date}}},")
     lines.append("}")
     return "\n".join(lines)
+
+
+_CITE_KEY_RE = re.compile(r"(@\w+\s*\{\s*)([^,\s]+)")
+
+
+def replace_cite_key(bibtex: str, new_key: str) -> str:
+    """Replace the citation key of the first @entry in a bibtex string."""
+    return _CITE_KEY_RE.sub(lambda m: m.group(1) + new_key, bibtex, count=1)
+
+
+_BIB_ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,(.*?)\n\}", re.DOTALL)
+_BIB_FIELD_RE = re.compile(
+    r"(\w+)\s*=\s*(?:\{((?:[^{}]|\{[^{}]*\})*)\}|\"([^\"]*)\")",
+    re.DOTALL,
+)
+
+
+def _parse_bib_fields(body: str) -> dict[str, str]:
+    """Parse the field body of a BibTeX entry into a dict."""
+    fields: dict[str, str] = {}
+    for m in _BIB_FIELD_RE.finditer(body):
+        name = m.group(1).lower()
+        value = m.group(2) if m.group(2) is not None else m.group(3) or ""
+        fields[name] = " ".join(value.split())
+    return fields
+
+
+def parse_bib_file(bib_path: Path) -> list[dict]:
+    """Parse a BibTeX file into a list of entries.
+
+    Each entry dict has 'cite_key', 'entry_type', and parsed fields
+    (title, author, year, doi, url, file, ...).
+    """
+    if not bib_path.exists():
+        return []
+    text = bib_path.read_text(encoding="utf-8", errors="replace")
+    entries = []
+    for m in _BIB_ENTRY_RE.finditer(text):
+        entry = {
+            "entry_type": m.group(1).lower(),
+            "cite_key": m.group(2),
+        }
+        entry.update(_parse_bib_fields(m.group(3)))
+        entries.append(entry)
+    return entries
+
+
+def _authors_from_bib(author_field: str) -> list[str]:
+    """Split a BibTeX author field on ' and '."""
+    if not author_field:
+        return []
+    return [a.strip() for a in re.split(r"\s+and\s+", author_field) if a.strip()]
+
+
+def _source_type_for_entry(entry_type: str, path: Path | None) -> str:
+    """Best-effort source_type for a bibtex entry."""
+    if path is not None:
+        t = detect_source_type(path)
+        if t != "other":
+            return t
+    return {
+        "article": "pdf",
+        "inproceedings": "pdf",
+        "book": "pdf",
+        "phdthesis": "pdf",
+        "mastersthesis": "pdf",
+    }.get(entry_type, "other")
+
+
+def upsert_sources_from_disk(root: Path, db) -> int:
+    """Create sources rows for files in sources/notebooks/ and sources/data/.
+
+    These directories are committed to git (unlike sources/external/), so a
+    fresh clone has the files but no sources table. Scans both directories
+    and creates a source row for each file, using the filename stem as the
+    cite_key in metadata. Skips hidden files, extracted text sidecars
+    (*.txt next to a non-txt source), and entries whose path already exists
+    in the sources table.
+
+    Returns the number of new sources inserted.
+    """
+    existing_paths: set[str] = {src["path"] for src in db.list_sources()}
+    inserted = 0
+
+    subdirs = [
+        (root / CRUCIBLE_DIR / "sources" / "notebooks", "notebook"),
+        (root / CRUCIBLE_DIR / "sources" / "data", "data"),
+    ]
+
+    for subdir, default_type in subdirs:
+        if not subdir.is_dir():
+            continue
+        for path in sorted(subdir.rglob("*")):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            # Skip *.txt sidecars from text extraction if a non-txt source
+            # with the same stem exists
+            if path.suffix.lower() == ".txt":
+                siblings = [p for p in path.parent.glob(path.stem + ".*")
+                            if p != path and p.is_file()]
+                if siblings:
+                    continue
+
+            try:
+                rel_path = str(path.relative_to(root.resolve()))
+            except ValueError:
+                rel_path = str(path)
+
+            if rel_path in existing_paths:
+                continue
+
+            cite_key = path.stem
+            title = path.stem.replace("-", " ").replace("_", " ").title()
+            if path.suffix.lower() == ".org":
+                try:
+                    meta = parse_org_file(path)
+                    if meta.title:
+                        title = meta.title
+                except Exception:
+                    pass
+
+            detected = detect_source_type(path)
+            source_type = detected if detected != "other" else default_type
+
+            metadata = {"cite_key": cite_key}
+
+            try:
+                mtime_iso = datetime.fromtimestamp(
+                    path.stat().st_mtime
+                ).strftime("%Y-%m-%d")
+            except OSError:
+                mtime_iso = None
+
+            try:
+                db.add_source(
+                    path=rel_path,
+                    title=title,
+                    source_type=source_type,
+                    shareable=True,
+                    url=None,
+                    authors=None,
+                    date=mtime_iso,
+                    metadata=metadata,
+                )
+                existing_paths.add(rel_path)
+                inserted += 1
+            except Exception:
+                continue
+
+    return inserted
+
+
+def upsert_sources_from_bib(root: Path, db) -> int:
+    """Create sources rows for every entry in .crucible/references.bib.
+
+    Safe to call repeatedly: entries whose cite_key already exists in
+    sources.metadata are skipped. Used by auto-rebuild (no DB) and by
+    `crucible sync` so bib edits are picked up without re-ingesting.
+
+    Returns the number of new sources inserted.
+    """
+    import json as _json
+
+    bib_path = root / CRUCIBLE_DIR / "references.bib"
+    entries = parse_bib_file(bib_path)
+    if not entries:
+        return 0
+
+    existing_cite_keys: set[str] = set()
+    for src in db.list_sources():
+        raw = src.get("metadata") or "{}"
+        try:
+            meta = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (ValueError, TypeError):
+            meta = {}
+        key = meta.get("cite_key")
+        if key:
+            existing_cite_keys.add(key)
+
+    existing_paths: set[str] = {src["path"] for src in db.list_sources()}
+
+    inserted = 0
+    for entry in entries:
+        cite_key = entry["cite_key"]
+        if cite_key in existing_cite_keys:
+            continue
+
+        file_field = entry.get("file")
+        rel_path: str | None = None
+        abs_path: Path | None = None
+        if file_field:
+            candidate = Path(file_field)
+            if not candidate.is_absolute():
+                abs_path = (root / candidate).resolve()
+            else:
+                abs_path = candidate
+            try:
+                rel_path = str(abs_path.relative_to(root.resolve()))
+            except ValueError:
+                rel_path = str(abs_path)
+
+        if rel_path is None:
+            rel_path = f"{CRUCIBLE_DIR}/bib/{cite_key}"
+
+        if rel_path in existing_paths:
+            continue
+
+        source_type = _source_type_for_entry(entry["entry_type"], abs_path)
+        shareable = not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/")
+        authors = _authors_from_bib(entry.get("author", ""))
+        date = entry.get("year") or None
+
+        metadata: dict = {"cite_key": cite_key}
+        if entry.get("doi"):
+            metadata["doi"] = entry["doi"]
+
+        try:
+            db.add_source(
+                path=rel_path,
+                title=entry.get("title", cite_key),
+                source_type=source_type,
+                shareable=shareable,
+                url=entry.get("url"),
+                authors=authors,
+                date=date,
+                metadata=metadata,
+            )
+            existing_cite_keys.add(cite_key)
+            existing_paths.add(rel_path)
+            inserted += 1
+        except Exception:
+            continue
+
+    return inserted
+
+
+def fetch_bibtex_from_doi(doi: str, timeout: float = 10.0) -> str | None:
+    """Fetch a full BibTeX entry for a DOI via doi.org content negotiation.
+
+    Returns the entry string on success, or None if the lookup fails.
+    """
+    doi = doi.strip()
+    if doi.lower().startswith("doi:"):
+        doi = doi[4:]
+    if doi.startswith("http"):
+        url = doi
+    else:
+        url = f"https://doi.org/{doi}"
+
+    req = Request(url, headers={
+        "Accept": "application/x-bibtex; charset=utf-8",
+        "User-Agent": "crucible (+https://github.com/jkitchin/crucible)",
+    })
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="replace").strip()
+    except (URLError, OSError, TimeoutError):
+        return None
+    if not data.startswith("@"):
+        return None
+    return data
 
 
 def append_bib_entry(root: Path, entry: str, cite_key: str):
@@ -284,6 +550,7 @@ def ingest_source(
     date: str | None = None,
     authors: list[str] | None = None,
     doi: str | None = None,
+    bibtex: str | None = None,
 ) -> dict:
     """Ingest a source file into Crucible.
 
@@ -337,11 +604,22 @@ def ingest_source(
     # Relative path for database
     rel_path = str(dest_path.relative_to(root))
 
-    # Generate cite key and bib entry
+    # Generate cite key and bib entry. Preference order:
+    #   1. user-provided --bibtex string
+    #   2. fetched from doi.org content negotiation
+    #   3. minimal entry from known metadata
     cite_key = generate_cite_key(title, authors, date)
-    bib_entry = generate_bib_entry(
-        cite_key, title, authors, date, url, source_type, doi=doi,
-    )
+    bib_entry = None
+    if bibtex and bibtex.strip().startswith("@"):
+        bib_entry = replace_cite_key(bibtex.strip(), cite_key)
+    elif doi:
+        fetched = fetch_bibtex_from_doi(doi)
+        if fetched:
+            bib_entry = replace_cite_key(fetched, cite_key)
+    if bib_entry is None:
+        bib_entry = generate_bib_entry(
+            cite_key, title, authors, date, url, source_type, doi=doi,
+        )
     append_bib_entry(root, bib_entry, cite_key)
 
     # Register in database (store cite_key in metadata)

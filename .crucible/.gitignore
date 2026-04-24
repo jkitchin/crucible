@@ -1,8 +1,10 @@
 # External sources (copyrighted, not shareable)
 sources/external/
 
-# Database (regenerable from wiki)
+# Database (regenerable from wiki via auto-rebuild)
 crucible.db
+crucible.db-wal
+crucible.db-shm
 
 # Publish output
 wiki/_build/

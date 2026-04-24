@@ -349,6 +349,53 @@ crucible history wiki/comparisons/my-synthesis.org
 
 You can also trace forward: "what has been derived from this article?"
 
+* Version Control
+
+A crucible knowledge base is git-friendly. Commit =.crucible/wiki/=,
+=.crucible/references.bib=, =.crucible/sources/notebooks/=, and
+=.crucible/sources/data/=. The default =.gitignore= written by
+=crucible init= excludes =.crucible/crucible.db= (and its WAL
+sidecars) and =.crucible/sources/external/= (copyrighted material).
+
+** Rebuild on clone
+
+The database is regenerable from the committed wiki files and
+=references.bib=. After cloning a repo that contains a crucible, the
+first command that needs the database rebuilds it automatically:
+
+#+BEGIN_SRC bash
+git clone <repo>
+cd <repo>
+crucible search "some term"
+# crucible: database missing, rebuilding from wiki...
+# <search results>
+#+END_SRC
+
+No =crucible init= is needed on clone. The rebuild creates the
+schema, populates articles and their cross-links from =wiki/*.org=,
+creates =sources= rows from =references.bib=, and regenerates
+=MANIFEST.md= and =index.org=.
+
+** Embeddings are a separate step
+
+Semantic embeddings are not auto-regenerated (they require a local
+ollama server). If you want =crucible related= and semantic search
+to work after a clone, run:
+
+#+BEGIN_SRC bash
+crucible embed
+#+END_SRC
+
+Full-text search (FTS5) and everything else works without embeddings.
+
+** Dropbox + git
+
+If your crucible lives in Dropbox *and* is a git repo, pick one
+machine as the authoritative sync point. SQLite's WAL files do not
+play well with simultaneous access across Dropbox; running
+=crucible sync= from two machines at once can produce =.db=
+conflict files. Git itself is fine in Dropbox.
+
 * Acknowledgments
 
 Crucible draws on several sources of inspiration:
