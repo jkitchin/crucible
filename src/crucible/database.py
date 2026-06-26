@@ -440,7 +440,12 @@ class CrucibleDB:
     def delete_article(self, article_id: int):
         """Delete an article and all its relationships."""
         self.conn.execute("DELETE FROM article_fts WHERE rowid = ?", (article_id,))
-        self.conn.execute("DELETE FROM embeddings WHERE article_id = ?", (article_id,))
+        # The embeddings table is created lazily by the first `crucible embed`,
+        # so it may not exist yet on a knowledge base that was never embedded.
+        if self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
+        ).fetchone():
+            self.conn.execute("DELETE FROM embeddings WHERE article_id = ?", (article_id,))
         self.conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
         self.conn.commit()
 

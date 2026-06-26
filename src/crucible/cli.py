@@ -548,12 +548,41 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                         stats["links_added"] += 1
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
-            for key in source_keys:
-                if not key:
-                    continue
-                for src in db.list_sources():
-                    if key in src["path"] or key in src.get("title", ""):
-                        db.link_article_source(article_id, src["id"])
+            if source_keys:
+                # Match SOURCE_KEYS against each source's cite_key (stored in
+                # sources.metadata JSON at ingest), which is the canonical
+                # identity. Fall back to the legacy substring test on
+                # path/title only for sources that have no cite_key, so
+                # pre-cite_key projects keep linking.
+                sources = db.list_sources()
+                key_to_src = {}
+                for src in sources:
+                    raw = src.get("metadata") or "{}"
+                    try:
+                        md = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    except (ValueError, TypeError):
+                        md = {}
+                    if md.get("cite_key"):
+                        key_to_src[md["cite_key"]] = src["id"]
+
+                for key in source_keys:
+                    if not key:
+                        continue
+                    sid = key_to_src.get(key)
+                    if sid is not None:
+                        db.link_article_source(article_id, sid)
+                        continue
+                    # Legacy fallback for sources lacking a cite_key.
+                    for src in sources:
+                        raw = src.get("metadata") or "{}"
+                        try:
+                            md = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                        except (ValueError, TypeError):
+                            md = {}
+                        if md.get("cite_key"):
+                            continue
+                        if key in src["path"] or key in src.get("title", ""):
+                            db.link_article_source(article_id, src["id"])
 
             derived_from = meta.properties.get("DERIVED_FROM", "").split()
             for ref in derived_from:
