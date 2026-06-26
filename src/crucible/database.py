@@ -173,6 +173,19 @@ CREATE INDEX IF NOT EXISTS idx_article_links_to ON article_links(to_id);
 """
 
 
+def _fts_query(raw: str) -> str:
+    """Turn a raw user query into a safe FTS5 MATCH expression.
+
+    Each whitespace-separated token is wrapped as a quoted string literal so
+    FTS5 query operators in user input (-, :, *, parentheses, the bare keywords
+    AND/OR/NOT/NEAR) are treated as ordinary text rather than crashing the
+    parser. Returns "" when the query has no usable tokens, in which case
+    callers should skip the search and return no results.
+    """
+    tokens = raw.split()
+    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+
 class CrucibleDB:
     """Interface to the Crucible wiki graph database (libSQL)."""
 
@@ -270,6 +283,9 @@ class CrucibleDB:
         """
         if peers is None:
             peers = []
+        match = _fts_query(query)
+        if not match:
+            return []
         results = []
         # Local
         for r in self.search(query, limit=limit):
@@ -291,7 +307,7 @@ class CrucibleDB:
                     WHERE article_fts MATCH ?
                     ORDER BY rank
                     LIMIT ?
-                """, (query, limit)):
+                """, (match, limit)):
                     r = dict(row)
                     r["_crucible"] = _name
                     rows.append(r)
@@ -499,6 +515,9 @@ class CrucibleDB:
 
     def search(self, query: str, limit: int = 20) -> list[dict]:
         """Full-text search over article content."""
+        match = _fts_query(query)
+        if not match:
+            return []
         return [dict(r) for r in self.conn.execute("""
             SELECT a.*, rank
             FROM article_fts fts
@@ -506,7 +525,7 @@ class CrucibleDB:
             WHERE article_fts MATCH ?
             ORDER BY rank
             LIMIT ?
-        """, (query, limit))]
+        """, (match, limit))]
 
     def backlinks(self, article_path: str) -> list[dict]:
         """Articles that link TO the given article."""

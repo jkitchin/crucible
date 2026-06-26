@@ -11,7 +11,7 @@ from pathlib import Path
 
 import libsql
 
-from crucible.database import DictConnection
+from crucible.database import DictConnection, _fts_query
 
 DEFAULT_MODEL = "nomic-embed-text"
 DEFAULT_URL = "http://localhost:11434/api/embed"
@@ -172,17 +172,19 @@ class EmbeddingIndex:
         """
         scores: dict[int, dict] = {}  # article_id -> {article_data, score}
 
-        # FTS ranked results
+        # FTS ranked results (sanitized so FTS5 operator chars don't crash)
+        fts_match = _fts_query(query)
         fts_results = []
-        for row in self.conn.execute("""
-            SELECT a.*, rank
-            FROM article_fts fts
-            JOIN articles a ON a.id = fts.rowid
-            WHERE article_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-        """, (query, limit * 3)):
-            fts_results.append(dict(row))
+        if fts_match:
+            for row in self.conn.execute("""
+                SELECT a.*, rank
+                FROM article_fts fts
+                JOIN articles a ON a.id = fts.rowid
+                WHERE article_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (fts_match, limit * 3)):
+                fts_results.append(dict(row))
 
         for rank, r in enumerate(fts_results, start=1):
             aid = r["id"]
@@ -365,6 +367,7 @@ class EmbeddingIndex:
         """Hybrid search across local and all peers with RRF reranking."""
         query_vec = embed_text(query, model=self.model, url=self.url)
         query_blob = vector_to_blob(query_vec)
+        fts_match = _fts_query(query)  # sanitized FTS5 expression ("" if no tokens)
 
         scores: dict[str, dict] = {}
 
@@ -388,12 +391,13 @@ class EmbeddingIndex:
                 scores[key]["methods"].append(f"semantic:rank={rank},sim={sim:.3f}")
 
         # Local FTS
-        local_fts = [dict(row) for row in self.conn.execute("""
-            SELECT a.*, rank FROM article_fts fts
-            JOIN articles a ON a.id = fts.rowid
-            WHERE article_fts MATCH ? ORDER BY rank LIMIT ?
-        """, (query, limit * 3))]
-        _add_fts(local_fts, "local")
+        if fts_match:
+            local_fts = [dict(row) for row in self.conn.execute("""
+                SELECT a.*, rank FROM article_fts fts
+                JOIN articles a ON a.id = fts.rowid
+                WHERE article_fts MATCH ? ORDER BY rank LIMIT ?
+            """, (fts_match, limit * 3))]
+            _add_fts(local_fts, "local")
 
         # Local semantic (native vector search)
         local_sem = []
@@ -419,12 +423,13 @@ class EmbeddingIndex:
                 conn = DictConnection(libsql.connect(peer_db))
 
                 # Peer FTS
-                peer_fts = [dict(row) for row in conn.execute("""
-                    SELECT a.*, rank FROM article_fts fts
-                    JOIN articles a ON a.id = fts.rowid
-                    WHERE article_fts MATCH ? ORDER BY rank LIMIT ?
-                """, (query, limit * 3))]
-                _add_fts(peer_fts, name)
+                if fts_match:
+                    peer_fts = [dict(row) for row in conn.execute("""
+                        SELECT a.*, rank FROM article_fts fts
+                        JOIN articles a ON a.id = fts.rowid
+                        WHERE article_fts MATCH ? ORDER BY rank LIMIT ?
+                    """, (fts_match, limit * 3))]
+                    _add_fts(peer_fts, name)
 
                 # Peer semantic
                 peer_sem = []
