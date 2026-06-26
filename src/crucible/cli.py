@@ -471,6 +471,20 @@ def _print_ingest_result(result: dict):
     click.echo("Ready for distillation. Use citep:{} in articles.".format(result['cite_key']))
 
 
+def _safe_relative_to(target: Path, root: Path) -> str | None:
+    """Return ``target`` relative to ``root``, or None if it lies outside root.
+
+    ``Path.relative_to`` raises ``ValueError`` for paths outside ``root``. A wiki
+    article can easily contain a link to a file outside the wiki tree (an
+    absolute ``[[file:/...]]`` link, or one with enough ``../``), and that must
+    not abort the whole sync.
+    """
+    try:
+        return str(target.relative_to(root))
+    except ValueError:
+        return None
+
+
 def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
     """Core sync logic: scan wiki/*.org and reconcile with the DB.
 
@@ -487,6 +501,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
     stats = {
         "added": 0,
         "updated": 0,
+        "removed": 0,
         "links_added": 0,
         "concepts_added": 0,
         "skipped": 0,
@@ -537,11 +552,23 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
 
             parsed[org_path] = (article_id, meta)
 
+        # Prune articles whose .org file was removed from disk. Build the
+        # present set from the full on-disk file list (not just successfully
+        # parsed files) so a file skipped for concurrent modification is never
+        # mistaken for a deletion.
+        present = {str(p.relative_to(root)) for p in org_files}
+        for art in db.list_articles():
+            if art["path"] not in present:
+                db.delete_article(art["id"])
+                stats["removed"] += 1
+
         for org_path, (article_id, meta) in parsed.items():
             for link_target in meta.file_links:
                 target_path = (org_path.parent / link_target).resolve()
                 if target_path.exists():
-                    target_rel = str(target_path.relative_to(root))
+                    target_rel = _safe_relative_to(target_path, root)
+                    if target_rel is None:
+                        continue  # link points outside the wiki tree; ignore
                     target_article = db.get_article_by_path(target_rel)
                     if target_article:
                         db.add_article_link(article_id, target_article["id"])
@@ -590,7 +617,9 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     continue
                 ref_path = (org_path.parent / ref).resolve()
                 if ref_path.exists():
-                    ref_rel = str(ref_path.relative_to(root))
+                    ref_rel = _safe_relative_to(ref_path, root)
+                    if ref_rel is None:
+                        continue  # derivation points outside the wiki tree; ignore
                 else:
                     ref_rel = f"wiki/{ref}" if not ref.startswith("wiki/") else ref
                 source_article = db.get_article_by_path(ref_rel)
@@ -660,6 +689,7 @@ def sync():
 
     msg = (
         f"Sync complete: {stats['added']} added, {stats['updated']} updated, "
+        f"{stats['removed']} removed, "
         f"{stats['concepts_added']} concept links, "
         f"{stats['links_added']} article links"
     )
