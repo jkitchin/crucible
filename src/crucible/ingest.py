@@ -209,22 +209,37 @@ def generate_cite_key(title: str, authors: list[str] | None, date: str | None) -
     import re as _re
     year = (date or "")[:4] or "nd"
 
-    if authors and authors[0]:
+    if authors and authors[0] and authors[0].strip():
         # Take last name of first author
         first = authors[0]
         # Handle "Last, First" or "First Last"
         if "," in first:
             surname = first.split(",")[0].strip()
         else:
-            surname = first.strip().split()[-1]
+            parts = first.strip().split()
+            surname = parts[-1] if parts else ""
         surname = _re.sub(r"[^a-zA-Z]", "", surname).lower()
-        return f"{surname}{year}"
+        if surname:
+            return f"{surname}{year}"
+        # No usable surname (e.g. all-punctuation author); fall through to title.
 
     # Fallback to first significant word of title
     words = _re.sub(r"[^a-zA-Z\s]", "", title.lower()).split()
     stop = {"the", "a", "an", "of", "on", "in", "for", "and", "to", "with"}
     word = next((w for w in words if w not in stop), words[0] if words else "unknown")
     return f"{word}{year}"
+
+
+def _bib_value(value: str) -> str:
+    """Sanitize a string for use inside a BibTeX ``{field}`` value.
+
+    Removes braces, which would otherwise unbalance the field and break both
+    our own parser and downstream LaTeX/bibtex compilation, and collapses
+    newlines/whitespace. These values come from extracted titles and user
+    input rather than hand-written BibTeX, so literal braces are never intended
+    as grouping.
+    """
+    return " ".join(value.replace("{", "").replace("}", "").split())
 
 
 def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
@@ -245,15 +260,16 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
     }.get(source_type, "misc")
 
     lines = [f"@{entry_type}{{{cite_key},"]
-    lines.append(f"  title = {{{title}}},")
+    lines.append(f"  title = {{{_bib_value(title)}}},")
     if authors:
-        lines.append(f"  author = {{{' and '.join(authors)}}},")
+        author_str = " and ".join(_bib_value(a) for a in authors)
+        lines.append(f"  author = {{{author_str}}},")
     if year:
-        lines.append(f"  year = {{{year}}},")
+        lines.append(f"  year = {{{_bib_value(year)}}},")
     if doi:
-        lines.append(f"  doi = {{{doi}}},")
+        lines.append(f"  doi = {{{_bib_value(doi)}}},")
     if url:
-        lines.append(f"  url = {{{url}}},")
+        lines.append(f"  url = {{{_bib_value(url)}}},")
     lines.append("}")
     return "\n".join(lines)
 

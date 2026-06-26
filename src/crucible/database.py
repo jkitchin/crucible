@@ -182,7 +182,11 @@ def _fts_query(raw: str) -> str:
     parser. Returns "" when the query has no usable tokens, in which case
     callers should skip the search and return no results.
     """
-    tokens = raw.split()
+    # Drop NUL and other control characters first: a NUL terminates the string
+    # at the SQLite C layer ("unterminated string"), and other control chars
+    # contribute nothing to a text search. Tab/newline/CR are left for split().
+    cleaned = "".join(ch for ch in raw if ch >= " " or ch in "\t\n\r")
+    tokens = cleaned.split()
     return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
 
 
