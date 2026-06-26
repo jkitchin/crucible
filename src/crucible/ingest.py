@@ -519,6 +519,27 @@ def fetch_bibtex_from_doi(doi: str, timeout: float = 10.0) -> str | None:
     return data
 
 
+# DOIs are 10.<registrant>/<suffix>. Stop at whitespace/quotes/brackets and
+# strip trailing sentence punctuation that commonly abuts a DOI in running text.
+_DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\"'<>}\]]+", re.IGNORECASE)
+
+
+def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | None:
+    """Best-effort extraction of a document's own DOI from its text.
+
+    Only the first ``scan_chars`` characters are scanned (title page / header),
+    where a paper's own DOI normally appears, to avoid picking up a DOI from the
+    reference list. Returns the cleaned DOI string, or None if none is found.
+    """
+    if not text:
+        return None
+    m = _DOI_RE.search(text[:scan_chars])
+    if not m:
+        return None
+    doi = m.group(0).rstrip(".,;:)]}>")
+    return doi or None
+
+
 def append_bib_entry(root: Path, entry: str, cite_key: str):
     """Append a BibTeX entry to .crucible/references.bib if not already present.
 
@@ -604,9 +625,14 @@ def ingest_source(
     # Relative path for database
     rel_path = str(dest_path.relative_to(root))
 
+    # If no DOI was supplied, try to recover one from the document text so we
+    # can fetch a complete, correctly-typed entry instead of a bare @misc.
+    if not doi:
+        doi = extract_doi_from_text(text)
+
     # Generate cite key and bib entry. Preference order:
     #   1. user-provided --bibtex string
-    #   2. fetched from doi.org content negotiation
+    #   2. fetched from doi.org content negotiation (real entry type + fields)
     #   3. minimal entry from known metadata
     cite_key = generate_cite_key(title, authors, date)
     bib_entry = None
