@@ -4,6 +4,8 @@ Handles copying sources to the right location, extracting text,
 and registering them in the database.
 """
 
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -576,6 +578,68 @@ def append_bib_entry(root: Path, entry: str, cite_key: str):
         atomic_write_text(bib_path, new_content)
 
 
+def file_sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file's bytes, read in chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _source_metadata(src: dict) -> dict:
+    """Parse a source row's metadata JSON into a dict (empty on any error)."""
+    raw = src.get("metadata") or "{}"
+    try:
+        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except (ValueError, TypeError):
+        return {}
+
+
+def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str) -> dict | None:
+    """Return an existing source row with the same content, or None.
+
+    Matches on the stored ``content_hash`` metadata when present; for sources
+    ingested before hashing existed, falls back to hashing the stored file on
+    disk so re-ingesting an old source is still recognized as a duplicate.
+    """
+    for src in db.list_sources():
+        md = _source_metadata(src)
+        stored = md.get("content_hash")
+        if stored is None:
+            src_file = root / src["path"]
+            if src_file.exists():
+                try:
+                    stored = file_sha256(src_file)
+                except OSError:
+                    continue
+        if stored == content_hash:
+            return src
+    return None
+
+
+def _unique_cite_key(base: str, db: CrucibleDB) -> str:
+    """Return ``base``, or a suffixed variant, that no existing source uses.
+
+    Disambiguates colliding generated keys (e.g. two different smith2024
+    papers) as smith2024, smith2024a, smith2024b, ... so a new source never
+    silently reuses another's cite key (and its bib entry).
+    """
+    used = {
+        k for src in db.list_sources()
+        if (k := _source_metadata(src).get("cite_key"))
+    }
+    if base not in used:
+        return base
+    for suffix in "abcdefghijklmnopqrstuvwxyz":
+        if f"{base}{suffix}" not in used:
+            return f"{base}{suffix}"
+    i = 1
+    while f"{base}{i}" in used:
+        i += 1
+    return f"{base}{i}"
+
+
 def ingest_source(
     root: Path,
     db: CrucibleDB,
@@ -596,6 +660,27 @@ def ingest_source(
     source_path = source_path.resolve()
     if not source_path.exists():
         raise FileNotFoundError(f"Source not found: {source_path}")
+
+    # If this exact file (same content hash) was already ingested, skip it:
+    # don't copy, append bib, or add a duplicate DB row. Return the existing
+    # source so callers can report it.
+    content_hash = file_sha256(source_path)
+    existing = _find_duplicate_source(db, root, content_hash)
+    if existing is not None:
+        md = _source_metadata(existing)
+        return {
+            "source_id": existing["id"],
+            "title": existing["title"],
+            "cite_key": md.get("cite_key", ""),
+            "source_type": existing["source_type"],
+            "shareable": bool(existing["shareable"]),
+            "stored_path": str(root / existing["path"]),
+            "relative_path": existing["path"],
+            "text_path": None,
+            "text_length": 0,
+            "date": existing.get("date"),
+            "duplicate": True,
+        }
 
     # Detect type if not specified
     if source_type is None:
@@ -650,7 +735,7 @@ def ingest_source(
     #   1. user-provided --bibtex string
     #   2. fetched from doi.org content negotiation (real entry type + fields)
     #   3. minimal entry from known metadata
-    cite_key = generate_cite_key(title, authors, date)
+    cite_key = _unique_cite_key(generate_cite_key(title, authors, date), db)
     bib_entry = None
     if bibtex and bibtex.strip().startswith("@"):
         bib_entry = replace_cite_key(bibtex.strip(), cite_key)
@@ -664,7 +749,10 @@ def ingest_source(
         )
     append_bib_entry(root, bib_entry, cite_key)
 
-    # Register in database (store cite_key in metadata)
+    # Register in database (store cite_key and content hash in metadata)
+    metadata = {"cite_key": cite_key, "content_hash": content_hash}
+    if doi:
+        metadata["doi"] = doi
     source_id = db.add_source(
         path=rel_path,
         title=title,
@@ -673,7 +761,7 @@ def ingest_source(
         url=url,
         authors=authors,
         date=date,
-        metadata={"cite_key": cite_key, "doi": doi} if doi else {"cite_key": cite_key},
+        metadata=metadata,
     )
 
     return {
@@ -687,4 +775,5 @@ def ingest_source(
         "text_path": str(text_path) if text else None,
         "text_length": len(text),
         "date": date,
+        "duplicate": False,
     }

@@ -438,7 +438,10 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
                         url=None, date=date, authors=list(author) if author else None,
                         doi=doi,
                     )
-                    click.echo(f"  [{result['source_id']}] {result['title']} ({result['source_type']})")
+                    if result.get("duplicate"):
+                        click.echo(f"  DUP  {result['title']} (identical to existing source, skipped)")
+                    else:
+                        click.echo(f"  [{result['source_id']}] {result['title']} ({result['source_type']})")
                 except Exception as e:
                     click.echo(f"  SKIP {p}: {e}", err=True)
             click.echo(f"\nDone. Run `crucible undigested` to see what needs distilling.")
@@ -458,6 +461,13 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
 
 
 def _print_ingest_result(result: dict):
+    if result.get("duplicate"):
+        click.echo(f"Already ingested (identical content): {result['title']}")
+        click.echo(f"  Source ID: {result['source_id']}")
+        click.echo(f"  Cite key: {result['cite_key']}")
+        click.echo(f"  Stored: {result['relative_path']}")
+        click.echo("  Skipped: no changes made.")
+        return
     click.echo(f"Ingested: {result['title']}")
     click.echo(f"  Source ID: {result['source_id']}")
     click.echo(f"  Cite key: {result['cite_key']}")
