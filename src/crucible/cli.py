@@ -506,7 +506,12 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         on_skip = lambda _p: None  # noqa: E731
 
     wiki_dir = cdir(root) / "wiki"
-    org_files = sorted(wiki_dir.rglob("*.org"))
+    # wiki/index.org is generated output, not authored content (see
+    # _write_index / the wiki-merge and lint logic elsewhere, which already
+    # treat it specially) — it must never be registered as an article.
+    org_files = sorted(
+        p for p in wiki_dir.rglob("*.org") if p.name != "index.org"
+    )
 
     stats = {
         "added": 0,
