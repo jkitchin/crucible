@@ -23,9 +23,15 @@ CRUCIBLE_PERMISSIONS = [
     "Bash(pdftotext*)",
     "Bash(curl*)",
     "Read(.crucible/**)",
+    "Edit(.crucible/wiki/**)",
+    "Edit(.crucible/sources/**)",
+]
+
+# Rules written by older versions. Claude Code ignores Write(path) in file
+# permission checks (Edit(path) covers all file-editing tools), so drop them.
+OBSOLETE_PERMISSIONS = [
     "Write(.crucible/wiki/**)",
     "Write(.crucible/sources/**)",
-    "Edit(.crucible/wiki/**)",
 ]
 
 
@@ -49,8 +55,9 @@ def _ensure_settings(root: Path) -> bool:
     permissions = settings.setdefault("permissions", {})
     allow = permissions.setdefault("allow", [])
 
-    # Add any missing crucible permissions
-    added = []
+    # Drop obsolete rules, then add any missing crucible permissions
+    added = [perm for perm in allow if perm in OBSOLETE_PERMISSIONS]
+    allow[:] = [perm for perm in allow if perm not in OBSOLETE_PERMISSIONS]
     for perm in CRUCIBLE_PERMISSIONS:
         if perm not in allow:
             allow.append(perm)
