@@ -4,12 +4,16 @@ description: |
   LLM-compiled knowledge base management. Ingests primary sources (papers,
   notebooks, data), distills them into interlinked org-mode wiki articles,
   and provides structured search over the wiki graph database.
-  Triggers: "ingest this", "distill", "add to crucible", "crucible ingest",
-  "crucible search", "search the wiki", "what do we know about", "find related",
-  "knowledge base", "distill this source", "add source", "wiki article",
-  "concept article", "what sources", "what links to", "related articles",
-  "undigested sources", "orphan articles", "crucible sync", "update the wiki"
-allowed-tools: ["Bash(crucible*)", "Bash(pandoc*)", "Bash(pdftotext*)", "Bash(curl*)", "Read", "Glob", "Grep", "Write", "Edit", "WebFetch"]
+  Use when the user asks to ingest, distill, search, or maintain a crucible
+  knowledge base, or says things like "ingest this", "distill", "add to crucible",
+  "crucible ingest", "crucible search", "search the wiki", "what do we know about",
+  "find related", "knowledge base", "distill this source", "add source",
+  "wiki article", "concept article", "what sources", "what links to",
+  "related articles", "undigested sources", "orphan articles", "crucible sync",
+  "update the wiki".
+license: MIT
+compatibility: Requires the crucible CLI (pip install crucible-llm); pandoc and pdftotext are optional for web and PDF ingestion.
+allowed-tools: Bash(crucible:*) Bash(pandoc:*) Bash(pdftotext:*) Bash(curl:*) Read Glob Grep Write Edit WebFetch
 ---
 
 # Crucible Skill
@@ -54,6 +58,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Get suggestions | `crucible suggest` |
 | Export link graph | `crucible graph -o wiki.dot` |
 | Database stats | `crucible stats` |
+| Merge another crucible | `crucible merge SOURCE [-n] [-y]` |
 | Full help | `crucible help all` |
 
 ## Working Directory
@@ -74,7 +79,22 @@ crucible ingest <path> [--type TYPE] [-t "Title"] [--date YYYY-MM-DD] [-a "Autho
 
 For URLs, fetch and convert first:
 ```bash
-curl -sL "URL" | pandoc -f html -t org --wrap=none | crucible ingest - -t "Title" --type web --url "URL"
+curl -sL -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" "URL" | pandoc -f html -t org --wrap=none | crucible ingest - -t "Title" --type web --url "URL"
+```
+
+**Note**: The browser-like `User-Agent` header is required because many
+publisher sites (e.g. ACS, Elsevier) return 403 Forbidden for default
+curl requests. If a site still blocks access, try `WebFetch` as a
+fallback (it uses its own fetching mechanism), or ask the user to
+provide the content manually.
+
+**Non-interactive mode (`claude -p`)**: When running crucible commands
+via `claude -p`, you need `--allowedTools` to grant write permissions.
+For example:
+```bash
+claude -p "ingest and distill this URL" \
+  --allowedTools 'Bash(crucible *)' 'Bash(pandoc*)' 'Bash(curl*)' \
+  --allowedTools 'Read' 'Write' 'Edit' 'Glob' 'Grep' 'WebFetch'
 ```
 
 ### Step 2: Distill (Plan then Write)
@@ -142,7 +162,10 @@ When the user says "capture this as an article", "save this to the wiki",
 :CREATED: 2026-04-03
 :END:
 
-The synthesized narrative goes here...
+The synthesized narrative goes here, citing citep:smith2024 and
+citet:jones2023 as appropriate...
+
+bibliography:~/Dropbox/bibliography/references.bib
 ```
 
 4. **Run sync**:
@@ -188,6 +211,19 @@ when referencing sources: citep:smith2024, citet:jones2023.
 
 Cross-reference other wiki articles with file links:
 [[file:../concepts/other-topic.org][Other Topic]]
+
+bibliography:~/Dropbox/bibliography/references.bib
+```
+
+### Bibliography Requirement
+
+Every article that contains org-ref citations (`cite:`, `citep:`, `citet:`)
+**must** include a `bibliography:` link as the last line of the file. This
+is required for org-ref to resolve citations when the article is opened in
+Emacs. Use:
+
+```
+bibliography:~/Dropbox/bibliography/references.bib
 ```
 
 ### Article Types
@@ -332,6 +368,14 @@ crucible undigested  # see what needs distilling
 crucible search "research question keywords"
 crucible concepts  # browse available topics
 # Read relevant articles, then synthesize
+```
+
+### Merging two crucibles
+```bash
+crucible merge /path/to/other-project      # by path
+crucible merge other-project               # by registry name
+crucible merge other-project --dry-run     # preview first
+crucible merge other-project --yes         # skip confirmation
 ```
 
 ### Generating an index

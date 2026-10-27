@@ -25,7 +25,7 @@ crucible install
 #+END_SRC
 
 Does three things:
-1. Copies =skill/SKILL.md= to =~/.claude/skills/crucible/=
+1. Copies =skills/crucible/SKILL.md= to =~/.claude/skills/crucible/=
 2. Runs =crucible manifest= to generate =wiki/MANIFEST.md=
 3. Adds a directive to =~/.claude/CLAUDE.md= pointing agents at the manifest
 

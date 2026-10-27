@@ -66,6 +66,24 @@ The =install= command does three things:
 
 To remove: =crucible uninstall=.
 
+** Installing the skill with knowhow
+
+The skill lives in =skills/crucible/SKILL.md= and follows the
+[[https://agentskills.io/specification][Agent Skills specification]], so it can also be installed with
+[[https://github.com/jkitchin/knowhow][knowhow]] (or =npx skills=) for Claude Code and other agents
+(VS Code, Codex, OpenCode, Gemini CLI, Cursor):
+
+#+BEGIN_SRC bash
+uvx knowhow add jkitchin/crucible --skill crucible        # this project
+uvx knowhow add jkitchin/crucible --skill crucible -g     # global
+# or: npx skills add jkitchin/crucible --skill crucible
+#+END_SRC
+
+The skill still needs the =crucible= CLI on your PATH. Installing it this
+way does not generate the manifest or the =~/.claude/CLAUDE.md= directive,
+so run =crucible install= inside your project if you want those too.
+Contributors can check the skill with =uvx knowhow validate .=.
+
 For semantic search, you also need ollama running with an embedding model:
 
 #+BEGIN_SRC bash
@@ -97,8 +115,9 @@ crucible/
   db/
     crucible.db            Wiki graph database (SQLite)
   src/crucible/            Python source code
-  skill/
-    SKILL.md               Claude Code skill definition
+  skills/
+    crucible/
+      SKILL.md             Agent skill definition (Agent Skills spec)
   docs/                    Usage documentation
 #+END_EXAMPLE
 

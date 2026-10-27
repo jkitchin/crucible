@@ -2655,8 +2655,12 @@ def install():
     import subprocess
 
     # 1. Install skill files (works from anywhere)
+    # Wheel installs bundle skills/crucible into the package; editable
+    # installs read it from the repository root.
     pkg_dir = Path(__file__).parent
-    skill_src = pkg_dir / "skill"
+    skill_src = pkg_dir / "skills" / "crucible"
+    if not skill_src.exists():
+        skill_src = pkg_dir.parent.parent / "skills" / "crucible"
     if not skill_src.exists():
         raise click.ClickException(f"Skill source not found at {skill_src}")
 

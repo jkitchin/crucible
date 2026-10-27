@@ -39,3 +39,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/crucible"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills/crucible" = "crucible/skills/crucible"
