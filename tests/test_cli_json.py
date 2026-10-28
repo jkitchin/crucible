@@ -151,3 +151,15 @@ def test_init_refuses_the_home_directory(registry):
     assert result.exit_code != 0
     assert "global crucible registry" in result.output
     assert not (registry / "wiki").exists()
+
+
+def test_sync_stores_and_updates_article_metadata(project):
+    results = run_json("search", "platinum", "--mode", "fts")
+    assert results[0]["status"] == "draft"
+    summary = project / SUMMARY_PATH
+    summary.write_text(SUMMARY.replace(":STATUS: draft", ":STATUS: verified")
+                       .replace("#+TITLE: Smith 2024 results", "#+TITLE: Smith 2024 measurements"))
+    assert CliRunner().invoke(cli, ["sync"]).exit_code == 0
+    results = run_json("search", "platinum", "--mode", "fts")
+    assert results[0]["status"] == "verified"
+    assert results[0]["title"] == "Smith 2024 measurements"

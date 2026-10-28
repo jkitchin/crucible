@@ -591,9 +591,15 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
             meta = parse_org_file(org_path)
             rel_path = str(org_path.relative_to(root))
             article_type = meta.properties.get("ARTICLE_TYPE", "concept")
+            status = meta.properties.get("STATUS") or "draft"
 
             existing = db.get_article_by_path(rel_path)
             if existing:
+                db.update_article(
+                    existing["id"], title=meta.title, article_type=article_type, status=status,
+                    distill_model=meta.properties.get("DISTILL_MODEL"),
+                    abstract=meta.properties.get("ABSTRACT", ""),
+                )
                 db.update_article_fts(
                     existing["id"], rel_path, meta.title, meta.content
                 )
@@ -607,6 +613,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     distill_model=meta.properties.get("DISTILL_MODEL"),
                     abstract=meta.properties.get("ABSTRACT", ""),
                     content=meta.content,
+                    status=status,
                 )
                 stats["added"] += 1
 

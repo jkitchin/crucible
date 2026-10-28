@@ -417,11 +417,11 @@ class CrucibleDB:
 
     def add_article(self, path: str, title: str, article_type: str,
                     distill_model: str | None = None, abstract: str | None = None,
-                    content: str = "") -> int:
+                    content: str = "", status: str = "draft") -> int:
         cur = self.conn.execute(
-            """INSERT INTO articles (path, title, article_type, distill_model, abstract)
-               VALUES (?, ?, ?, ?, ?)""",
-            (path, title, article_type, distill_model, abstract),
+            """INSERT INTO articles (path, title, article_type, distill_model, abstract, status)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (path, title, article_type, distill_model, abstract, status),
         )
         article_id = cur.lastrowid
         # Index content for FTS
@@ -447,6 +447,17 @@ class CrucibleDB:
                 "SELECT * FROM articles WHERE article_type = ? ORDER BY updated_at DESC",
                 (article_type,))]
         return [dict(r) for r in self.conn.execute("SELECT * FROM articles ORDER BY updated_at DESC")]
+
+    def update_article(self, article_id: int, title: str, article_type: str, status: str,
+                       distill_model: str | None = None, abstract: str | None = None):
+        """Update an article's metadata from its file's front matter and properties."""
+        self.conn.execute(
+            """UPDATE articles SET title = ?, article_type = ?, status = ?,
+                      distill_model = ?, abstract = ?
+               WHERE id = ?""",
+            (title, article_type, status, distill_model, abstract, article_id),
+        )
+        self.conn.commit()
 
     def update_article_fts(self, article_id: int, path: str, title: str, content: str):
         """Update FTS index for an article (delete old, insert new)."""
