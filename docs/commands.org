@@ -339,6 +339,21 @@ Show database statistics.
 crucible stats
 #+END_SRC
 
+** =crucible vscode=
+
+Open the crucible in VS Code.
+
+#+BEGIN_SRC bash
+crucible vscode [FILE]
+#+END_SRC
+
+Opens the project root as the workspace and the wiki's =index.org= (or
+=FILE=, a path relative to the wiki such as =concepts/foo.org=). With the
+[[https://github.com/jkitchin/scimax_vscode][scimax]] extension, the Crucible
+panel in the Scimax sidebar then lists this crucible first, with its
+concepts and articles, and has search, back-links and related articles.
+Needs the =code= shell command.
+
 ** =crucible help=
 
 Show detailed help on a topic.

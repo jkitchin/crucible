@@ -1564,10 +1564,12 @@ def browse(port, no_open):
 @cli.command()
 @click.argument("file", required=False, default=None)
 def vscode(file):
-    """Open the crucible wiki in VS Code.
+    """Open the crucible in VS Code.
 
-    Opens the wiki directory as a workspace with the index file.
-    Optionally open a specific FILE (relative wiki path like concepts/foo.org).
+    Opens the project root as the workspace, so the scimax extension's
+    Crucible panel shows this crucible first, and opens the wiki's index
+    file. Optionally open a specific FILE (relative wiki path like
+    concepts/foo.org) instead.
     """
     import subprocess
 
@@ -1583,8 +1585,8 @@ def vscode(file):
         click.echo("Generating knowledge graph...")
         subprocess.run(["crucible", "viz"], cwd=str(root), capture_output=True)
 
-    # Open the wiki folder in VS Code
-    cmd = ["code", str(wiki_dir)]
+    # Open the project root in VS Code
+    cmd = ["code", str(root)]
 
     # Also open a specific file (or index.org by default)
     if file:
