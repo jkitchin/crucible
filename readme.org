@@ -64,6 +64,10 @@ The =install= command does three things:
 3. Adds a directive to =~/.claude/CLAUDE.md= so agents know to check the
    crucible before answering domain-specific questions
 
+=init= registers the project and installs the skill, but only =install=
+writes the =~/.claude/CLAUDE.md= directive. There is one directive, so a new
+crucible does not take it over until you run =install= in it.
+
 To remove: =crucible uninstall=.
 
 ** Installing the skill with knowhow

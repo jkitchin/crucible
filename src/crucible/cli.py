@@ -334,9 +334,9 @@ def init(root):
     actual_name = registry_register(root.name, str(root))
     click.echo(f"  Registered in global registry as '{actual_name}'")
 
-    # Install skill and CLAUDE.md directive automatically
-    ctx = click.get_current_context()
-    ctx.invoke(install)
+    # Install the skill and this project's manifest; the global CLAUDE.md
+    # directive is left to an explicit `crucible install`.
+    _install(root=root, directive=False)
 
 
 @cli.command()
@@ -2780,7 +2780,18 @@ def install():
 
     1. Copies the skill into ~/.claude/skills/crucible/
     2. If inside a crucible project, generates the manifest and adds
-       a CLAUDE.md directive pointing agents at it
+       a CLAUDE.md directive pointing agents at it (replacing a directive
+       for another crucible)
+    """
+    _install(root=None, directive=True)
+
+
+def _install(root: Path | None, directive: bool) -> None:
+    """Install the skill; for a project, also its manifest and registry entry.
+
+    `root` is the project (None: the one containing the current directory).
+    Only `crucible install` passes directive=True: init and update must not
+    repoint the global ~/.claude/CLAUDE.md at the project they act on.
     """
     import shutil
     import subprocess
@@ -2805,13 +2816,14 @@ def install():
             click.echo(f"  Skill: {src_file.name} -> {dest_file}")
 
     # 2. If inside a project, generate manifest and add CLAUDE.md directive
-    try:
-        root = get_root()
-    except click.ClickException:
-        click.echo("\nSkill installed. No crucible project found in current directory,")
-        click.echo("so manifest and CLAUDE.md directive were not generated.")
-        click.echo("Run `crucible install` from inside a project to complete setup.")
-        return
+    if root is None:
+        try:
+            root = get_root()
+        except click.ClickException:
+            click.echo("\nSkill installed. No crucible project found in current directory,")
+            click.echo("so manifest and CLAUDE.md directive were not generated.")
+            click.echo("Run `crucible install` from inside a project to complete setup.")
+            return
 
     subprocess.run(["crucible", "manifest"], cwd=str(root),
                    capture_output=True, text=True)
@@ -2823,10 +2835,14 @@ def install():
     actual_name = registry_register(root.name, str(root))
     click.echo(f"  Registry: registered as '{actual_name}'")
 
+    if not directive:
+        click.echo("  CLAUDE.md: unchanged (run `crucible install` here to point agents at this crucible)")
+        return
+
     # 3. Add directive to ~/.claude/CLAUDE.md
     claude_md = Path.home() / ".claude" / "CLAUDE.md"
     marker = "<!-- crucible-knowledge-base -->"
-    directive = (
+    directive_text = (
         f"\n{marker}\n"
         f"## Crucible Knowledge Base\n"
         f"\n"
@@ -2850,15 +2866,15 @@ def install():
                 _re.escape(marker) + r".*?" + _re.escape(marker),
                 _re.DOTALL,
             )
-            updated = pattern.sub(directive.strip(), existing)
+            updated = pattern.sub(directive_text.strip(), existing)
             claude_md.write_text(updated, encoding="utf-8")
             click.echo(f"  CLAUDE.md: updated existing directive")
         else:
-            claude_md.write_text(existing.rstrip() + "\n" + directive, encoding="utf-8")
+            claude_md.write_text(existing.rstrip() + "\n" + directive_text, encoding="utf-8")
             click.echo(f"  CLAUDE.md: added directive")
     else:
         claude_md.parent.mkdir(parents=True, exist_ok=True)
-        claude_md.write_text(directive, encoding="utf-8")
+        claude_md.write_text(directive_text, encoding="utf-8")
         click.echo(f"  CLAUDE.md: created with directive")
 
     click.echo(f"\nCrucible installed. Restart Claude Code to pick up the skill.")
@@ -2941,8 +2957,7 @@ def update():
     click.echo(f"  Registry: registered as '{actual_name}'")
 
     # 4. Reinstall skill
-    ctx = click.get_current_context()
-    ctx.invoke(install)
+    _install(root=root, directive=False)
 
 
 if __name__ == "__main__":

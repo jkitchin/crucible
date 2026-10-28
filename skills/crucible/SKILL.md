@@ -63,7 +63,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 
 ## Working Directory
 
-Crucible must be run from its project root or a parent directory. The root is identified by the presence of `CLAUDE.md` and a `db/` directory. Always `cd` to the crucible directory or use absolute paths.
+Crucible must be run from inside a project: it walks up from the current directory to the nearest `.crucible/wiki/`. The home directory is never a project (`~/.crucible/` is the global registry). Always `cd` to the crucible directory or use absolute paths.
 
 ## Distillation Workflow
 

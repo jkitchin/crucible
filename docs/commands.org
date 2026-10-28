@@ -7,8 +7,10 @@
 
 Initialize a crucible project. Creates =.crucible/= in the project root
 with the wiki and source directories, =references.bib= and the database
-=.crucible/crucible.db=, registers the project in the global registry and
-runs =crucible install=.
+=.crucible/crucible.db=, registers the project in the global registry,
+installs the skill and writes the manifest. It does not change
+=~/.claude/CLAUDE.md=: run =crucible install= in the project to point agents
+at it.
 
 #+BEGIN_SRC bash
 crucible init --root /path/to/project
@@ -35,6 +37,8 @@ Does three things:
 3. Adds a directive to =~/.claude/CLAUDE.md= pointing agents at the manifest
 
 Idempotent: re-running updates the existing directive rather than duplicating.
+There is one directive, so running =install= in another crucible points it
+there instead. =init= and =update= never change it; only =install= does.
 
 ** =crucible uninstall=
 

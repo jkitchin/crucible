@@ -43,8 +43,8 @@ Measured activation energies on platinum. See
 def registry(tmp_path, monkeypatch):
     """A temporary home directory and global registry.
 
-    `crucible init` also runs `install`, which writes ~/.claude/, so HOME
-    must be temporary too.
+    `crucible init` installs the skill into ~/.claude/, so HOME must be
+    temporary too.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -64,7 +64,8 @@ def project(tmp_path, registry, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(cli, ["init", "--root", str(root)])
     assert result.exit_code == 0, result.output
-    assert str(root) in (registry.parent / ".claude" / "CLAUDE.md").read_text()
+    # Only an explicit `crucible install` writes the global directive.
+    assert not (registry.parent / ".claude" / "CLAUDE.md").exists()
     wiki = root / ".crucible" / "wiki"
     (wiki / "concepts" / "activation-energy.org").write_text(CONCEPT)
     (wiki / "summaries" / "smith.org").write_text(SUMMARY)
@@ -163,3 +164,21 @@ def test_sync_stores_and_updates_article_metadata(project):
     results = run_json("search", "platinum", "--mode", "fts")
     assert results[0]["status"] == "verified"
     assert results[0]["title"] == "Smith 2024 measurements"
+
+
+def test_install_points_the_global_directive_at_this_crucible(project, registry):
+    result = CliRunner().invoke(cli, ["install"])
+    assert result.exit_code == 0, result.output
+    assert str(project.resolve()) in (registry.parent / ".claude" / "CLAUDE.md").read_text()
+
+
+def test_init_acts_on_its_root_not_the_current_directory(project, tmp_path, monkeypatch):
+    # Run from inside one crucible, init another: the new one gets the
+    # manifest and the registry entry.
+    other = tmp_path / "other"
+    other.mkdir()
+    result = CliRunner().invoke(cli, ["init", "--root", str(other)])
+    assert result.exit_code == 0, result.output
+    assert (other / ".crucible" / "wiki" / "MANIFEST.md").exists()
+    paths = [e["path"] for e in run_json("registry", "list")]
+    assert str(other.resolve()) in paths
