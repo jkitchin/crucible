@@ -93,33 +93,37 @@ crucible embed
 
 * Directory Layout
 
+A crucible project keeps everything in a =.crucible/= directory at its root:
+
 #+BEGIN_EXAMPLE
-crucible/
-  readme.org               This file
-  CLAUDE.md                Project conventions for Claude Code
-  pyproject.toml           Python package (click CLI)
-  .gitignore               Excludes sources/external/ and db/
-  sources/
-    external/              Copyrighted material (gitignored)
-      pdfs/                Academic papers, reports
-      web/                 Web clippings
-    notebooks/             Your own ELN entries (shareable)
-    data/                  Your own experimental data (shareable)
-  wiki/
-    index.org              Auto-generated master index
-    MANIFEST.md            Summary for agent discovery
-    concepts/              One topic per file
-    summaries/             One per ingested source
-    comparisons/           Cross-source analysis
-    methods/               Technique and methodology articles
-  db/
-    crucible.db            Wiki graph database (SQLite)
-  src/crucible/            Python source code
-  skills/
-    crucible/
-      SKILL.md             Agent skill definition (Agent Skills spec)
-  docs/                    Usage documentation
+your-project/
+  .crucible/
+    CLAUDE.md              Conventions for agents working in the wiki
+    .gitignore             Excludes crucible.db and sources/external/
+    crucible.db            Wiki graph database (SQLite, regenerable)
+    references.bib         Bibliography of ingested sources
+    sources/
+      external/            Copyrighted material (gitignored)
+        pdfs/              Academic papers, reports
+        web/               Web clippings
+      notebooks/           Your own ELN entries (shareable)
+      data/                Your own experimental data (shareable)
+    wiki/
+      index.org            Auto-generated master index
+      MANIFEST.md          Summary for agent discovery
+      concepts/            One topic per file
+      summaries/           One per ingested source
+      comparisons/         Cross-source analysis
+      methods/             Technique and methodology articles
 #+END_EXAMPLE
+
+The global registry of all crucibles on the machine is
+=~/.crucible/registry.json=. Because =~/.crucible/= is the registry, the
+home directory itself cannot be a crucible project.
+
+This repository holds the Python package (=src/crucible/=), the agent skill
+(=skills/crucible/SKILL.md=, Agent Skills spec), the documentation
+(=docs/=) and the tests (=tests/=).
 
 * Quick Start
 

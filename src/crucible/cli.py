@@ -7,6 +7,7 @@ from pathlib import Path
 
 import click
 
+from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import ingest_source
@@ -73,13 +74,23 @@ def _ensure_settings(root: Path) -> bool:
     return True
 
 
+def _is_registry_dir(candidate: Path) -> bool:
+    """True if `candidate` is the global registry directory (~/.crucible/)."""
+    try:
+        return candidate.resolve() == registry_module.REGISTRY_DIR.resolve()
+    except OSError:
+        return False
+
+
 def _is_project_dir(candidate: Path) -> bool:
     """True if `candidate` is a crucible project's .crucible/ dir.
 
-    Disambiguates from the global registry at ~/.crucible/, which has
-    registry.json but no wiki/ subdirectory.
+    The global registry at ~/.crucible/ is never a project, even if it
+    has a wiki/ subdirectory: otherwise every directory under the home
+    directory would resolve to it.
     """
-    return candidate.is_dir() and (candidate / "wiki").is_dir()
+    return (candidate.is_dir() and (candidate / "wiki").is_dir()
+            and not _is_registry_dir(candidate))
 
 
 def get_root() -> Path:
@@ -132,6 +143,16 @@ def _auto_rebuild_db(root: Path):
         db.close()
 
 
+def json_option(f):
+    """Add --json (aliases --json-output, -j): machine-readable output on stdout."""
+    return click.option("--json", "--json-output", "-j", "json_output", is_flag=True,
+                        help="Output as JSON (for editors and agents)")(f)
+
+
+def _emit_json(data) -> None:
+    click.echo(json.dumps(data, indent=2, default=str))
+
+
 @click.group()
 @click.pass_context
 def cli(ctx):
@@ -140,7 +161,8 @@ def cli(ctx):
 
 
 @cli.command()
-def about():
+@json_option
+def about(json_output):
     """Show crucible version, project info, and quick overview."""
     from crucible.database import SCHEMA_VERSION
     from crucible.registry import list_instances
@@ -151,6 +173,29 @@ def about():
         version = pkg_version("crucible")
     except Exception:
         version = "dev"
+
+    if json_output:
+        project = None
+        try:
+            root = get_root()
+            db = get_db(root)
+            project = {
+                "root": str(root),
+                "wiki": str(cdir(root) / "wiki"),
+                "bibliography": str(cdir(root) / "references.bib"),
+                "schema_version": db.schema_version(),
+                "stats": db.stats(),
+            }
+            db.close()
+        except click.ClickException:
+            pass
+        _emit_json({
+            "version": version,
+            "schema_version": SCHEMA_VERSION,
+            "project": project,
+            "registry": list_instances(),
+        })
+        return
 
     click.echo(f"Crucible v{version} (schema v{SCHEMA_VERSION})")
     click.echo("LLM-compiled knowledge base with org-mode wiki and graph database")
@@ -202,6 +247,11 @@ def init(root):
         root = Path.cwd()
     root = root.resolve()
     cdir = root / CRUCIBLE_DIR
+    if _is_registry_dir(cdir):
+        raise click.ClickException(
+            f"{cdir} is the global crucible registry, so {root} cannot be a "
+            "crucible project. Run `crucible init` in a project directory."
+        )
 
     # Create directory structure inside .crucible/
     dirs = [
@@ -758,10 +808,17 @@ def registry():
 
 
 @registry.command("list")
-def registry_list():
+@json_option
+def registry_list(json_output):
     """List all registered crucible instances."""
     from crucible.registry import list_instances, resolve_db_path
     instances = list_instances()
+    if json_output:
+        for inst in instances:
+            db_path = resolve_db_path(inst)
+            inst["db"] = str(db_path) if db_path else None
+        _emit_json(instances)
+        return
     if not instances:
         click.echo("No crucible instances registered.")
         return
@@ -826,7 +883,8 @@ def registry_clean():
 @click.option("--fts-weight", default=1.0, help="FTS weight for hybrid reranking")
 @click.option("--semantic-weight", default=1.0, help="Semantic weight for hybrid reranking")
 @click.option("--raw", is_flag=True, help="Skip dedup/quality filtering (return raw ranked results)")
-def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, raw):
+@json_option
+def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, raw, json_output):
     """Search wiki articles.
 
     By default, returns deduplicated, quality-ranked results. Similar
@@ -872,6 +930,9 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
                 raw=raw,
             )
         db.close()
+        if json_output:
+            _emit_json(results)
+            return
         if not results:
             click.echo("No results.")
             return
@@ -900,6 +961,9 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
         else:
             results = idx.search(query, limit=limit)
         db.close()
+        if json_output:
+            _emit_json(results)
+            return
         if not results:
             click.echo("No results.")
             return
@@ -917,6 +981,9 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
             results = db.search(query, limit=limit)
 
         db.close()
+        if json_output:
+            _emit_json(results)
+            return
         if not results:
             click.echo("No results.")
             return
@@ -930,7 +997,8 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
 
 @cli.command()
 @click.argument("article_path")
-def history(article_path):
+@json_option
+def history(article_path, json_output):
     """Show the derivation history of an article.
 
     Shows what articles this one was derived from (upstream)
@@ -943,6 +1011,9 @@ def history(article_path):
     upstream = db.derived_from(article_path)
     downstream = db.derivatives(article_path)
     db.close()
+    if json_output:
+        _emit_json({"derived_from": upstream, "derivatives": downstream})
+        return
 
     if not upstream and not downstream:
         click.echo("No derivation history for this article.")
@@ -963,12 +1034,16 @@ def history(article_path):
 
 @cli.command()
 @click.argument("article_path")
-def backlinks(article_path):
+@json_option
+def backlinks(article_path, json_output):
     """Show articles that link to the given article."""
     root = get_root()
     db = get_db(root)
     results = db.backlinks(article_path)
     db.close()
+    if json_output:
+        _emit_json(results)
+        return
     if not results:
         click.echo("No backlinks found.")
         return
@@ -980,7 +1055,8 @@ def backlinks(article_path):
 
 @cli.command("source")
 @click.argument("source_path")
-def source_info(source_path):
+@json_option
+def source_info(source_path, json_output):
     """Show everything known about a source.
 
     Displays the source metadata and all articles distilled from it.
@@ -998,8 +1074,17 @@ def source_info(source_path):
                 src = s
                 break
     if not src:
-        click.echo(f"Source not found: {source_path}")
         db.close()
+        if json_output:
+            _emit_json(None)
+            return
+        click.echo(f"Source not found: {source_path}")
+        return
+
+    if json_output:
+        articles = db.source_articles(src["id"])
+        db.close()
+        _emit_json({**src, "articles": articles})
         return
 
     click.echo(f"Source: {src['title']}")
@@ -1024,12 +1109,16 @@ def source_info(source_path):
 
 @cli.command()
 @click.argument("article_path")
-def sources(article_path):
+@json_option
+def sources(article_path, json_output):
     """Show primary sources for an article."""
     root = get_root()
     db = get_db(root)
     results = db.article_sources(article_path)
     db.close()
+    if json_output:
+        _emit_json(results)
+        return
     if not results:
         click.echo("No sources linked.")
         return
@@ -1041,7 +1130,8 @@ def sources(article_path):
 
 @cli.command()
 @click.option("--all", "query_all", is_flag=True, help="Include all registered crucibles")
-def concepts(query_all):
+@json_option
+def concepts(query_all, json_output):
     """List all concepts with article counts."""
     root = get_root()
     db = get_db(root)
@@ -1052,6 +1142,9 @@ def concepts(query_all):
     else:
         results = db.list_concepts()
     db.close()
+    if json_output:
+        _emit_json(results)
+        return
     if not results:
         click.echo("No concepts yet.")
         return
@@ -1063,12 +1156,16 @@ def concepts(query_all):
 
 @cli.command()
 @click.argument("name")
-def concept(name):
+@json_option
+def concept(name, json_output):
     """Show articles covering a concept."""
     root = get_root()
     db = get_db(root)
     results = db.concept_articles(name)
     db.close()
+    if json_output:
+        _emit_json(results)
+        return
     if not results:
         click.echo(f"No articles found for concept '{name}'.")
         return
@@ -1077,12 +1174,16 @@ def concept(name):
 
 
 @cli.command()
-def orphans():
+@json_option
+def orphans(json_output):
     """Show articles with no incoming links."""
     root = get_root()
     db = get_db(root)
     results = db.orphans()
     db.close()
+    if json_output:
+        _emit_json(results)
+        return
     if not results:
         click.echo("No orphan articles.")
         return
@@ -1091,12 +1192,16 @@ def orphans():
 
 
 @cli.command()
-def undigested():
+@json_option
+def undigested(json_output):
     """Show sources with no articles distilled from them."""
     root = get_root()
     db = get_db(root)
     results = db.undigested()
     db.close()
+    if json_output:
+        _emit_json(results)
+        return
     if not results:
         click.echo("All sources have been distilled.")
         return
@@ -1106,7 +1211,8 @@ def undigested():
 
 @cli.command()
 @click.argument("article_path")
-def related(article_path):
+@json_option
+def related(article_path, json_output):
     """Show articles related through implied links.
 
     Computes relationships via shared concepts, shared sources,
@@ -1116,6 +1222,9 @@ def related(article_path):
     db = get_db(root)
     results = db.related(article_path)
     db.close()
+    if json_output:
+        _emit_json(results)
+        return
     if not results:
         click.echo("No related articles found.")
         return
@@ -1817,12 +1926,16 @@ def _parse_bib_entries(text: str) -> dict[str, str]:
 
 
 @cli.command()
-def stats():
+@json_option
+def stats(json_output):
     """Show database statistics."""
     root = get_root()
     db = get_db(root)
     s = db.stats()
     db.close()
+    if json_output:
+        _emit_json(s)
+        return
     click.echo(f"Sources:  {s['sources']}")
     click.echo(f"Articles: {s['articles']}")
     click.echo(f"Concepts: {s['concepts']}")
@@ -2011,7 +2124,7 @@ def index():
 
 
 @cli.command()
-@click.option("--json-output", "-j", is_flag=True, help="Output as JSON for agents")
+@json_option
 def lint(json_output):
     """Check wiki health and report issues.
 
@@ -2030,6 +2143,7 @@ def lint(json_output):
                 "type": "missing_file",
                 "severity": "error",
                 "message": f"Article registered in db but file missing: {article['path']}",
+                "path": article['path'],
             })
             continue
         meta = parse_org_file(org_path)
@@ -2040,6 +2154,8 @@ def lint(json_output):
                     "type": "broken_link",
                     "severity": "warning",
                     "message": f"Broken link in {article['path']}: {link}",
+                    "path": article['path'],
+                    "link": link,
                 })
 
     # 2. Orphan articles (no incoming links)
@@ -2049,6 +2165,7 @@ def lint(json_output):
             "type": "orphan",
             "severity": "info",
             "message": f"No incoming links: {a['path']} ({a['title']})",
+            "path": a['path'],
         })
 
     # 3. Undigested sources
@@ -2058,6 +2175,7 @@ def lint(json_output):
             "type": "undigested",
             "severity": "warning",
             "message": f"Source not yet distilled: {s['title']} ({s['path']})",
+            "path": s['path'],
         })
 
     # 4. Concepts without dedicated articles
@@ -2080,18 +2198,21 @@ def lint(json_output):
                 "type": "missing_property",
                 "severity": "warning",
                 "message": f"Missing ARTICLE_TYPE property: {article['path']}",
+                "path": article['path'],
             })
         if not meta.properties.get("SOURCE_KEYS"):
             issues.append({
                 "type": "missing_property",
                 "severity": "info",
                 "message": f"Missing SOURCE_KEYS property: {article['path']}",
+                "path": article['path'],
             })
         if not meta.filetags:
             issues.append({
                 "type": "missing_tags",
                 "severity": "warning",
                 "message": f"No filetags: {article['path']}",
+                "path": article['path'],
             })
 
     # 6. Wiki files not in database
@@ -2105,6 +2226,7 @@ def lint(json_output):
                 "type": "untracked",
                 "severity": "warning",
                 "message": f"Wiki file not in database (run crucible sync): {rel}",
+                "path": rel,
             })
 
     # 7. Citation keys not in references.bib
@@ -2126,12 +2248,14 @@ def lint(json_output):
                     "type": "missing_citation",
                     "severity": "warning",
                     "message": f"Citation key '{key}' in {article['path']} not found in references.bib",
+                    "path": article['path'],
+                    "key": key,
                 })
 
     db.close()
 
     if json_output:
-        click.echo(json.dumps(issues, indent=2))
+        _emit_json(issues)
         return
 
     if not issues:
@@ -2155,7 +2279,7 @@ def lint(json_output):
 
 
 @cli.command()
-@click.option("--json-output", "-j", is_flag=True, help="Output as JSON for agents")
+@json_option
 def suggest(json_output):
     """Suggest improvements to the wiki.
 
@@ -2279,7 +2403,7 @@ def suggest(json_output):
     suggestions = deduped
 
     if json_output:
-        click.echo(json.dumps(suggestions, indent=2))
+        _emit_json(suggestions)
         return
 
     if not suggestions:

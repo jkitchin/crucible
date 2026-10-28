@@ -5,16 +5,21 @@
 
 ** =crucible init=
 
-Initialize the crucible database. Creates =db/crucible.db= with all tables.
+Initialize a crucible project. Creates =.crucible/= in the project root
+with the wiki and source directories, =references.bib= and the database
+=.crucible/crucible.db=, registers the project in the global registry and
+runs =crucible install=.
 
 #+BEGIN_SRC bash
-crucible init --root /path/to/crucible
+crucible init --root /path/to/project
 #+END_SRC
 
-If =--root= is omitted, auto-detects by walking up from cwd looking for
-a directory with =CLAUDE.md= and =db/=.
+If =--root= is omitted, the current directory is used. Other commands find
+the project by walking up from the current directory to the nearest
+=.crucible/wiki/=. The home directory cannot be a project, because
+=~/.crucible/= holds the global registry.
 
-Safe to re-run: uses =CREATE TABLE IF NOT EXISTS=.
+Safe to re-run: creates only what is missing.
 
 ** =crucible install=
 
@@ -226,14 +231,16 @@ Organized by article type and by concept.
 Check wiki health and report issues.
 
 #+BEGIN_SRC bash
-crucible lint [-j]
+crucible lint [--json]
 #+END_SRC
 
 Checks: broken file links, missing article files, orphan articles,
 undigested sources, missing concept articles, missing properties/filetags,
 wiki files not in database.
 
-=-j= outputs JSON for agent consumption.
+=--json= outputs a list of issues, each with =type=, =severity=,
+=message= and the =path= it concerns (plus =link= for a broken link and
+=key= for a missing citation).
 
 ** =crucible suggest=
 
@@ -338,3 +345,26 @@ crucible help [TOPIC]
 
 Topics: overview, workflow, ingest, distill, search, sync, maintain,
 org-format. Use =all= for everything.
+
+* JSON Output
+
+The read commands take =--json= (also spelled =--json-output= or =-j=) and
+print JSON on stdout instead of text, for editors, scripts and agents:
+=about=, =stats=, =search=, =concepts=, =concept=, =backlinks=,
+=sources=, =source=, =related=, =history=, =orphans=, =undigested=,
+=registry list=, =lint= and =suggest=. Messages such as the database
+rebuild notice go to stderr, so stdout is always valid JSON.
+
+Article and source paths are relative to the project root, which
+=crucible about --json= gives along with the wiki and bibliography paths:
+
+#+BEGIN_SRC bash
+crucible about --json      # {"version", "schema_version", "project": {"root", "wiki", "bibliography", ...}, "registry": [...]}
+crucible search "activation energy" --json   # list of articles (path, title, article_type, abstract, scores)
+crucible history wiki-article.org --json     # {"derived_from": [...], "derivatives": [...]}
+crucible registry list --json                # registered crucibles, with their database path (null if missing)
+#+END_SRC
+
+A command with no results prints =[]= (=source= prints =null= for an
+unknown source). =search --all --json= marks each result from a peer with
+=_crucible=, its registry name.

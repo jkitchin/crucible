@@ -27,7 +27,9 @@ FILETAGS_RE = re.compile(r"^#\+FILETAGS:\s*(.+)$", re.MULTILINE)
 PROP_DRAWER_RE = re.compile(
     r":PROPERTIES:\s*\n(.*?)\n\s*:END:", re.DOTALL
 )
-PROP_LINE_RE = re.compile(r"^\s*:([A-Z_]+):\s+(.+?)\s*$", re.MULTILINE)
+# [ \t], not \s: \s matches a newline, so an empty property would take
+# the next property line as its value.
+PROP_LINE_RE = re.compile(r"^[ \t]*:([A-Z_]+):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 FILE_LINK_RE = re.compile(r"\[\[file:([^\]]+?)(?:::.*?)?\](?:\[([^\]]*)\])?\]")
 CITE_RE = re.compile(r"(?:cite[pt]?):([a-zA-Z0-9_,-]+)")
 

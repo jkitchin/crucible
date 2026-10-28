@@ -8,22 +8,31 @@ the LLM's domain; humans rarely edit it directly.
 
 ## Directory Layout
 
-- `sources/` - Primary source documents, organized by shareability:
+A crucible project keeps everything in `.crucible/` at its root:
+
+- `.crucible/sources/` - Primary source documents, organized by shareability:
   - `external/` - Copyrighted material (PDFs, web articles). Gitignored.
     - `pdfs/` - Academic papers, reports
     - `web/` - Web clippings
   - `notebooks/` - Your own ELN entries. NOT gitignored.
   - `data/` - Your own experimental data. NOT gitignored.
-- `wiki/` - Distilled org-mode articles. Shareable. Organized by type:
+- `.crucible/wiki/` - Distilled org-mode articles. Shareable. Organized by type:
   - `concepts/` - Concept articles (one topic per file)
   - `summaries/` - Per-source summaries
   - `comparisons/` - Cross-source comparison articles
   - `methods/` - Methodology articles
   - `index.org` - Auto-maintained master index
-- `db/crucible.db` - Wiki graph database (SQLite). Tracks sources, articles,
+- `.crucible/crucible.db` - Wiki graph database (SQLite). Tracks sources, articles,
   concepts, and links between them. Regenerable from wiki content.
-- `bin/crucible` - CLI entry point
-- `src/crucible/` - Python source code
+- `.crucible/references.bib` - Bibliography of ingested sources
+
+`~/.crucible/registry.json` is the global registry of crucibles, so the home
+directory cannot itself be a project.
+
+This repository holds the CLI (`src/crucible/`, entry point `crucible.cli:cli`),
+the agent skill (`skills/crucible/`), docs (`docs/`) and tests (`tests/`, run
+with `pytest`). Tests must point `HOME` and the registry at a temporary
+directory: `crucible init` runs `install`, which writes `~/.claude/`.
 
 ## Conventions
 
