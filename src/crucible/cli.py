@@ -552,6 +552,44 @@ def _safe_relative_to(target: Path, root: Path) -> str | None:
         return None
 
 
+def _resolve_source_keys(keys: list[str], sources: list[dict]) -> dict[str, list[int]]:
+    """Resolve cite keys, falling back to legacy source paths and titles."""
+    key_to_src = {}
+    legacy_sources = []
+    for src in sources:
+        raw = src.get("metadata") or "{}"
+        try:
+            md = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (ValueError, TypeError):
+            md = {}
+        if md.get("cite_key"):
+            key_to_src[md["cite_key"]] = src["id"]
+        else:
+            legacy_sources.append(src)
+
+    return {
+        key: [key_to_src[key]]
+        if key in key_to_src
+        else [
+            src["id"]
+            for src in legacy_sources
+            if key in src["path"] or key in src.get("title", "")
+        ]
+        for key in keys
+        if key
+    }
+
+
+def _warn_skipped_bib(cite_key: str, reason: str) -> None:
+    ctx = click.get_current_context(silent=True)
+    if ctx is not None:
+        warned = ctx.meta.setdefault("crucible_skipped_bib", set())
+        if (cite_key, reason) in warned:
+            return
+        warned.add((cite_key, reason))
+    click.echo(f"Warning: BibTeX entry '{cite_key}' skipped: {reason}.", err=True)
+
+
 def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
     """Core sync logic: scan wiki/*.org and reconcile with the DB.
 
@@ -652,40 +690,9 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
             if source_keys:
-                # Match SOURCE_KEYS against each source's cite_key (stored in
-                # sources.metadata JSON at ingest), which is the canonical
-                # identity. Fall back to the legacy substring test on
-                # path/title only for sources that have no cite_key, so
-                # pre-cite_key projects keep linking.
-                sources = db.list_sources()
-                key_to_src = {}
-                for src in sources:
-                    raw = src.get("metadata") or "{}"
-                    try:
-                        md = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                    except (ValueError, TypeError):
-                        md = {}
-                    if md.get("cite_key"):
-                        key_to_src[md["cite_key"]] = src["id"]
-
-                for key in source_keys:
-                    if not key:
-                        continue
-                    sid = key_to_src.get(key)
-                    if sid is not None:
+                for source_ids in _resolve_source_keys(source_keys, db.list_sources()).values():
+                    for sid in source_ids:
                         db.link_article_source(article_id, sid)
-                        continue
-                    # Legacy fallback for sources lacking a cite_key.
-                    for src in sources:
-                        raw = src.get("metadata") or "{}"
-                        try:
-                            md = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                        except (ValueError, TypeError):
-                            md = {}
-                        if md.get("cite_key"):
-                            continue
-                        if key in src["path"] or key in src.get("title", ""):
-                            db.link_article_source(article_id, src["id"])
 
             derived_from = meta.properties.get("DERIVED_FROM", "").split()
             for ref in derived_from:
@@ -718,7 +725,7 @@ def _rebuild_db_from_wiki(root: Path, db: CrucibleDB) -> dict:
     )
 
     sources_added = upsert_sources_from_disk(root, db)
-    sources_added += upsert_sources_from_bib(root, db)
+    sources_added += upsert_sources_from_bib(root, db, on_skip=_warn_skipped_bib)
     sync_stats = _sync_wiki_to_db(root, db)
     _write_manifest(root, db)
     _write_index(root, db)
@@ -733,8 +740,8 @@ def sync():
     links, citations), and updates the articles, concepts, and links
     tables. Also upserts sources from references.bib and from the
     sources/notebooks and sources/data directories so new entries get
-    picked up automatically. Run this after Claude writes or updates
-    wiki articles.
+    picked up automatically. Unresolved bibliography entries are reported
+    on stderr. Run this after Claude writes or updates wiki articles.
     """
     from crucible.ingest import (
         upsert_sources_from_bib,
@@ -749,7 +756,7 @@ def sync():
     registry_register(root.name, str(root))
 
     sources_added = upsert_sources_from_disk(root, db)
-    sources_added += upsert_sources_from_bib(root, db)
+    sources_added += upsert_sources_from_bib(root, db, on_skip=_warn_skipped_bib)
 
     stats = _sync_wiki_to_db(
         root, db,
@@ -2140,7 +2147,7 @@ def lint(json_output):
     """Check wiki health and report issues.
 
     Finds broken links, orphan articles, missing concept articles,
-    stale sources, and other consistency problems.
+    stale sources, unresolved source keys, and other consistency problems.
     """
     root = get_root()
     db = get_db(root)
@@ -2198,7 +2205,8 @@ def lint(json_output):
             "message": f"Concept '{c}' has no dedicated concept article",
         })
 
-    # 5. Articles missing required properties
+    # 5. Articles missing required properties or referencing unknown sources
+    sources = db.list_sources()
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
@@ -2211,13 +2219,24 @@ def lint(json_output):
                 "message": f"Missing ARTICLE_TYPE property: {article['path']}",
                 "path": article['path'],
             })
-        if not meta.properties.get("SOURCE_KEYS"):
+        source_keys = meta.properties.get("SOURCE_KEYS", "").split()
+        if not source_keys:
             issues.append({
                 "type": "missing_property",
                 "severity": "info",
                 "message": f"Missing SOURCE_KEYS property: {article['path']}",
                 "path": article['path'],
             })
+        else:
+            for key, source_ids in _resolve_source_keys(source_keys, sources).items():
+                if not source_ids:
+                    issues.append({
+                        "type": "unresolved_source_key",
+                        "severity": "warning",
+                        "message": f"Unresolved SOURCE_KEYS value '{key}' in {article['path']}",
+                        "path": article['path'],
+                        "key": key,
+                    })
         if not meta.filetags:
             issues.append({
                 "type": "missing_tags",

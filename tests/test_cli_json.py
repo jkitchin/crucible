@@ -130,6 +130,209 @@ def test_lint_json_issues_name_their_file(project):
     assert json.loads(result.stdout) == issues
 
 
+def test_lint_resolves_source_keys_like_sync(project):
+    cdir = project / ".crucible"
+    external = cdir / "sources" / "external" / "pdfs"
+    external.mkdir(parents=True, exist_ok=True)
+    records = [
+        ("paper.pdf", "Canonical source", {"cite_key": "known2026"}),
+        ("legacy-path-file.pdf", "Legacy source", {}),
+        ("other.pdf", "Vintage source", {}),
+        ("badmetadata-file.pdf", "Old source", {}),
+        ("known2026-copy.pdf", "Lower priority", {}),
+        ("falsepositive2026.pdf", "Different source", {"cite_key": "different2026"}),
+    ]
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        for filename, title, metadata in records:
+            path = external / filename
+            path.write_text("Synthetic source.")
+            source_id = db.add_source(
+                path=str(path.relative_to(project)),
+                title=title,
+                source_type="pdf",
+                metadata=metadata,
+            )
+            if filename == "badmetadata-file.pdf":
+                db.conn.execute(
+                    "UPDATE sources SET metadata = ? WHERE id = ?",
+                    ("{invalid", source_id),
+                )
+                db.conn.commit()
+    finally:
+        db.close()
+
+    data = cdir / "sources" / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "title-matched.md").write_text("Synthetic source.")
+    (external / "explicit.pdf").write_text("Synthetic source.")
+    (cdir / "references.bib").write_text(
+        "@misc{titlematch2026,\n  title = {Title Matched}\n}\n"
+        "@misc{filematch2026,\n  title = {Explicit Source},\n"
+        "  file = {.crucible/sources/external/pdfs/explicit.pdf}\n}\n"
+        "@misc{bibonly2026,\n  title = {No Local File}\n}\n"
+    )
+    keys = (
+        "known2026 legacy-path Vintage badmetadata titlematch2026 "
+        "filematch2026 missing2026 bibonly2026 falsepositive2026"
+    )
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", f":SOURCE_KEYS: {keys}")
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    sources = run_json("sources", CONCEPT_PATH)
+    assert {source["path"] for source in sources} == {
+        ".crucible/sources/external/pdfs/paper.pdf",
+        ".crucible/sources/external/pdfs/legacy-path-file.pdf",
+        ".crucible/sources/external/pdfs/other.pdf",
+        ".crucible/sources/external/pdfs/badmetadata-file.pdf",
+        ".crucible/sources/external/pdfs/explicit.pdf",
+        ".crucible/sources/data/title-matched.md",
+    }
+
+    issues = run_json("lint")
+    unresolved = {
+        issue["key"]: issue
+        for issue in issues
+        if issue["type"] == "unresolved_source_key" and issue["path"] == CONCEPT_PATH
+    }
+    assert set(unresolved) == {"missing2026", "bibonly2026", "falsepositive2026"}
+    for key, issue in unresolved.items():
+        assert issue["severity"] == "warning"
+        assert key in issue["message"]
+
+
+def test_sync_warns_for_unmatched_and_ambiguous_bib_entries(project):
+    cdir = project / ".crucible"
+    data = cdir / "sources" / "data"
+    notebooks = cdir / "sources" / "notebooks"
+    external = cdir / "sources" / "external" / "pdfs"
+    for directory in (data, notebooks, external):
+        directory.mkdir(parents=True, exist_ok=True)
+    for name in ("unique.md", "shared-title.md", "duplicate-bib.md"):
+        (data / name).write_text("Synthetic source.")
+    (notebooks / "shared-title.org").write_text("#+TITLE: Shared Title\n")
+    (external / "explicit.pdf").write_text("Synthetic source.")
+    (external / "registered.pdf").write_text("Synthetic source.")
+    (external / "shared-file.pdf").write_text("Synthetic source.")
+
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/sources/external/pdfs/registered.pdf",
+            title="Registered source",
+            source_type="pdf",
+            metadata={"cite_key": "registered2026"},
+        )
+    finally:
+        db.close()
+    (cdir / "references.bib").write_text(
+        "@misc{unique2026,\n  title = {Unique}\n}\n"
+        "@misc{explicit2026,\n  title = {Explicit},\n"
+        "  file = {.crucible/sources/external/pdfs/explicit.pdf}\n}\n"
+        "@misc{registered2026,\n  title = {Already Registered}\n}\n"
+        "@misc{orphan2026,\n  title = {No Local File}\n}\n"
+        "@misc{ambiguous2026,\n  title = {Shared Title}\n}\n"
+        "@misc{duplicate2026a,\n  title = {Duplicate Bib}\n}\n"
+        "@misc{duplicate2026b,\n  title = {Duplicate Bib}\n}\n"
+        "@misc{samefile2026a,\n  title = {First Entry},\n"
+        "  file = {.crucible/sources/external/pdfs/shared-file.pdf}\n}\n"
+        "@misc{samefile2026b,\n  title = {Second Entry},\n"
+        "  file = {.crucible/sources/external/pdfs/shared-file.pdf}\n}\n"
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    for key, reason in (
+        ("orphan2026", "no matching"),
+        ("ambiguous2026", "ambiguous"),
+        ("duplicate2026a", "ambiguous"),
+        ("duplicate2026b", "ambiguous"),
+        ("samefile2026b", "already"),
+    ):
+        messages = [line.lower() for line in result.stderr.splitlines() if key in line]
+        assert len(messages) == 1
+        assert reason in messages[0]
+    for key in ("unique2026", "explicit2026", "registered2026", "samefile2026a"):
+        assert key not in result.stderr
+
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        sources = db.list_sources()
+    finally:
+        db.close()
+    source_keys = {json.loads(source["metadata"]).get("cite_key") for source in sources}
+    assert {
+        "unique2026",
+        "explicit2026",
+        "registered2026",
+        "samefile2026a",
+    } <= source_keys
+    skipped = {
+        "orphan2026",
+        "ambiguous2026",
+        "duplicate2026a",
+        "duplicate2026b",
+        "samefile2026b",
+    }
+    assert not skipped & source_keys
+    assert all((project / source["path"]).is_file() for source in sources)
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "samefile2026a" in result.stderr
+    assert "reassigned" in result.stderr
+
+
+def test_sync_warns_when_bib_registration_fails(project, monkeypatch):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "external" / "pdfs" / "rejected.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    (cdir / "references.bib").write_text(
+        "@misc{rejected2026,\n  title = {Rejected Entry},\n"
+        "  file = {.crucible/sources/external/pdfs/rejected.pdf}\n}\n"
+    )
+
+    original = CrucibleDB.add_source
+
+    def reject_entry(self, *args, **kwargs):
+        if kwargs.get("title") == "Rejected Entry":
+            raise ValueError("Synthetic registration failure")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CrucibleDB, "add_source", reject_entry)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "rejected2026" in result.stderr
+    assert "registration failed" in result.stderr
+
+
+def test_lint_rebuild_warnings_preserve_json_stdout(project):
+    cdir = project / ".crucible"
+    (cdir / "references.bib").write_text(
+        "@misc{bibonly2026,\n  title = {No Local File}\n}\n"
+    )
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: bibonly2026")
+    )
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
+
+    result = CliRunner().invoke(cli, ["lint", "--json"])
+    assert result.exit_code == 0, result.output
+    issues = json.loads(result.stdout)
+    assert result.stderr.count("bibonly2026") == 1
+    assert any(
+        issue["type"] == "unresolved_source_key"
+        and issue["key"] == "bibonly2026"
+        and issue["severity"] == "warning"
+        for issue in issues
+    )
+
+
 def test_registry_list_json(project):
     entries = run_json("registry", "list")
     entry = next(e for e in entries if e["path"] == str(project.resolve()))
@@ -227,6 +430,7 @@ def test_rebuild_reconciles_bib_entries_with_data_files(project):
 
     result = CliRunner().invoke(cli, ["sync"])
     assert result.exit_code == 0, result.output
+    assert result.stderr.count("orphan2026") == 1
 
     db = CrucibleDB(cdir / "crucible.db")
     try:

@@ -425,7 +425,7 @@ def upsert_sources_from_disk(root: Path, db) -> int:
     return inserted
 
 
-def upsert_sources_from_bib(root: Path, db) -> int:
+def upsert_sources_from_bib(root: Path, db, on_skip=None) -> int:
     """Reconcile source rows with entries in .crucible/references.bib.
 
     Entries with a file field use that path. Entries without one are matched
@@ -433,7 +433,8 @@ def upsert_sources_from_bib(root: Path, db) -> int:
     without a match are skipped rather than assigned a synthetic path.
     Safe to call repeatedly. Used by auto-rebuild and `crucible sync`.
 
-    Returns the number of new sources inserted.
+    Returns the number of new sources inserted. If supplied, on_skip is
+    called with the cite key and reason for each unresolved entry.
     """
     import json as _json
 
@@ -515,10 +516,20 @@ def upsert_sources_from_bib(root: Path, db) -> int:
             continue
 
         if not file_field:
+            if on_skip is not None:
+                if len(matches) > 1:
+                    reason = "ambiguous title (multiple matching sources)"
+                elif len(matches) == 1 and bib_title_counts.get(title, 0) > 1:
+                    reason = "ambiguous title (multiple bibliography entries)"
+                else:
+                    reason = "no matching data or notebook source"
+                on_skip(cite_key, reason)
             continue
 
         assert rel_path is not None
         if rel_path in existing_paths:
+            if on_skip is not None:
+                on_skip(cite_key, "file path already assigned to another source")
             continue
 
         source_type = _source_type_for_entry(entry["entry_type"], abs_path)
@@ -545,7 +556,18 @@ def upsert_sources_from_bib(root: Path, db) -> int:
             existing_paths.add(rel_path)
             inserted += 1
         except Exception:
+            if on_skip is not None:
+                on_skip(cite_key, "source registration failed")
             continue
+
+    if on_skip is not None:
+        remaining_keys = {
+            key for src in db.list_sources()
+            if (key := _source_metadata(src).get("cite_key"))
+        }
+        bib_keys = {entry["cite_key"] for entry in entries}
+        for key in sorted((existing_cite_keys & bib_keys) - remaining_keys):
+            on_skip(key, "source key reassigned during reconciliation")
 
     return inserted
 
