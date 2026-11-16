@@ -563,7 +563,9 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         on_skip = lambda _p: None  # noqa: E731
 
     wiki_dir = cdir(root) / "wiki"
-    org_files = sorted(wiki_dir.rglob("*.org"))
+    org_files = sorted(
+        p for p in wiki_dir.rglob("*.org") if p != wiki_dir / "index.org"
+    )
 
     stats = {
         "added": 0,
@@ -715,8 +717,8 @@ def _rebuild_db_from_wiki(root: Path, db: CrucibleDB) -> dict:
         upsert_sources_from_disk,
     )
 
-    sources_added = upsert_sources_from_bib(root, db)
-    sources_added += upsert_sources_from_disk(root, db)
+    sources_added = upsert_sources_from_disk(root, db)
+    sources_added += upsert_sources_from_bib(root, db)
     sync_stats = _sync_wiki_to_db(root, db)
     _write_manifest(root, db)
     _write_index(root, db)
@@ -746,8 +748,8 @@ def sync():
     from crucible.registry import register as registry_register
     registry_register(root.name, str(root))
 
-    sources_added = upsert_sources_from_bib(root, db)
-    sources_added += upsert_sources_from_disk(root, db)
+    sources_added = upsert_sources_from_disk(root, db)
+    sources_added += upsert_sources_from_bib(root, db)
 
     stats = _sync_wiki_to_db(
         root, db,
@@ -2228,7 +2230,7 @@ def lint(json_output):
     wiki_dir = cdir(root) / "wiki"
     for org_path in wiki_dir.rglob("*.org"):
         rel = str(org_path.relative_to(root))
-        if rel.endswith("index.org"):
+        if org_path == wiki_dir / "index.org":
             continue
         if not db.get_article_by_path(rel):
             issues.append({

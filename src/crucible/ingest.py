@@ -349,7 +349,7 @@ def upsert_sources_from_disk(root: Path, db) -> int:
     These directories are committed to git (unlike sources/external/), so a
     fresh clone has the files but no sources table. Scans both directories
     and creates a source row for each file, using the filename stem as the
-    cite_key in metadata. Skips hidden files, extracted text sidecars
+    default cite_key in metadata. Skips hidden files, extracted text sidecars
     (*.txt next to a non-txt source), and entries whose path already exists
     in the sources table.
 
@@ -395,8 +395,7 @@ def upsert_sources_from_disk(root: Path, db) -> int:
                 except Exception:
                     pass
 
-            detected = detect_source_type(path)
-            source_type = detected if detected != "other" else default_type
+            source_type = default_type
 
             metadata = {"cite_key": cite_key}
 
@@ -427,11 +426,12 @@ def upsert_sources_from_disk(root: Path, db) -> int:
 
 
 def upsert_sources_from_bib(root: Path, db) -> int:
-    """Create sources rows for every entry in .crucible/references.bib.
+    """Reconcile source rows with entries in .crucible/references.bib.
 
-    Safe to call repeatedly: entries whose cite_key already exists in
-    sources.metadata are skipped. Used by auto-rebuild (no DB) and by
-    `crucible sync` so bib edits are picked up without re-ingesting.
+    Entries with a file field use that path. Entries without one are matched
+    to a unique source in sources/data or sources/notebooks by title; entries
+    without a match are skipped rather than assigned a synthetic path.
+    Safe to call repeatedly. Used by auto-rebuild and `crucible sync`.
 
     Returns the number of new sources inserted.
     """
@@ -442,8 +442,20 @@ def upsert_sources_from_bib(root: Path, db) -> int:
     if not entries:
         return 0
 
+    def normalize_title(title: str) -> str:
+        return " ".join(title.casefold().split())
+
+    bib_title_counts: dict[str, int] = {}
+    for entry in entries:
+        title = normalize_title(entry.get("title", ""))
+        if title:
+            bib_title_counts[title] = bib_title_counts.get(title, 0) + 1
+
+    sources = db.list_sources()
     existing_cite_keys: set[str] = set()
-    for src in db.list_sources():
+    sources_by_path = {src["path"]: src for src in sources}
+    sources_by_title: dict[str, list[dict]] = {}
+    for src in sources:
         raw = src.get("metadata") or "{}"
         try:
             meta = _json.loads(raw) if isinstance(raw, str) else (raw or {})
@@ -452,8 +464,14 @@ def upsert_sources_from_bib(root: Path, db) -> int:
         key = meta.get("cite_key")
         if key:
             existing_cite_keys.add(key)
+        if src["path"].startswith((
+            f"{CRUCIBLE_DIR}/sources/notebooks/",
+            f"{CRUCIBLE_DIR}/sources/data/",
+        )):
+            normalized_title = normalize_title(src.get("title", ""))
+            sources_by_title.setdefault(normalized_title, []).append(src)
 
-    existing_paths: set[str] = {src["path"] for src in db.list_sources()}
+    existing_paths: set[str] = set(sources_by_path)
 
     inserted = 0
     for entry in entries:
@@ -475,9 +493,31 @@ def upsert_sources_from_bib(root: Path, db) -> int:
             except ValueError:
                 rel_path = str(abs_path)
 
-        if rel_path is None:
-            rel_path = f"{CRUCIBLE_DIR}/bib/{cite_key}"
+        matched_source = sources_by_path.get(rel_path) if rel_path else None
+        if matched_source is None and not file_field:
+            title = normalize_title(entry.get("title", ""))
+            matches = sources_by_title.get(title, [])
+            if len(matches) == 1 and bib_title_counts.get(title) == 1:
+                matched_source = matches[0]
 
+        metadata: dict = {}
+        if matched_source:
+            raw = matched_source.get("metadata") or "{}"
+            try:
+                metadata = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except (ValueError, TypeError):
+                metadata = {}
+            metadata["cite_key"] = cite_key
+            if entry.get("doi"):
+                metadata["doi"] = entry["doi"]
+            db.update_source_metadata(matched_source["id"], metadata)
+            existing_cite_keys.add(cite_key)
+            continue
+
+        if not file_field:
+            continue
+
+        assert rel_path is not None
         if rel_path in existing_paths:
             continue
 
@@ -486,7 +526,7 @@ def upsert_sources_from_bib(root: Path, db) -> int:
         authors = _authors_from_bib(entry.get("author", ""))
         date = entry.get("year") or None
 
-        metadata: dict = {"cite_key": cite_key}
+        metadata = {"cite_key": cite_key}
         if entry.get("doi"):
             metadata["doi"] = entry["doi"]
 

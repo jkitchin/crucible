@@ -406,6 +406,13 @@ class CrucibleDB:
         row = self.conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
         return dict(row) if row else None
 
+    def update_source_metadata(self, source_id: int, metadata: dict):
+        self.conn.execute(
+            "UPDATE sources SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata), source_id),
+        )
+        self.conn.commit()
+
     def list_sources(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM sources ORDER BY ingested_at DESC")]
 

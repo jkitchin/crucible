@@ -7,6 +7,7 @@ from click.testing import CliRunner
 
 from crucible import registry as registry_module
 from crucible.cli import cli
+from crucible.database import CrucibleDB
 
 CONCEPT = """#+TITLE: Activation energy
 #+FILETAGS: :concept:kinetics:
@@ -164,6 +165,83 @@ def test_sync_stores_and_updates_article_metadata(project):
     results = run_json("search", "platinum", "--mode", "fts")
     assert results[0]["status"] == "verified"
     assert results[0]["title"] == "Smith 2024 measurements"
+
+
+def test_sync_preserves_lowercase_org_keywords(project):
+    concept = project / CONCEPT_PATH
+    concept.write_text(
+        CONCEPT.replace("#+TITLE: Activation energy", "#+title: Lowercase title")
+        .replace("#+FILETAGS: :concept:kinetics:", "#+filetags: :concept:lowercase-tag:")
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    results = run_json("search", "barrier", "--mode", "fts")
+    assert results[0]["title"] == "Lowercase title"
+    concepts = {c["name"] for c in run_json("concepts")}
+    assert "lowercase-tag" in concepts
+
+
+def test_sync_ignores_generated_index(project):
+    result = CliRunner().invoke(cli, ["index"])
+    assert result.exit_code == 0, result.output
+    assert (project / ".crucible" / "wiki" / "index.org").exists()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    assert run_json("stats")["articles"] == 2
+    issues = run_json("lint")
+    assert not any(
+        issue.get("path") == ".crucible/wiki/index.org"
+        and issue["type"] == "missing_property"
+        for issue in issues
+    )
+
+
+def test_rebuild_reconciles_bib_entries_with_data_files(project):
+    cdir = project / ".crucible"
+    data_dir = cdir / "sources" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "widget-notes.md").write_text("Notes for the widget experiment.")
+    (cdir / "references.bib").write_text(
+        "@misc{widget2026,\n  title = {Widget Notes},\n  year = {2026}\n}\n\n"
+        "@misc{orphan2026,\n  title = {Orphan Notes}\n}\n"
+    )
+    article_path = ".crucible/wiki/summaries/widget.org"
+    (project / article_path).write_text(
+        "#+TITLE: Widget experiment\n"
+        "#+FILETAGS: :summary:widgets:\n\n"
+        "* Widget experiment\n"
+        ":PROPERTIES:\n"
+        ":ARTICLE_TYPE: summary\n"
+        ":SOURCE_KEYS: widget2026\n"
+        ":STATUS: draft\n"
+        ":END:\n\n"
+        "Notes from the widget experiment.\n"
+    )
+
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        sources = db.list_sources()
+    finally:
+        db.close()
+
+    assert len(sources) == 1
+    source = sources[0]
+    assert source["path"] == ".crucible/sources/data/widget-notes.md"
+    assert source["title"] == "Widget Notes"
+    assert source["source_type"] == "data"
+    assert json.loads(source["metadata"])["cite_key"] == "widget2026"
+    linked_sources = run_json("sources", article_path)
+    assert [item["path"] for item in linked_sources] == [source["path"]]
 
 
 def test_install_points_the_global_directive_at_this_crucible(project, registry):
