@@ -12,7 +12,7 @@ import urllib.parse
 from pathlib import Path, PurePosixPath
 
 from crucible import bibtex
-from crucible.orgparse import CITATION_RE, citation_keys, citation_type
+from crucible.orgparse import CITATION_RE, FILE_LINK_RE, citation_keys, citation_type
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +111,11 @@ _COMMENT_BLOCK_RE = re.compile(
 _TABLE_BLOCK_RE = re.compile(r"((?:^[ \t]*\|.*$\n?)+)", re.MULTILINE)
 
 # Inline patterns
-_FILE_LINK_RE = re.compile(
-    r"\[\[file:([^\]]+?)(?:::.*?)?\](?:\[([^\]]*)\])?\]"
-)
+# Wiki links are what sync counts as links: [[file:x.org]] and the
+# prefix-less forms org also reads as file links ([[./x.org]],
+# [[../m/y.org][Y]], [[x.org]]). Other schemes (https:, javascript:, ...)
+# never match, so they fall to the plain-link rules below.
+_FILE_LINK_RE = FILE_LINK_RE
 _PLAIN_LINK_RE = re.compile(
     r"\[\[([^\]]+)\]\[([^\]]*)\]\]"
 )
@@ -236,8 +238,7 @@ def _process_inline(text: str, current_path: str,
     # File links
     text = _FILE_LINK_RE.sub(lambda m: _hold(_rewrite_file_link(m, current_path)), text)
 
-    # Citations (with bib tooltips, linked to references page). Before plain
-    # links, so [[cite:&key][description]] renders as a citation.
+    # Citations (with bib tooltips, linked to references page).
     def _cite_repl(m: re.Match) -> str:
         cite_type = citation_type(m)
         keys = citation_keys(m)
@@ -252,18 +253,26 @@ def _process_inline(text: str, current_path: str,
                 )
             else:
                 spans.append(
-                    f'<a class="citation" href="/_references#{ekey}" title="{cite_type}:{ekey}">[{ekey}]</a>'
+                    f'<a class="citation" href="/_references#{ekey}" '
+                    f'title="{html.escape(cite_type)}:{ekey}">[{ekey}]</a>'
                 )
         return _hold("".join(spans))
 
-    text = CITATION_RE.sub(_cite_repl, text)
+    # Bracketed citation links ([[cite:&key][description]]) first, so the
+    # plain-link rule below does not take them for unknown links.
+    text = CITATION_RE.sub(
+        lambda m: _cite_repl(m) if m.group("btype") else m.group(0), text)
 
-    # Plain links
+    # Plain links, then external links without a description. Before bare
+    # citations, so a link target is taken literally: the "cite:foo" in
+    # [[https://example.com/ cite:foo][desc]] is part of the URL, not a
+    # citation to restore inside href="...". Held as placeholders so the
+    # italic pattern cannot match the slashes in them.
     text = _PLAIN_LINK_RE.sub(lambda m: _hold(_rewrite_plain_link(m)), text)
-
-    # External links without a description, then bare URLs. Held as
-    # placeholders so the italic pattern cannot match the slashes in them.
     text = _BARE_LINK_RE.sub(lambda m: _hold(_external_link(m.group(1))), text)
+
+    # Bare citations (cite:key in prose), then bare URLs.
+    text = CITATION_RE.sub(_cite_repl, text)
     text = _URL_RE.sub(lambda m: _bare_url(m.group(0), _hold), text)
 
     # LaTeX (before other inline markup to avoid conflicts)
@@ -891,7 +900,7 @@ def _build_nav_html(articles: list[dict]) -> str:
         if atype in type_labels:
             continue
         items.sort(key=lambda a: a["title"].lower())
-        parts.append(f"<h2>{atype.title()} ({len(items)})</h2>")
+        parts.append(f"<h2>{html.escape(str(atype).title())} ({len(items)})</h2>")
         parts.append("<ul>")
         for a in items:
             path = _url_path(a["path"])
@@ -930,8 +939,8 @@ def _build_index_html(articles: list[dict]) -> str:
         for a in items:
             path = _url_path(a["path"])
             title = html.escape(a["title"])
-            status = a.get("status", "")
-            meta = f'<span class="meta">{status}</span>' if status else ""
+            status = a.get("status") or ""
+            meta = f'<span class="meta">{html.escape(str(status))}</span>' if status else ""
             parts.append(f'<li><a href="{_href(path)}">{title}</a>{meta}</li>')
         parts.append("</ul></div>")
 
@@ -940,7 +949,8 @@ def _build_index_html(articles: list[dict]) -> str:
         if atype in type_labels:
             continue
         items.sort(key=lambda a: a["title"].lower())
-        parts.append(f'<div class="article-list"><h2>{atype.title()}</h2><ul>')
+        parts.append(
+            f'<div class="article-list"><h2>{html.escape(str(atype).title())}</h2><ul>')
         for a in items:
             path = _url_path(a["path"])
             title = html.escape(a["title"])
@@ -1033,8 +1043,9 @@ def _build_topics_html(concepts: list[dict],
             for a in articles:
                 path = _url_path(a["path"])
                 title = html.escape(a["title"])
-                atype = a.get("article_type", "")
-                meta = f' <span class="meta">{atype}</span>' if atype else ""
+                atype = a.get("article_type") or ""
+                meta = (f' <span class="meta">{html.escape(str(atype))}</span>'
+                        if atype else "")
                 parts.append(f'<li><a href="{_href(path)}">{title}</a>{meta}</li>')
             parts.append("</ul>")
         else:
@@ -1225,8 +1236,19 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
                                   self.articles, self.bib),
             )
         elif path == "/_graph":
-            # Built from the database on every request, so it is never stale,
-            # with node clicks opening browse pages rather than VS Code.
+            self._serve_graph()
+        elif path == "/_static/style.css":
+            self._send_response(200, "text/css", _BROWSE_CSS.encode("utf-8"))
+        else:
+            # Serve an org file
+            self._serve_org(path)
+
+    def _serve_graph(self):
+        """Serve the link graph, built from the database on every request so
+        it is never stale, with node clicks opening browse pages rather than
+        VS Code. A failure (a database mid-write, a malformed row) is an
+        error page, not a dropped connection."""
+        try:
             from crucible.cli import viz_html  # cli imports this module
             from crucible.database import CrucibleDB
             db = CrucibleDB(self.db_path)
@@ -1235,13 +1257,12 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
                                       link_mode="browse")
             finally:
                 db.close()
-            self._send_response(200, "text/html; charset=utf-8",
-                                body.encode("utf-8"))
-        elif path == "/_static/style.css":
-            self._send_response(200, "text/css", _BROWSE_CSS.encode("utf-8"))
-        else:
-            # Serve an org file
-            self._serve_org(path)
+        except Exception as e:  # noqa: BLE001 - any failure is an error page
+            self._send_error(
+                500, f"Could not build the graph: {type(e).__name__}: {e}")
+            return
+        self._send_response(200, "text/html; charset=utf-8",
+                            body.encode("utf-8"))
 
     def _serve_org(self, url_path: str):
         """Convert and serve an org file (or an image) from the wiki."""

@@ -195,9 +195,18 @@ def _fts_query(raw: str) -> str:
     Each whitespace-separated token is wrapped as a quoted string literal so
     FTS5 query operators in user input (-, :, parentheses, the bare keywords
     AND/OR/NOT/NEAR) are treated as ordinary text rather than crashing the
-    parser. A token ending in * is a prefix query (catal* matches catalysis).
-    Prefixes are stemmed like every other word (porter turns "cataly" into
-    "catali"), so the prefix one character shorter is matched too.
+    parser. A token with no letter or digit in it ("&", "-", "/", an en
+    dash) is dropped: the tokenizer reads it as an empty phrase, which,
+    ANDed with the rest, would make every search return nothing.
+
+    A token ending in * is a prefix query on exactly that prefix: catal*
+    matches catalysis, catalyst and catalog, not catastrophe. The index
+    holds porter stems ("catalysi", "catalyst", "oxid" for oxidation) and
+    the prefix is stemmed too, so a prefix that cuts into a suffix porter
+    rewrites or removes can miss: cataly* (stemmed to "catali") finds no
+    catalysis, oxidat* no oxidation. Use the shorter prefix (catal*, oxid*)
+    for those. Also matching the prefix one character shorter was tried
+    and dropped: it made catal* match catastrophe and catapult.
 
     The match is limited to the title and content columns: the path column
     holds ".crucible/wiki/concepts/x.org", whose words would otherwise match
@@ -214,12 +223,10 @@ def _fts_query(raw: str) -> str:
     terms = []
     for token in cleaned.split():
         stem = token.rstrip("*")
-        if not stem:
-            continue  # a bare "*" means nothing
+        if not any(ch.isalnum() for ch in stem):
+            continue  # "*", "&", "--": nothing the tokenizer would index
         if stem == token:
             terms.append(_fts_literal(token))
-        elif len(stem) > 3:
-            terms.append(f"({_fts_literal(stem)}* OR {_fts_literal(stem[:-1])}*)")
         else:
             terms.append(f"{_fts_literal(stem)}*")
     if not terms:
@@ -239,27 +246,47 @@ class CrucibleDB:
         raw_conn.execute("PRAGMA busy_timeout = 5000")
         self.conn = DictConnection(raw_conn)
         self._attached: dict[str, str] = {}
+        # (stamp, {concept key: [concept ids]}); see _concept_ids_by_key.
+        self._concept_key_cache: tuple | None = None
 
     def initialize(self):
-        """Create all tables and set schema version."""
+        """Create all tables, run pending migrations and set schema version.
+
+        The version on disk is read before the new one is recorded, so an
+        older database is migrated; a brand-new one has nothing to migrate
+        and is simply stamped with SCHEMA_VERSION.
+        """
+        current = self._stored_version()
         for statement in SCHEMA_SQL.split(";"):
             statement = statement.strip()
             if statement:
                 self.conn.execute(statement)
+        self.conn.commit()
+        if current:
+            self._migrate(current)
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
         self.conn.commit()
-        self._migrate()
 
-    def _migrate(self):
-        """Run any pending migrations based on schema_version."""
+    def _stored_version(self) -> int:
+        """The schema version of the database as found on disk.
+
+        0 for a brand-new (empty) database. One with crucible tables but no
+        recorded version predates versioning and counts as v1.
+        """
+        version = self.schema_version()
+        if version:
+            return version
         row = self.conn.execute(
-            "SELECT MAX(version) as v FROM schema_version"
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'"
+            " AND name IN ('articles', 'sources', 'peers')"
         ).fetchone()
-        current = row["v"] if row else 0
+        return 1 if row and row["n"] else 0
 
+    def _migrate(self, current: int):
+        """Run the migrations from version `current` up to SCHEMA_VERSION."""
         if current < 2:
             self._migrate_v2()
         # Future migrations:
@@ -279,7 +306,7 @@ class CrucibleDB:
             row = self.conn.execute(
                 "SELECT MAX(version) as v FROM schema_version"
             ).fetchone()
-            return row["v"] if row else 0
+            return (row["v"] or 0) if row else 0
         except (ValueError, Exception):
             # Table doesn't exist yet (pre-init database)
             return 0
@@ -737,6 +764,27 @@ class CrucibleDB:
             WHERE a.path = ?
         """, (article_path,))]
 
+    def _concept_ids_by_key(self) -> dict[str, list[int]]:
+        """Concept ids grouped by _concept_key of their names.
+
+        Cached per connection: building it scans every concept, and callers
+        such as suggest look up each concept in turn. The cache is dropped
+        whenever this connection writes (total_changes) or another one
+        commits (data_version).
+        """
+        stamp = (
+            self.conn.execute("PRAGMA data_version").fetchone()["data_version"],
+            self.conn.execute("SELECT total_changes() AS n").fetchone()["n"],
+        )
+        cached = self._concept_key_cache
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        by_key: dict[str, list[int]] = {}
+        for r in self.conn.execute("SELECT id, name FROM concepts ORDER BY id"):
+            by_key.setdefault(_concept_key(r["name"]), []).append(r["id"])
+        self._concept_key_cache = (stamp, by_key)
+        return by_key
+
     def concept_articles(self, concept_name: str) -> list[dict]:
         """Articles covering a given concept.
 
@@ -747,8 +795,7 @@ class CrucibleDB:
         key = _concept_key(concept_name)
         if not key:
             return []
-        ids = [r["id"] for r in self.conn.execute("SELECT id, name FROM concepts")
-               if _concept_key(r["name"]) == key]
+        ids = self._concept_ids_by_key().get(key)
         if not ids:
             return []
         marks = ",".join("?" * len(ids))
@@ -782,17 +829,33 @@ class CrucibleDB:
 
     def graph_dot(self) -> str:
         """Export the article link graph in DOT format."""
+        def quoted(text: str | None) -> str:
+            # A DOT string escapes only \ and "; an unescaped trailing
+            # backslash would escape the closing quote.
+            text = (text or "").replace("\\", "\\\\").replace('"', '\\"')
+            return '"' + text.replace("\r", " ").replace("\n", " ") + '"'
+
         lines = ["digraph crucible {", "  rankdir=LR;", "  node [shape=box];"]
-        for row in self.conn.execute("""
-            SELECT a1.path as from_path, a1.title as from_title,
-                   a2.path as to_path, a2.title as to_title
+        links = [dict(r) for r in self.conn.execute("""
+            SELECT al.from_id, al.to_id
             FROM article_links al
             JOIN articles a1 ON a1.id = al.from_id
             JOIN articles a2 ON a2.id = al.to_id
-        """):
-            from_label = row["from_title"].replace('"', '\\"')
-            to_label = row["to_title"].replace('"', '\\"')
-            lines.append(f'  "{from_label}" -> "{to_label}";')
+            ORDER BY a1.path, a2.path
+        """)]
+        # Nodes are named by article id and labelled with the title, so
+        # two articles that share a title stay two nodes.
+        ids = sorted({r["from_id"] for r in links} | {r["to_id"] for r in links})
+        if ids:
+            marks = ",".join("?" * len(ids))
+            for row in self.conn.execute(
+                f"SELECT id, title, path FROM articles WHERE id IN ({marks})"
+                " ORDER BY path", tuple(ids),
+            ):
+                lines.append(f'  a{row["id"]} [label={quoted(row["title"])},'
+                             f' tooltip={quoted(row["path"])}];')
+        for r in links:
+            lines.append(f'  a{r["from_id"]} -> a{r["to_id"]};')
         lines.append("}")
         return "\n".join(lines)
 
