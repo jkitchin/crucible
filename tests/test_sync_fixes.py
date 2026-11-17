@@ -300,3 +300,13 @@ def test_sync_leaves_generated_pages_alone_when_only_the_date_differs(kb):
     sync()
     assert "1999-01-01" not in (wiki(kb) / "index.org").read_text()
     assert "concepts/b.org" in (wiki(kb) / "index.org").read_text()
+
+
+def test_lint_reports_an_unreadable_article_without_crashing(kb):
+    write(kb, "concepts/a.org", title="A", body="see cite:nokey")
+    sync()
+    path = wiki(kb) / "concepts/a.org"
+    path.write_bytes(path.read_bytes() + b"\nPt caf\xe9\n")
+    result = CliRunner().invoke(cli, ["lint", "--json"])
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
+    assert "unreadable_file" in result.output

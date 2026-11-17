@@ -3021,7 +3021,9 @@ def _rewrite_article_links(
     count = 0
 
     for org_file, final_path in files:
-        content = org_file.read_text(encoding="utf-8")
+        # surrogateescape round-trips bytes that are not valid UTF-8, so
+        # one badly encoded file neither aborts the merge nor is mangled.
+        content = org_file.read_text(encoding="utf-8", errors="surrogateescape")
 
         def repl(match: re.Match) -> str:
             # An org search option (file:foo.org::*Heading) is not part of
@@ -3041,7 +3043,8 @@ def _rewrite_article_links(
         # One pass, so a link already rewritten is not rewritten again.
         new_content = re.sub(r"\[\[file:(.*?)\]", repl, content)
         if new_content != content:
-            org_file.write_text(new_content, encoding="utf-8")
+            org_file.write_text(new_content, encoding="utf-8",
+                                errors="surrogateescape")
             count += 1
 
     return count
@@ -3454,7 +3457,10 @@ def lint(strict, json_output):
         org_path = root / article["path"]
         if not org_path.exists():
             continue
-        meta = parse_org_file(org_path)
+        try:
+            meta = parse_org_file(org_path)
+        except (UnicodeDecodeError, OSError):
+            continue  # reported above as unreadable_file
         if not meta.properties.get("ARTICLE_TYPE"):
             issues.append({
                 "type": "missing_property",
@@ -3560,7 +3566,10 @@ def lint(strict, json_output):
         org_path = root / article["path"]
         if not org_path.exists():
             continue
-        meta = parse_org_file(org_path)
+        try:
+            meta = parse_org_file(org_path)
+        except (UnicodeDecodeError, OSError):
+            continue  # reported above as unreadable_file
         for key in meta.cite_keys:
             if key not in bib_keys:
                 issues.append({

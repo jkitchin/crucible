@@ -1077,3 +1077,20 @@ def test_merge_copies_an_index_article_in_a_subdirectory(project, tmp_path):
     assert (project / ".crucible/wiki/concepts/index.org").exists()
     after = target_index.read_text() if target_index.exists() else None
     assert after is None or "Generated index" not in after or before == after
+
+
+def test_merge_keeps_non_utf8_article_bytes(project, tmp_path):
+    """A badly encoded incoming article neither aborts the merge nor is mangled."""
+    source = make_crucible(tmp_path / "src")
+    wiki = source / ".crucible/wiki/concepts"
+    # Same name as the target's article, so it is renamed and its links rewritten.
+    (wiki / "activation-energy.org").write_bytes(
+        CONCEPT.encode() + b"See [[file:other.org][other]]. Caf\xe9.\n"
+    )
+    (wiki / "other.org").write_text(CONCEPT.replace("Activation energy", "Other"))
+    result = CliRunner().invoke(cli, ["merge", str(source), "--yes"])
+    assert result.exit_code == 0, result.output
+    merged = [p for p in (project / ".crucible/wiki/concepts").glob("activation-energy*.org")
+              if b"Caf\xe9" in p.read_bytes()]
+    assert len(merged) == 1
+    assert b"Caf\xe9." in merged[0].read_bytes()
