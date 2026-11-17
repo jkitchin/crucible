@@ -204,6 +204,63 @@ def test_lint_resolves_source_keys_like_sync(project):
         assert key in issue["message"]
 
 
+def test_lint_reports_duplicate_canonical_source_keys(project):
+    cdir = project / ".crucible"
+    duplicate_paths = []
+    for subdir in ("data", "notebooks"):
+        source = cdir / "sources" / subdir / "shared2026.md"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("Synthetic source.")
+        duplicate_paths.append(str(source.relative_to(project)))
+
+    unique = cdir / "sources" / "data" / "single2026.md"
+    unique.write_text("Synthetic source.")
+    legacy_paths = []
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        for key in ("shared2026", "single2026"):
+            source = cdir / "sources" / "external" / "pdfs" / f"{key}-legacy.pdf"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("Synthetic legacy source.")
+            path = str(source.relative_to(project))
+            legacy_paths.append(path)
+            db.add_source(path=path, title="Legacy source", source_type="pdf", metadata={})
+    finally:
+        db.close()
+
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(
+            ":SOURCE_KEYS:", ":SOURCE_KEYS: shared2026 single2026 missing2026"
+        )
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    linked_paths = {source["path"] for source in run_json("sources", CONCEPT_PATH)}
+    assert linked_paths.intersection(duplicate_paths)
+    assert str(unique.relative_to(project)) in linked_paths
+    assert not linked_paths.intersection(legacy_paths)
+
+    issues = run_json("lint")
+    collisions = [issue for issue in issues if issue["type"] == "ambiguous_source_key"]
+    assert len(collisions) == 1
+    assert collisions[0]["severity"] == "warning"
+    assert collisions[0]["key"] == "shared2026"
+    assert collisions[0]["source_paths"] == sorted(duplicate_paths)
+    assert {
+        issue["key"]
+        for issue in issues
+        if issue["type"] == "unresolved_source_key" and issue["path"] == CONCEPT_PATH
+    } == {"missing2026"}
+    result = CliRunner().invoke(cli, ["lint", "-j"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == issues
+
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: single2026")
+    )
+    assert any(issue["type"] == "ambiguous_source_key" for issue in run_json("lint"))
+
+
 def test_sync_warns_for_unmatched_and_ambiguous_bib_entries(project):
     cdir = project / ".crucible"
     data = cdir / "sources" / "data"
@@ -256,7 +313,7 @@ def test_sync_warns_for_unmatched_and_ambiguous_bib_entries(project):
         assert len(messages) == 1
         assert reason in messages[0]
     for key in ("unique2026", "explicit2026", "registered2026", "samefile2026a"):
-        assert key not in result.stderr
+        assert f"BibTeX entry '{key}' skipped" not in result.stderr
 
     db = CrucibleDB(cdir / "crucible.db")
     try:
@@ -282,32 +339,559 @@ def test_sync_warns_for_unmatched_and_ambiguous_bib_entries(project):
 
     result = CliRunner().invoke(cli, ["sync"])
     assert result.exit_code == 0, result.output
-    assert "samefile2026a" in result.stderr
-    assert "reassigned" in result.stderr
+    assert "samefile2026b" in result.stderr
+    assert "BibTeX entry 'samefile2026a' skipped" not in result.stderr
 
 
-def test_sync_warns_when_bib_registration_fails(project, monkeypatch):
+@pytest.mark.parametrize(
+    ("source_subdir", "filename", "article_keys"),
+    [
+        ("external/pdfs", "shared.pdf", "first2026 second2026"),
+        ("data", "shared.md", "first2026 second2026"),
+        ("data", "second2026.md", "first2026"),
+    ],
+)
+def test_sync_keeps_first_bib_owner_and_links_after_fresh_rebuild(
+    project, source_subdir, filename, article_keys
+):
     cdir = project / ".crucible"
-    source = cdir / "sources" / "external" / "pdfs" / "rejected.pdf"
+    source = cdir / "sources" / source_subdir / filename
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_text("Synthetic source.")
-    (cdir / "references.bib").write_text(
-        "@misc{rejected2026,\n  title = {Rejected Entry},\n"
-        "  file = {.crucible/sources/external/pdfs/rejected.pdf}\n}\n"
+    source_path = str(source.relative_to(project))
+    first = (
+        "@misc{first2026,\n  title = {First Entry},\n"
+        f"  file = {{{source_path}}}\n}}\n"
     )
+    second = (
+        "@misc{second2026,\n  title = {Second Entry},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    bib = cdir / "references.bib"
+    bib.write_text(first + second)
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", f":SOURCE_KEYS: {article_keys}")
+    )
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
 
-    original = CrucibleDB.add_source
+    source_id = None
+    for _ in range(4):
+        result = CliRunner().invoke(cli, ["sync"])
+        assert result.exit_code == 0, result.output
+        assert "second2026" in result.stderr
+        assert "BibTeX entry 'first2026' skipped" not in result.stderr
+        db = CrucibleDB(cdir / "crucible.db")
+        try:
+            sources = db.list_sources()
+            linked = db.article_sources(CONCEPT_PATH)
+            link_count = db.conn.execute(
+                "SELECT COUNT(*) AS count FROM article_sources"
+            ).fetchone()["count"]
+        finally:
+            db.close()
+        assert len(sources) == 1
+        source_id = sources[0]["id"] if source_id is None else source_id
+        assert sources[0]["id"] == source_id
+        assert sources[0]["path"] == source_path
+        metadata = json.loads(sources[0]["metadata"])
+        assert metadata["cite_key"] == "first2026"
+        assert "cite_key_inferred" not in metadata
+        assert [(item["id"], json.loads(item["metadata"])["cite_key"]) for item in linked] == [
+            (source_id, "first2026")
+        ]
+        assert link_count == 1
 
-    def reject_entry(self, *args, **kwargs):
-        if kwargs.get("title") == "Rejected Entry":
-            raise ValueError("Synthetic registration failure")
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(CrucibleDB, "add_source", reject_entry)
+    bib.write_text(second + first)
     result = CliRunner().invoke(cli, ["sync"])
     assert result.exit_code == 0, result.output
-    assert "rejected2026" in result.stderr
-    assert "registration failed" in result.stderr
+    assert "second2026" in result.stderr
+    linked = run_json("sources", CONCEPT_PATH)
+    assert [(item["id"], json.loads(item["metadata"])["cite_key"]) for item in linked] == [
+        (source_id, "first2026")
+    ]
+
+
+@pytest.mark.parametrize("include_bib_key", [False, True])
+def test_fresh_rebuild_preserves_wiki_referenced_inferred_key(project, include_bib_key):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "data" / "original.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    source_path = str(source.relative_to(project))
+    keys = "original new2026" if include_bib_key else "original"
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", f":SOURCE_KEYS: {keys}")
+    )
+    (cdir / "references.bib").write_text(
+        "@misc{new2026,\n  title = {Original},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
+
+    source_id = None
+    for _ in range(4):
+        result = CliRunner().invoke(cli, ["sync"])
+        assert result.exit_code == 0, result.output
+        assert "new2026" in result.stderr
+        assert "original" in result.stderr
+        assert source_path in result.stderr
+        assert "reconcile" in result.stderr.lower()
+        db = CrucibleDB(cdir / "crucible.db")
+        try:
+            sources = db.list_sources()
+            linked = db.article_sources(CONCEPT_PATH)
+        finally:
+            db.close()
+        assert len(sources) == 1
+        source_id = sources[0]["id"] if source_id is None else source_id
+        assert sources[0]["id"] == source_id
+        metadata = json.loads(sources[0]["metadata"])
+        assert metadata["cite_key"] == "original"
+        assert metadata["cite_key_inferred"] is True
+        assert [row["id"] for row in linked] == [source_id]
+        unresolved = {
+            issue["key"]
+            for issue in run_json("lint")
+            if issue["type"] == "unresolved_source_key" and issue["path"] == CONCEPT_PATH
+        }
+        assert unresolved == ({"new2026"} if include_bib_key else set())
+
+
+def test_fresh_rebuild_prioritizes_wiki_key_over_earlier_bib_entry(project):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "data" / "second2026.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    source_path = str(source.relative_to(project))
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: first2026 second2026")
+    )
+    first = (
+        "@misc{first2026,\n  title = {First Entry},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    second = (
+        "@misc{second2026,\n  title = {Second Entry},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    bib = cdir / "references.bib"
+    bib.write_text(first + second)
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
+
+    source_id = None
+    for _ in range(4):
+        result = CliRunner().invoke(cli, ["sync"])
+        assert result.exit_code == 0, result.output
+        assert "BibTeX entry 'first2026' skipped" in result.stderr
+        assert "second2026" in result.stderr
+        db = CrucibleDB(cdir / "crucible.db")
+        try:
+            sources = db.list_sources()
+            linked = db.article_sources(CONCEPT_PATH)
+        finally:
+            db.close()
+        assert len(sources) == 1
+        source_id = sources[0]["id"] if source_id is None else source_id
+        assert sources[0]["id"] == source_id
+        metadata = json.loads(sources[0]["metadata"])
+        assert metadata["cite_key"] == "second2026"
+        assert "cite_key_inferred" not in metadata
+        assert [row["id"] for row in linked] == [source_id]
+        assert any(
+            issue["type"] == "unresolved_source_key" and issue["key"] == "first2026"
+            for issue in run_json("lint")
+        )
+
+    bib.write_text(second + first)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "BibTeX entry 'first2026' skipped" in result.stderr
+    linked = run_json("sources", CONCEPT_PATH)
+    assert [(row["id"], json.loads(row["metadata"])["cite_key"]) for row in linked] == [
+        (source_id, "second2026")
+    ]
+
+
+def test_fresh_rebuild_preserves_key_referenced_without_replacement(project):
+    cdir = project / ".crucible"
+    first_source = cdir / "sources" / "data" / "shared.md"
+    other_source = cdir / "sources" / "external" / "pdfs" / "other.pdf"
+    for source in (first_source, other_source):
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("Synthetic source.")
+    first_path = str(first_source.relative_to(project))
+    other_path = str(other_source.relative_to(project))
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: first2026 shared")
+    )
+    (project / SUMMARY_PATH).write_text(
+        SUMMARY.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: shared")
+    )
+    (cdir / "references.bib").write_text(
+        "@misc{first2026,\n  title = {First Source},\n"
+        f"  file = {{{first_path}}}\n}}\n"
+        "@misc{shared,\n  title = {Other Source},\n"
+        f"  file = {{{other_path}}}\n}}\n"
+    )
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "first2026" in result.stderr
+    assert "shared" in result.stderr
+    warning = next(
+        line for line in result.stderr.splitlines()
+        if "BibTeX entry 'first2026' skipped" in line
+    )
+    assert SUMMARY_PATH in warning
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        sources = db.list_sources()
+        concept_sources = db.article_sources(CONCEPT_PATH)
+        summary_sources = db.article_sources(SUMMARY_PATH)
+    finally:
+        db.close()
+    assert len(sources) == 1
+    assert json.loads(sources[0]["metadata"])["cite_key"] == "shared"
+    assert [row["id"] for row in concept_sources] == [sources[0]["id"]]
+    assert [row["id"] for row in summary_sources] == [sources[0]["id"]]
+    assert any(
+        issue["type"] == "unresolved_source_key"
+        and issue["key"] == "first2026"
+        and issue["path"] == CONCEPT_PATH
+        for issue in run_json("lint")
+    )
+
+
+@pytest.mark.parametrize("duplicate_stem", [False, True])
+def test_sync_tracks_keys_when_reconciling_disk_sources(project, duplicate_stem):
+    cdir = project / ".crucible"
+    first_source = cdir / "sources" / "data" / "first" / "shared.md"
+    if duplicate_stem:
+        second_source = cdir / "sources" / "data" / "second" / "shared.md"
+    else:
+        second_source = cdir / "sources" / "external" / "pdfs" / "other.pdf"
+    for source in (first_source, second_source):
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("Synthetic source.")
+    first_path = str(first_source.relative_to(project))
+    second_path = str(second_source.relative_to(project))
+    (cdir / "references.bib").write_text(
+        "@misc{first2026,\n  title = {First Source},\n"
+        f"  file = {{{first_path}}}\n}}\n"
+        "@misc{shared,\n  title = {Second Source},\n"
+        f"  file = {{{second_path}}}\n}}\n"
+    )
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: first2026 shared")
+    )
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
+
+    for _ in range(2):
+        result = CliRunner().invoke(cli, ["sync"])
+        assert result.exit_code == 0, result.output
+        assert "skipped" not in result.stderr
+        linked = run_json("sources", CONCEPT_PATH)
+        assert {
+            item["path"]: json.loads(item["metadata"])["cite_key"]
+            for item in linked
+        } == {first_path: "first2026", second_path: "shared"}
+        assert all("cite_key_inferred" not in json.loads(item["metadata"]) for item in linked)
+
+
+@pytest.mark.parametrize("source_kind", ["registered", "linked_stem"])
+def test_sync_preserves_existing_source_provenance(project, source_kind):
+    cdir = project / ".crucible"
+    if source_kind == "registered":
+        source = cdir / "sources" / "external" / "pdfs" / "original.pdf"
+        old_key = "original2026"
+    else:
+        source = cdir / "sources" / "data" / "original.md"
+        old_key = "original"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    source_path = str(source.relative_to(project))
+    if source_kind == "registered":
+        db = CrucibleDB(cdir / "crucible.db")
+        try:
+            db.add_source(
+                path=source_path,
+                title="Original",
+                source_type="pdf",
+                metadata={"cite_key": old_key},
+            )
+        finally:
+            db.close()
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", f":SOURCE_KEYS: {old_key}")
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    linked = run_json("sources", CONCEPT_PATH)
+    assert len(linked) == 1
+    source_id = linked[0]["id"]
+    if source_kind == "linked_stem":
+        assert json.loads(linked[0]["metadata"])["cite_key_inferred"] is True
+
+    (cdir / "references.bib").write_text(
+        "@misc{new2026,\n  title = {Original},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "new2026" in result.stderr
+    linked = run_json("sources", CONCEPT_PATH)
+    assert len(linked) == 1
+    assert linked[0]["id"] == source_id
+    metadata = json.loads(linked[0]["metadata"])
+    assert metadata["cite_key"] == old_key
+    if source_kind == "linked_stem":
+        assert metadata["cite_key_inferred"] is True
+
+
+@pytest.mark.parametrize("registered_key", [False, True])
+def test_sync_distinguishes_existing_inferred_and_bibliography_keys(project, registered_key):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "data" / "original.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    source_path = str(source.relative_to(project))
+    bib = cdir / "references.bib"
+    if registered_key:
+        bib.write_text(
+            "@misc{original,\n  title = {Original},\n"
+            f"  file = {{{source_path}}}\n}}\n"
+        )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_row = db.list_sources()[0]
+    finally:
+        db.close()
+    source_id = source_row["id"]
+    metadata = json.loads(source_row["metadata"])
+    if registered_key:
+        assert "cite_key_inferred" not in metadata
+    else:
+        assert metadata["cite_key_inferred"] is True
+
+    bib.write_text(
+        "@misc{new2026,\n  title = {Original},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        sources = db.list_sources()
+    finally:
+        db.close()
+    assert len(sources) == 1
+    assert sources[0]["id"] == source_id
+    expected = "original" if registered_key else "new2026"
+    metadata = json.loads(sources[0]["metadata"])
+    assert metadata["cite_key"] == expected
+    assert "cite_key_inferred" not in metadata
+
+
+@pytest.mark.parametrize("match_method", ["file", "title"])
+def test_sync_confirms_linked_inferred_key_with_matching_bib_entry(project, match_method):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "data" / "original.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    source_path = str(source.relative_to(project))
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: original")
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    linked = run_json("sources", CONCEPT_PATH)
+    assert len(linked) == 1
+    source_id = linked[0]["id"]
+    assert json.loads(linked[0]["metadata"])["cite_key_inferred"] is True
+
+    file_field = f"  file = {{{source_path}}}\n" if match_method == "file" else ""
+    (cdir / "references.bib").write_text(
+        f"@misc{{original,\n  title = {{Original}},\n{file_field}}}\n"
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    linked = run_json("sources", CONCEPT_PATH)
+    assert len(linked) == 1 and linked[0]["id"] == source_id
+    metadata = json.loads(linked[0]["metadata"])
+    assert metadata["cite_key"] == "original"
+    assert "cite_key_inferred" not in metadata
+
+    (cdir / "references.bib").write_text(
+        "@misc{new2026,\n  title = {Original},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "new2026" in result.stderr
+    linked = run_json("sources", CONCEPT_PATH)
+    assert len(linked) == 1 and linked[0]["id"] == source_id
+    assert json.loads(linked[0]["metadata"])["cite_key"] == "original"
+
+
+def test_sync_preserves_unmarked_legacy_cite_key(project):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "data" / "original.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    source_path = str(source.relative_to(project))
+    metadata = {"cite_key": "original", "custom": "keep"}
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_id = db.add_source(
+            path=source_path, title="Original", source_type="data", metadata=metadata
+        )
+    finally:
+        db.close()
+
+    (cdir / "references.bib").write_text(
+        "@misc{new2026,\n  title = {Original},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "new2026" in result.stderr
+    assert source_path in result.stderr
+    assert "original" in result.stderr
+    assert "reconcile" in result.stderr.lower()
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_row = db.get_source(source_id)
+    finally:
+        db.close()
+    assert json.loads(source_row["metadata"]) == metadata
+
+
+def test_sync_does_not_confirm_inferred_key_for_different_file(project):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "data" / "shared.md"
+    other = cdir / "sources" / "external" / "pdfs" / "different.pdf"
+    for path in (source, other):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Synthetic source.")
+    source_path = str(source.relative_to(project))
+    other_path = str(other.relative_to(project))
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_row = db.list_sources()[0]
+    finally:
+        db.close()
+    source_id = source_row["id"]
+    assert json.loads(source_row["metadata"])["cite_key_inferred"] is True
+
+    bib = cdir / "references.bib"
+    bib.write_text(
+        "@misc{shared,\n  title = {Different},\n"
+        f"  file = {{{other_path}}}\n}}\n"
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "shared" in result.stderr
+    assert "different source" in result.stderr.lower()
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_row = db.get_source(source_id)
+    finally:
+        db.close()
+    assert json.loads(source_row["metadata"])["cite_key_inferred"] is True
+
+    bib.write_text(
+        "@misc{real2026,\n  title = {Shared},\n"
+        f"  file = {{{source_path}}}\n}}\n"
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_row = db.get_source(source_id)
+    finally:
+        db.close()
+    metadata = json.loads(source_row["metadata"])
+    assert metadata["cite_key"] == "real2026"
+    assert "cite_key_inferred" not in metadata
+
+
+def test_sync_does_not_confirm_inferred_key_for_ambiguous_title(project):
+    cdir = project / ".crucible"
+    source = cdir / "sources" / "data" / "original.md"
+    notebook = cdir / "sources" / "notebooks" / "other.org"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    notebook.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    notebook.write_text("#+TITLE: Original\n")
+    (cdir / "references.bib").write_text(
+        "@misc{original,\n  title = {Original}\n}\n"
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "original" in result.stderr
+    assert "unique source title" in result.stderr
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        rows = db.list_sources()
+    finally:
+        db.close()
+    source_row = next(row for row in rows if row["path"] == str(source.relative_to(project)))
+    assert json.loads(source_row["metadata"])["cite_key_inferred"] is True
+
+
+@pytest.mark.parametrize("fresh_db", [False, True])
+@pytest.mark.parametrize("source_kind", ["bib", "disk"])
+def test_sync_propagates_unexpected_source_registration_failures(
+    project, monkeypatch, source_kind, fresh_db
+):
+    cdir = project / ".crucible"
+    if source_kind == "bib":
+        source = cdir / "sources" / "external" / "pdfs" / "rejected.pdf"
+    else:
+        source = cdir / "sources" / "data" / "rejected.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("Synthetic source.")
+    if source_kind == "bib":
+        (cdir / "references.bib").write_text(
+            "@misc{rejected2026,\n  title = {Rejected Entry},\n"
+            "  file = {.crucible/sources/external/pdfs/rejected.pdf}\n}\n"
+        )
+    if fresh_db:
+        for db_file in cdir.glob("crucible.db*"):
+            db_file.unlink()
+
+    closed = []
+    original_close = CrucibleDB.close
+    error_type = RuntimeError if source_kind == "disk" else ValueError
+
+    def reject_entry(self, *args, **kwargs):
+        raise error_type("Synthetic registration failure")
+
+    def close_db(self):
+        closed.append(self)
+        original_close(self)
+
+    monkeypatch.setattr(CrucibleDB, "add_source", reject_entry)
+    monkeypatch.setattr(CrucibleDB, "close", close_db)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, error_type)
+    assert str(result.exception) == "Synthetic registration failure"
+    assert "Sync complete" not in result.stdout
+    assert len(closed) == 1
 
 
 def test_lint_rebuild_warnings_preserve_json_stdout(project):

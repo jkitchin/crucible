@@ -10,7 +10,7 @@ import click
 from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
-from crucible.ingest import ingest_source
+from crucible.ingest import _source_metadata, ingest_source
 from crucible.orgparse import parse_org_file
 
 
@@ -741,7 +741,10 @@ def sync():
     tables. Also upserts sources from references.bib and from the
     sources/notebooks and sources/data directories so new entries get
     picked up automatically. Unresolved bibliography entries are reported
-    on stderr. Run this after Claude writes or updates wiki articles.
+    on stderr. Filename-inferred source keys remain provisional until confirmed
+    by the bibliography; unmarked, linked, and wiki-referenced keys are
+    preserved on conflicts.
+    Run this after Claude writes or updates wiki articles.
     """
     from crucible.ingest import (
         upsert_sources_from_bib,
@@ -750,21 +753,22 @@ def sync():
 
     root = get_root()
     db = get_db(root)
+    try:
+        # Auto-register in global registry (ensures pre-registry crucibles get registered)
+        from crucible.registry import register as registry_register
+        registry_register(root.name, str(root))
 
-    # Auto-register in global registry (ensures pre-registry crucibles get registered)
-    from crucible.registry import register as registry_register
-    registry_register(root.name, str(root))
+        sources_added = upsert_sources_from_disk(root, db)
+        sources_added += upsert_sources_from_bib(root, db, on_skip=_warn_skipped_bib)
 
-    sources_added = upsert_sources_from_disk(root, db)
-    sources_added += upsert_sources_from_bib(root, db, on_skip=_warn_skipped_bib)
-
-    stats = _sync_wiki_to_db(
-        root, db,
-        on_skip=lambda p: click.echo(
-            f"  Skipping {p.name} (modified during sync)"
-        ),
-    )
-    db.close()
+        stats = _sync_wiki_to_db(
+            root, db,
+            on_skip=lambda p: click.echo(
+                f"  Skipping {p.name} (modified during sync)"
+            ),
+        )
+    finally:
+        db.close()
 
     if stats["files"] == 0 and sources_added == 0:
         click.echo("No org files found in wiki/.")
@@ -2147,7 +2151,7 @@ def lint(json_output):
     """Check wiki health and report issues.
 
     Finds broken links, orphan articles, missing concept articles,
-    stale sources, unresolved source keys, and other consistency problems.
+    stale sources, unresolved or ambiguous source keys, and other consistency problems.
     """
     root = get_root()
     db = get_db(root)
@@ -2205,8 +2209,30 @@ def lint(json_output):
             "message": f"Concept '{c}' has no dedicated concept article",
         })
 
-    # 5. Articles missing required properties or referencing unknown sources
+    # 5. Source key collisions and article properties
     sources = db.list_sources()
+    source_paths_by_key = {}
+    for source in sources:
+        metadata = _source_metadata(source)
+        if not isinstance(metadata, dict):
+            continue
+        key = metadata.get("cite_key")
+        if isinstance(key, str) and key:
+            source_paths_by_key.setdefault(key, []).append(source["path"])
+    for key, paths in sorted(source_paths_by_key.items()):
+        if len(paths) > 1:
+            paths = sorted(paths)
+            issues.append({
+                "type": "ambiguous_source_key",
+                "severity": "warning",
+                "message": (
+                    f"Ambiguous source key '{key}' is assigned to multiple sources: "
+                    f"{', '.join(paths)}"
+                ),
+                "key": key,
+                "source_paths": paths,
+            })
+
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
