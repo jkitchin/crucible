@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from filelock import FileLock
 
+from crucible import bibtex as bibtex_mod
 from crucible.database import CrucibleDB
 from crucible.orgparse import parse_org_file
 
@@ -284,61 +285,26 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
     return "\n".join(lines)
 
 
-# BibTeX delimits an entry with braces, @type{key, ...}, or parentheses,
-# @type(key, ...). Every entry pattern accepts both; the full-entry pattern
-# requires the closer that matches the opener.
-BIB_ENTRY_HEAD = r"@(?P<type>\w+)\s*(?:(?P<paren>\()|\{)\s*(?P<key>[^,\s]+)\s*,"
-BIB_ENTRY_CLOSE = r"(?(paren)\)|\})"
-
-_CITE_KEY_RE = re.compile(r"(@\w+\s*[{(]\s*)([^,\s]+)")
-
-
 def replace_cite_key(bibtex: str, new_key: str) -> str:
     """Replace the citation key of the first @entry in a bibtex string."""
-    return _CITE_KEY_RE.sub(lambda m: m.group(1) + new_key, bibtex, count=1)
-
-
-_ENTRY_HEAD_RE = re.compile(BIB_ENTRY_HEAD)
+    return bibtex_mod.replace_key(bibtex, new_key)
 
 
 def set_bib_field(bibtex: str, name: str, value: str) -> str:
     """Set a field on the first @entry in a bibtex string, replacing any existing one."""
-    field_re = re.compile(
-        rf"\n?[ \t]*\b{re.escape(name)}\s*=\s*"
-        r"(?:\{(?:[^{}]|\{[^{}]*\})*\}|\"[^\"]*\")\s*,?",
-        re.IGNORECASE,
-    )
-    head = _ENTRY_HEAD_RE.search(bibtex)
-    if head is None:
-        return bibtex
-    body = field_re.sub("", bibtex[head.end():])
     # A file path is written verbatim (only braces, which would unbalance the
     # entry, are dropped): collapsing whitespace would name a different file.
     if name.lower() == "file":
         value = value.replace("{", "").replace("}", "")
     else:
         value = _bib_value(value)
-    line = f"\n  {name} = {{{value}}},"
-    return bibtex[:head.end()] + line + body
+    return bibtex_mod.set_field(bibtex, name, value)
 
 
-_BIB_ENTRY_RE = re.compile(
-    BIB_ENTRY_HEAD + r"(?P<body>.*?)\n" + BIB_ENTRY_CLOSE, re.DOTALL
-)
-_BIB_FIELD_RE = re.compile(
-    r"(\w+)\s*=\s*(?:\{((?:[^{}]|\{[^{}]*\})*)\}|\"([^\"]*)\")",
-    re.DOTALL,
-)
-
-
-def _parse_bib_fields(body: str) -> dict[str, str]:
-    """Parse the field body of a BibTeX entry into a dict."""
-    fields: dict[str, str] = {}
-    for m in _BIB_FIELD_RE.finditer(body):
-        name = m.group(1).lower()
-        value = m.group(2) if m.group(2) is not None else m.group(3) or ""
-        fields[name] = value.strip() if name == "file" else " ".join(value.split())
-    return fields
+def _parse_bib_fields(entry_text: str) -> dict[str, str]:
+    """The fields of the first entry in entry_text, as a dict."""
+    entry = bibtex_mod.first_entry(entry_text)
+    return entry.as_dict() if entry else {}
 
 
 def _resolve_bib_file(root: Path, value: str) -> Path:
@@ -365,15 +331,12 @@ def parse_bib_file(bib_path: Path) -> list[dict]:
     if not bib_path.exists():
         return []
     text = bib_path.read_text(encoding="utf-8", errors="replace")
-    entries = []
-    for m in _BIB_ENTRY_RE.finditer(text):
-        entry = {
-            "entry_type": m["type"].lower(),
-            "cite_key": m["key"],
-        }
-        entry.update(_parse_bib_fields(m["body"]))
-        entries.append(entry)
-    return entries
+    parsed = []
+    for e in bibtex_mod.entries(text):
+        entry = {"entry_type": e.entry_type, "cite_key": e.key}
+        entry.update(e.as_dict())
+        parsed.append(entry)
+    return parsed
 
 
 def _authors_from_bib(author_field: str) -> list[str]:
@@ -654,6 +617,9 @@ def reconcile_sources(root: Path, db) -> int:
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     entries = parse_bib_file(bib_path)
     bib_keys = {entry["cite_key"] for entry in entries}
+    key_counts: dict[str, int] = {}
+    for entry in entries:
+        key_counts[entry["cite_key"]] = key_counts.get(entry["cite_key"], 0) + 1
     inserted = 0
 
     with db.conn.transaction():
@@ -670,9 +636,12 @@ def reconcile_sources(root: Path, db) -> int:
         # one (e.g. a source merge renamed) only from ingest's own rows, so a
         # user's edit to an entry is not undone by a row rebuilt from it.
         file_updates = {}
+        date_updates = {}
         for entry in entries:
             src = by_key.get(entry["cite_key"])
-            if src is None:
+            # A repeated key is ambiguous: lint reports it, and which entry
+            # the row belongs to is not guessed.
+            if src is None or key_counts[entry["cite_key"]] > 1:
                 continue
             missing = not entry.get("file")
             stale = (not missing and _from_ingest(src)
@@ -680,9 +649,22 @@ def reconcile_sources(root: Path, db) -> int:
             if stale or (missing and _knows_its_file(root, src, bib_keys)):
                 file_updates[entry["cite_key"]] = src["path"]
                 entry["file"] = src["path"]
+            # Rows ingested before ingest wrote `date` know a full date the
+            # entry lacks; record it so a rebuild keeps it. A date whose
+            # year disagrees with the entry's is not written: the entry wins.
+            row_date = src.get("date") or ""
+            if (_from_ingest(src) and not entry.get("date")
+                    and re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", row_date)
+                    and entry.get("year", row_date[:4]) == row_date[:4]):
+                date_updates[entry["cite_key"]] = row_date
+                entry["date"] = row_date
         set_bib_file_fields(root, file_updates)
+        set_bib_fields(root, "date", date_updates)
 
-        # 2. Entries with a file own the row for it.
+        # 2. Entries with a file own the row for it. A row one entry claimed
+        # is not handed to a later entry with the same key: both files keep
+        # a row and lint reports the shared key.
+        claimed: set[int] = set()
         for entry in entries:
             if not entry.get("file"):
                 continue
@@ -692,8 +674,21 @@ def reconcile_sources(root: Path, db) -> int:
             row_path = by_path.get(rel_path)
             if row_key is not None and row_key is not row_path and _from_disk_scan(row_key):
                 row_key = None  # a different file whose name matches this key
+            if row_key is not None and row_key["id"] in claimed and row_key is not row_path:
+                row_key = None  # an earlier entry with this key owns that row
             if row_key is not None and _from_ingest(row_key):
-                continue  # step 1 made the entry's file match this row
+                if key_counts[key] == 1 or row_key["path"] == rel_path:
+                    # Step 1 made the entry's file match this row. The entry
+                    # describes the source, as it will after a rebuild; the
+                    # row keeps ingest's own metadata (its content hash).
+                    claimed.add(row_key["id"])
+                    if row_key["path"] == rel_path:
+                        fields = _fields_from_bib(entry, rel_path)
+                        fields["metadata"] = {**_source_metadata(row_key), **fields["metadata"]}
+                        del fields["path"]
+                        db.update_source(row_key["id"], **fields)
+                    continue
+                row_key = None  # another entry with this key has the ingested file
             if row_path is not None and row_path is not row_key:
                 other = _source_metadata(row_path).get("cite_key")
                 if _from_ingest(row_path) or (other != key and other in bib_keys):
@@ -713,6 +708,7 @@ def reconcile_sources(root: Path, db) -> int:
                 target_id = db.add_source(**fields)
                 inserted += 1
             updated = db.get_source(target_id)
+            claimed.add(target_id)
             by_path[rel_path] = updated
             by_key[key] = updated
 
@@ -775,15 +771,8 @@ def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | Non
 
 
 def bib_has_key(text: str, cite_key: str) -> bool:
-    """Return True if BibTeX text has an entry whose key is cite_key.
-
-    Matches the entry header ``@type{key,`` (or ``@type(key,``) rather than
-    ``{key,`` anywhere, so field text such as ``author = {Smith, J}`` is not
-    taken for the key ``Smith``.
-    """
-    return re.search(
-        rf"@\w+\s*[{{(]\s*{re.escape(cite_key)}\s*,", text
-    ) is not None
+    """Return True if BibTeX text has an entry whose key is cite_key."""
+    return bibtex_mod.has_key(text, cite_key)
 
 
 def append_bib_entry(root: Path, entry: str, cite_key: str):
@@ -808,7 +797,12 @@ def append_bib_entry(root: Path, entry: str, cite_key: str):
 
 def set_bib_file_fields(root: Path, paths: dict[str, str]) -> None:
     """Set the `file` field of existing entries in references.bib (cite_key -> path)."""
-    if not paths:
+    set_bib_fields(root, "file", paths)
+
+
+def set_bib_fields(root: Path, name: str, values: dict[str, str]) -> None:
+    """Set field `name` on existing entries in references.bib (cite_key -> value)."""
+    if not values:
         return
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     lock_path = bib_path.with_suffix(".bib.lock")
@@ -817,13 +811,40 @@ def set_bib_file_fields(root: Path, paths: dict[str, str]) -> None:
             return
         text = bib_path.read_text(encoding="utf-8")
 
-        def repl(m: re.Match) -> str:
-            path = paths.get(m["key"])
-            return set_bib_field(m.group(0), "file", path) if path else m.group(0)
+        def repl(entry: bibtex_mod.Entry) -> str:
+            value = values.get(entry.key)
+            return set_bib_field(entry.text, name, value) if value else entry.text
 
-        new_text = _BIB_ENTRY_RE.sub(repl, text)
+        new_text = bibtex_mod.map_entries(text, repl)
         if new_text != text:
             atomic_write_text(bib_path, new_text)
+
+
+def drop_bib_file_fields(root: Path, rel_path: str) -> list[str]:
+    """Remove the `file` field of every entry that names rel_path.
+
+    The entries themselves stay: they are bibliography, and articles may
+    still cite them. Returns the keys of the entries changed.
+    """
+    bib_path = root / CRUCIBLE_DIR / "references.bib"
+    lock_path = bib_path.with_suffix(".bib.lock")
+    changed: list[str] = []
+    with FileLock(lock_path, timeout=10):
+        if not bib_path.exists():
+            return changed
+        text = bib_path.read_text(encoding="utf-8")
+
+        def repl(entry: bibtex_mod.Entry) -> str:
+            value = entry.get("file")
+            if value and _bib_file_path(root, value) == rel_path:
+                changed.append(entry.key)
+                return bibtex_mod.remove_field(entry.text, "file")
+            return entry.text
+
+        new_text = bibtex_mod.map_entries(text, repl)
+        if new_text != text:
+            atomic_write_text(bib_path, new_text)
+    return changed
 
 
 def file_sha256(path: Path) -> str:
@@ -871,17 +892,22 @@ def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str) -> dic
     return None
 
 
-def _unique_cite_key(base: str, db: CrucibleDB) -> str:
-    """Return ``base``, or a suffixed variant, that no existing source uses.
+def _unique_cite_key(base: str, db: CrucibleDB, root: Path | None = None) -> str:
+    """Return ``base``, or a suffixed variant, that no source or bib entry uses.
 
     Disambiguates colliding generated keys (e.g. two different smith2024
     papers) as smith2024, smith2024a, smith2024b, ... so a new source never
-    silently reuses another's cite key (and its bib entry).
+    silently reuses another's cite key (and its bib entry). Keys in
+    references.bib count even without a source row: an entry with no
+    `file` field has none, and reusing its key would attach the new file
+    to that unrelated entry.
     """
     used = {
         k for src in db.list_sources()
         if (k := _source_metadata(src).get("cite_key"))
     }
+    if root is not None:
+        used.update(e["cite_key"] for e in parse_bib_file(root / CRUCIBLE_DIR / "references.bib"))
     if base not in used:
         return base
     for suffix in "abcdefghijklmnopqrstuvwxyz":
@@ -973,6 +999,7 @@ def ingest_source(
         title = extract_title(dest_path, text)
 
     # Use today if no date given
+    date_given = date is not None
     if date is None:
         date = datetime.now().strftime("%Y-%m-%d")
 
@@ -988,7 +1015,7 @@ def ingest_source(
     #   1. user-provided --bibtex string
     #   2. fetched from doi.org content negotiation (real entry type + fields)
     #   3. minimal entry from known metadata
-    cite_key = _unique_cite_key(generate_cite_key(title, authors, date), db)
+    cite_key = _unique_cite_key(generate_cite_key(title, authors, date), db, root)
     bib_entry = None
     if bibtex and bibtex.strip().startswith("@"):
         bib_entry = replace_cite_key(bibtex.strip(), cite_key)
@@ -1000,9 +1027,28 @@ def ingest_source(
         bib_entry = generate_bib_entry(
             cite_key, title, authors, date, url, source_type, doi=doi,
         )
+    # The row is rebuilt from this entry on a fresh clone, so the entry must
+    # carry what the row records: the authors and full date the user gave,
+    # when a supplied or fetched entry lacks them.
+    known = _parse_bib_fields(bib_entry)
+    if authors and not known.get("author"):
+        bib_entry = set_bib_field(bib_entry, "author", " and ".join(authors))
+    if (re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", date) and not known.get("date")
+            and (date_given or not known.get("year"))):
+        bib_entry = set_bib_field(bib_entry, "date", date)
     # Record the stored copy, so a fresh clone can tie the entry to its file.
     bib_entry = set_bib_field(bib_entry, "file", rel_path)
     append_bib_entry(root, bib_entry, cite_key)
+
+    # Describe the source exactly as a rebuild from the entry would.
+    first = bibtex_mod.first_entry(bib_entry)
+    rebuilt = _fields_from_bib(
+        {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
+    )
+    title = rebuilt["title"]
+    authors = rebuilt["authors"] or authors
+    date = rebuilt["date"] or date
+    url = rebuilt["url"] or url
 
     # Register in database (store cite_key and content hash in metadata)
     metadata = {"cite_key": cite_key, "content_hash": content_hash}

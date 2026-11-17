@@ -369,7 +369,7 @@ def init(root):
 
     created = []
 
-    # .gitignore inside .crucible/
+    # .gitignore at the project root
     gitignore = root / ".gitignore"
     if not gitignore.exists():
         gitignore.write_text(
@@ -380,6 +380,11 @@ def init(root):
             ".crucible/crucible.db\n"
             ".crucible/crucible.db-wal\n"
             ".crucible/crucible.db-shm\n"
+            ".crucible/crucible.db-journal\n"
+            ".crucible/.crucible.db.rebuild-*.tmp\n"
+            "\n"
+            "# Crucible: lock file for references.bib\n"
+            ".crucible/references.bib.lock\n"
             "\n"
             "# Crucible: publish output\n"
             ".crucible/wiki/_build/\n"
@@ -780,7 +785,10 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
             # existing rows, so incremental sync and a rebuild agree. Property
             # dates have no zone and count as midnight; the sync-time fallback
             # (datetime('now')) is UTC. Ordering is only meaningful by day.
-            created = _org_date(meta.properties.get("CREATED"))
+            # An article with only :MODIFIED: was created no later than that,
+            # and using it keeps created_at <= updated_at on a rebuild too.
+            created = (_org_date(meta.properties.get("CREATED"))
+                       or _org_date(meta.properties.get("MODIFIED")))
             modified = _org_date(meta.properties.get("MODIFIED")) or created
 
             existing = db.get_article_by_path(rel_path)
@@ -964,7 +972,7 @@ def sync():
         f"{stats['article_links']} article links"
     )
     if sources_added:
-        msg += f", {sources_added} sources from bib"
+        msg += f", {sources_added} sources added"
     if stats["skipped"]:
         msg += f", {stats['skipped']} skipped (modified during sync)"
     click.echo(msg)
@@ -1866,13 +1874,23 @@ def delete(path, yes, delete_file):
                 click.echo(f"    {a['title']}")
         if not yes:
             click.confirm("Delete this source?", abort=True)
-        if delete_file:
-            disk_path = root / src["path"]
-            if disk_path.exists():
-                disk_path.unlink()
-                click.echo(f"  Deleted file: {disk_path}")
+        disk_path = root / src["path"]
+        if delete_file and disk_path.exists():
+            disk_path.unlink()
+            click.echo(f"  Deleted file: {disk_path}")
+        # The bibliography is what sync rebuilds sources from, so the entry
+        # must stop naming the file or the next sync restores the row.
+        from crucible.ingest import drop_bib_file_fields
+        for key in drop_bib_file_fields(root, src["path"]):
+            click.echo(f"  Removed the file field from bib entry '{key}' (the entry is kept).")
         db.delete_source(src["id"])
         click.echo("  Deleted from database.")
+        scanned = (f"{CRUCIBLE_DIR}/sources/notebooks/", f"{CRUCIBLE_DIR}/sources/data/")
+        if disk_path.exists() and src["path"].startswith(scanned):
+            click.echo(
+                "  Note: the file is still on disk, so the next `crucible sync` adds it "
+                "back. Use --file to delete it too."
+            )
         db.close()
         return
 
@@ -2017,9 +2035,8 @@ def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path
     if not source_wiki.exists():
         return
     planned: set[Path] = set()
-    for org_path in sorted(source_wiki.rglob("*.org")):
-        if org_path.name == "index.org":
-            continue
+    # The same walk sync uses: only the top-level index.org is generated.
+    for org_path in _wiki_article_files(source_wiki):
         rel_within_wiki = org_path.relative_to(source_wiki)
         dest_path = target_wiki / rel_within_wiki
         if dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
@@ -2172,22 +2189,23 @@ def _undo_merge(
 
 def _merged_bib_text(text: str, plan: "_MergePlan") -> str:
     """The target bibliography with the plan's file fields and new entries."""
-    from crucible.ingest import _BIB_ENTRY_RE, _parse_bib_fields, bib_has_key, set_bib_field
+    from crucible import bibtex
+    from crucible.ingest import bib_has_key, set_bib_field
 
     attached: list[str] = []
 
-    def attach(m: re.Match) -> str:
-        path = plan.bib_file_fields.get(m["key"])
+    def attach(entry: "bibtex.Entry") -> str:
+        path = plan.bib_file_fields.get(entry.key)
         if path is None:
-            return m.group(0)
-        if _parse_bib_fields(m["body"]).get("file") or m["key"] in attached:
+            return entry.text
+        if entry.get("file") or entry.key in attached:
             raise click.ClickException(
-                f"the bibliography entry '{m['key']}' changed while merging."
+                f"the bibliography entry '{entry.key}' changed while merging."
             )
-        attached.append(m["key"])
-        return set_bib_field(m.group(0), "file", path)
+        attached.append(entry.key)
+        return set_bib_field(entry.text, "file", path)
 
-    text = _BIB_ENTRY_RE.sub(attach, text)
+    text = bibtex.map_entries(text, attach)
     missing = set(plan.bib_file_fields) - set(attached)
     if missing:
         raise click.ClickException(
@@ -2250,10 +2268,8 @@ def _plan_source_merge(
     Raises a ClickException listing every problem found, so the user can fix
     them all at once. Nothing has been written when it is raised.
     """
-    from crucible.ingest import (
-        _BIB_ENTRY_RE, _BIB_FIELD_RE, _parse_bib_fields, _resolve_bib_file,
-        bib_has_key, file_sha256,
-    )
+    from crucible import bibtex
+    from crucible.ingest import _parse_bib_fields, _resolve_bib_file, file_sha256
 
     source_cdir = source_root / CRUCIBLE_DIR
     target_cdir = cdir(root)
@@ -2310,7 +2326,9 @@ def _plan_source_merge(
                 if cite_key in incoming_keys:
                     raise _MergeConflict(
                         f"Cannot safely merge source with citation key '{cite_key}': "
-                        "multiple incoming sources use it."
+                        "multiple incoming sources use it. Give each its own key in the "
+                        "source crucible (`crucible lint` there reports it as "
+                        "duplicate_cite_key), sync it, and merge again."
                     )
                 incoming_keys.add(cite_key)
 
@@ -2417,8 +2435,8 @@ def _plan_source_merge(
     # Bibliography entries, with `file` fields pointing at the planned paths.
     target_text = target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
     target_entries: dict[str, list[str]] = {}
-    for m in _BIB_ENTRY_RE.finditer(target_text):
-        target_entries.setdefault(m["key"], []).append(m.group(0))
+    for e in bibtex.entries(target_text):
+        target_entries.setdefault(e.key, []).append(e.text)
     source_sources = (source_cdir / "sources").resolve()
     for cite_key, entry_text in source_entries.items():
         if not _parse_bib_fields(entry_text).get("file"):
@@ -2430,9 +2448,7 @@ def _plan_source_merge(
                 plan.warnings.append(
                     f"bibliography-only source '{cite_key}' has no source file."
                 )
-        # bib_has_key also catches entries _BIB_ENTRY_RE misses (a closing
-        # brace not on its own line) without matching field text.
-        if cite_key in target_entries or bib_has_key(target_text, cite_key):
+        if cite_key in target_entries:
             if cite_key in copied_keys:
                 # The target has the reference but no source for it. Attach
                 # the incoming file to the target's entry when it is plainly
@@ -2448,11 +2464,10 @@ def _plan_source_merge(
             continue
 
         try:
-            for match in reversed(list(_BIB_FIELD_RE.finditer(entry_text))):
-                if match.group(1).lower() != "file":
-                    continue
-                group = 2 if match.group(2) is not None else 3
-                file_path = _resolve_bib_file(source_root, match.group(group).strip())
+            parsed = bibtex.first_entry(entry_text)
+            file_fields = [f for f in parsed.fields if f.name == "file"] if parsed else []
+            for fld in reversed(file_fields):
+                file_path = _resolve_bib_file(source_root, fld.value.strip())
                 direct = planned_by_path.get(os.path.abspath(file_path), [])
                 resolved = planned_by_realpath.get(os.path.realpath(file_path), [])
                 # Prefer a destination planned for this same citation key.
@@ -2467,7 +2482,8 @@ def _plan_source_merge(
                         "to a source: several sources match its file field."
                     )
                 if candidates:
-                    start, end = match.span(group)
+                    start = parsed.start + fld.value_start
+                    end = parsed.start + fld.value_end
                     entry_text = entry_text[:start] + candidates[0][0] + entry_text[end:]
                 elif (
                     Path(os.path.abspath(file_path)).is_relative_to(source_cdir / "sources")
@@ -2656,16 +2672,17 @@ def _rewrite_article_links(
 
 def _parse_bib_entries(text: str) -> dict[str, str]:
     """Parse BibTeX text into a dict of cite_key -> full entry text."""
-    from crucible.ingest import _BIB_ENTRY_RE
+    from crucible import bibtex
 
     entries = {}
-    for match in _BIB_ENTRY_RE.finditer(text):
-        cite_key = match["key"]
-        if cite_key in entries:
+    for entry in bibtex.entries(text):
+        if entry.key in entries:
             raise _MergeConflict(
-                f"Cannot safely merge: duplicate bibliography key '{cite_key}'."
+                f"Cannot safely merge: duplicate bibliography key '{entry.key}'. "
+                "Give each entry its own key (`crucible lint` reports it as "
+                "duplicate_bib_key) and merge again."
             )
-        entries[cite_key] = match.group(0)
+        entries[entry.key] = entry.text
     return entries
 
 
@@ -2923,6 +2940,19 @@ def lint(json_output):
             "path": s['path'],
         })
 
+    # 3b. Committed sources whose file is gone. External sources are
+    # gitignored, so a fresh clone legitimately lacks their files.
+    for s in db.list_sources():
+        if s["path"].startswith(f"{CRUCIBLE_DIR}/sources/external/"):
+            continue
+        if not (root / s["path"]).exists():
+            issues.append({
+                "type": "missing_source_file",
+                "severity": "warning",
+                "message": f"Source file not found: {s['path']} ({s['title']})",
+                "path": s["path"],
+            })
+
     # 4. Concepts without dedicated articles
     missing_concepts = db.concepts_without_articles()
     for c in missing_concepts:
@@ -2949,6 +2979,33 @@ def lint(json_output):
                 "key": key,
                 "sources": paths,
             })
+    # The bibliography itself: a key used by two entries is ambiguous (each
+    # citation can only mean one), and an entry with no closing brace is
+    # ignored by everything that reads the file.
+    bib_file = cdir(root) / "references.bib"
+    if bib_file.exists():
+        from crucible import bibtex
+        bib_text = bib_file.read_text(encoding="utf-8", errors="replace")
+        bib_entries, malformed = bibtex.scan(bib_text)
+        counts: dict[str, int] = {}
+        for e in bib_entries:
+            counts[e.key] = counts.get(e.key, 0) + 1
+        for key, n in sorted(counts.items()):
+            if n > 1:
+                issues.append({
+                    "type": "duplicate_bib_key",
+                    "severity": "warning",
+                    "message": f"references.bib has {n} entries with the key '{key}'",
+                    "key": key,
+                })
+        for offset in malformed:
+            line = bib_text.count("\n", 0, offset) + 1
+            issues.append({
+                "type": "malformed_bib_entry",
+                "severity": "warning",
+                "message": f"references.bib line {line}: entry is never closed and is ignored",
+                "line": line,
+            })
     from crucible.ingest import parse_bib_file
     bib_without_file = {
         entry["cite_key"]
@@ -2965,6 +3022,39 @@ def lint(json_output):
                 "type": "missing_property",
                 "severity": "warning",
                 "message": f"Missing ARTICLE_TYPE property: {article['path']}",
+                "path": article['path'],
+            })
+        dates = {}
+        for prop in ("CREATED", "MODIFIED"):
+            raw = meta.properties.get(prop)
+            if raw is None:
+                continue
+            dates[prop] = _org_date(raw)
+            if dates[prop] is None:
+                issues.append({
+                    "type": "invalid_date",
+                    "severity": "warning",
+                    "message": (
+                        f"Unreadable :{prop}: date '{raw}' in {article['path']} "
+                        "(use YYYY-MM-DD or an org timestamp)"
+                    ),
+                    "path": article['path'],
+                })
+        if not dates.get("CREATED") and not dates.get("MODIFIED"):
+            issues.append({
+                "type": "missing_property",
+                "severity": "info",
+                "message": (
+                    f"Missing CREATED property: {article['path']} "
+                    "(its dates are sync time, which a rebuild cannot reproduce)"
+                ),
+                "path": article['path'],
+            })
+        elif dates.get("CREATED") and dates.get("MODIFIED") and dates["MODIFIED"] < dates["CREATED"]:
+            issues.append({
+                "type": "invalid_date",
+                "severity": "warning",
+                "message": f":MODIFIED: is earlier than :CREATED: in {article['path']}",
                 "path": article['path'],
             })
         source_keys = meta.properties.get("SOURCE_KEYS", "").split()
@@ -3029,10 +3119,8 @@ def lint(json_output):
     bib_path = cdir(root) / "references.bib"
     bib_keys = set()
     if bib_path.exists():
-        import re as _re
-        from crucible.ingest import BIB_ENTRY_HEAD
-        for m in _re.finditer(BIB_ENTRY_HEAD, bib_path.read_text(encoding="utf-8")):
-            bib_keys.add(m["key"])
+        from crucible import bibtex
+        bib_keys = set(bibtex.keys(bib_path.read_text(encoding="utf-8", errors="replace")))
 
     for article in db.list_articles():
         org_path = root / article["path"]

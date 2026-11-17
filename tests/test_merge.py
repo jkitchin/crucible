@@ -1060,3 +1060,20 @@ def test_bib_has_key_matches_entry_headers_only(text, expected):
     from crucible.ingest import bib_has_key
 
     assert bib_has_key(text, "smith2020") is expected
+
+
+def test_merge_copies_an_index_article_in_a_subdirectory(project, tmp_path):
+    """Only the top-level wiki/index.org is generated; concepts/index.org is an article."""
+    source = make_crucible(tmp_path / "other")
+    wiki = source / ".crucible/wiki"
+    (wiki / "concepts/index.org").write_text(
+        CONCEPT.replace("Activation Energy", "Index").replace("activation-energy", "index")
+    )
+    (wiki / "index.org").write_text("#+TITLE: Generated index\n")
+    target_index = (project / ".crucible/wiki/index.org")
+    before = target_index.read_text() if target_index.exists() else None
+    result = CliRunner().invoke(cli, ["merge", str(source), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert (project / ".crucible/wiki/concepts/index.org").exists()
+    after = target_index.read_text() if target_index.exists() else None
+    assert after is None or "Generated index" not in after or before == after
