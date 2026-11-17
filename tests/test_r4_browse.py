@@ -104,7 +104,7 @@ def test_graph_failure_is_an_error_page(server, monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("graph broke")
 
-    monkeypatch.setattr(crucible.cli, "viz_html", boom)
+    monkeypatch.setattr(crucible.viz, "viz_html", boom)
     status, body = get(server, "/_graph")
     assert status == 500
     assert "graph broke" in body
@@ -190,8 +190,7 @@ def test_punctuation_only_query_is_empty():
     assert _fts_query("café &") == '{title content} : ("café")'
 
 
-def test_prefix_is_not_shortened(fts_db):
-    assert _fts_query("catal*") == '{title content} : ("catal"*)'
+def test_prefix_does_not_overmatch(fts_db):
     titles = {r["title"] for r in fts_db.search("catal*")}
     assert titles == {"Catalysis", "Catalyst"}
     assert fts_db.search("catapu*")[0]["title"] == "Catastrophe"

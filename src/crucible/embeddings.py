@@ -17,8 +17,8 @@ from pathlib import Path
 
 import libsql
 
-from crucible.browse import DRAWER_RE
-from crucible.database import DictConnection, _fts_query
+from crucible.orgparse import DRAWER_RE
+from crucible.database import DictConnection, fts_rows
 
 DEFAULT_MODEL = "nomic-embed-text"
 DEFAULT_URL = "http://localhost:11434/api/embed"
@@ -388,14 +388,8 @@ class EmbeddingIndex:
         return _semantic_rows(self.conn, query_blob, self.model, dim, limit)
 
     @staticmethod
-    def _fts_rows(conn, fts_match: str, limit: int) -> list[dict]:
-        if not fts_match:
-            return []
-        return [dict(row) for row in conn.execute("""
-            SELECT a.*, rank FROM article_fts fts
-            JOIN articles a ON a.id = fts.rowid
-            WHERE article_fts MATCH ? ORDER BY rank LIMIT ?
-        """, (fts_match, limit))]
+    def _fts_rows(conn, query: str, limit: int) -> list[dict]:
+        return fts_rows(conn, query, limit)
 
     def hybrid_search(self, query: str, limit: int = 10,
                       fts_weight: float = 1.0,
@@ -416,9 +410,8 @@ class EmbeddingIndex:
             raw: if True, skip dedup/quality filtering
         """
         query_blob, dim = self._embed_query(query)
-        fts_match = _fts_query(query)
         scores: dict = {}
-        fts_results = self._fts_rows(self.conn, fts_match, limit * 3)
+        fts_results = self._fts_rows(self.conn, query, limit * 3)
         semantic_results = _semantic_rows(self.conn, query_blob, self.model,
                                           dim, limit * 3)
         _rrf(scores, fts_results, semantic_results, None,
@@ -555,7 +548,6 @@ class EmbeddingIndex:
         Results are deduplicated as in hybrid_search unless raw is set.
         """
         query_blob, dim = self._embed_query(query)
-        fts_match = _fts_query(query)
         scores: dict = {}
         vectors: dict = {}
 
@@ -571,7 +563,7 @@ class EmbeddingIndex:
                     vectors[(scope, aid)] = v
 
         collect(self.conn, (False, "local"),
-                self._fts_rows(self.conn, fts_match, limit * 3),
+                self._fts_rows(self.conn, query, limit * 3),
                 _semantic_rows(self.conn, query_blob, self.model, dim, limit * 3))
 
         for peer in peers:
@@ -583,7 +575,7 @@ class EmbeddingIndex:
                 conn = DictConnection(libsql.connect(peer_db))
                 try:
                     collect(conn, (True, name),
-                            self._fts_rows(conn, fts_match, limit * 3),
+                            self._fts_rows(conn, query, limit * 3),
                             self._peer_semantic(conn, name, query_blob, dim,
                                                 limit * 3))
                 finally:

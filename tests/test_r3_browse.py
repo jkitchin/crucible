@@ -283,12 +283,7 @@ def test_prefix_search(kb):
     db = CrucibleDB(kb / ".crucible" / "crucible.db")
     try:
         assert [r["title"] for r in db.search("catal*")] == ["Platinum"]
-        # The prefix is used as given (a shortened one made catal* match
-        # catastrophe). Porter stems "cataly" to "catali", which no indexed
-        # stem ("catalysi") starts with: a documented miss, see _fts_query.
-        assert db.search("cataly*") == []
-        assert [r["title"] for r in db.search("catalys*")] == []
-        assert [r["title"] for r in db.search("catalysi*")] == ["Platinum"]
+        assert [r["title"] for r in db.search("cataly*")] == ["Platinum"]
         assert [r["title"] for r in db.search("plat* hydrog*")] == ["Platinum"]
         # Still no FTS syntax injection.
         for q in ["*", "-*", '"*', "(*", "NOT*", "a* OR*", ")*", "*catal",
