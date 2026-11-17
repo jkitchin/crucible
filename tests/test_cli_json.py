@@ -1551,3 +1551,96 @@ def test_nested_index_org_is_an_ordinary_article(project):
     assert result.exit_code == 0, result.output
     assert run_json("stats")["articles"] == 3
     assert nested in {r["path"] for r in run_json("concept", "kinetics")}
+
+
+def _ingest_into_new_crucible(tmp_path, monkeypatch, name, content):
+    """Create a crucible holding one ingested data source keyed synthetic2026."""
+    root = tmp_path / name
+    root.mkdir()
+    runner = CliRunner()
+    result = runner.invoke(cli, ["init", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    original = tmp_path / f"{name}-evidence.md"
+    original.write_text(content)
+    monkeypatch.chdir(root)
+    result = runner.invoke(
+        cli,
+        ["ingest", str(original), "--type", "data",
+         "--title", "Synthetic Evidence", "--date", "2026-01-01"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "{synthetic2026," in (root / ".crucible/references.bib").read_text()
+    return root
+
+
+def test_merge_lists_every_problem_at_once(project, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    runner = CliRunner()
+    result = runner.invoke(cli, ["init", "--root", str(source)])
+    assert result.exit_code == 0, result.output
+    first = source / ".crucible/sources/data/first.md"
+    second = source / ".crucible/sources/data/second.md"
+    first.write_text("First.\n")
+    second.write_text("Second.\n")
+    monkeypatch.chdir(source)
+    result = runner.invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    first.unlink()
+    second.unlink()
+
+    monkeypatch.chdir(project)
+    result = runner.invoke(cli, ["merge", str(source), "--yes"])
+    assert result.exit_code != 0
+    assert "2 problems" in result.output
+    assert "first.md" in result.output and "second.md" in result.output
+
+
+def test_merge_refuses_before_asking_for_confirmation(project, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    runner = CliRunner()
+    result = runner.invoke(cli, ["init", "--root", str(source)])
+    assert result.exit_code == 0, result.output
+    missing = source / ".crucible/sources/data/evidence.md"
+    missing.write_text("Imported source.\n")
+    monkeypatch.chdir(source)
+    assert runner.invoke(cli, ["sync"]).exit_code == 0
+    missing.unlink()
+
+    monkeypatch.chdir(project)
+    result = runner.invoke(cli, ["merge", str(source)], input="y\n")
+    assert result.exit_code != 0
+    assert "source file is missing" in result.output
+    assert "Proceed with merge?" not in result.output
+
+
+def test_merge_refuses_key_already_in_unsynced_target_bibliography(
+    project, tmp_path, monkeypatch
+):
+    source = _ingest_into_new_crucible(tmp_path, monkeypatch, "source", "Imported.\n")
+    # The target's bibliography has the key, but its database has no source
+    # for it, so merge cannot detect the clash from the database alone.
+    target_bib = project / ".crucible/references.bib"
+    with target_bib.open("a") as f:
+        f.write("\n@misc{synthetic2026,\n  title = {Something else},\n}\n")
+    before = target_bib.read_text()
+
+    monkeypatch.chdir(project)
+    result = CliRunner().invoke(cli, ["merge", str(source), "--yes"])
+    assert result.exit_code != 0
+    assert "target bibliography already has an entry" in result.output
+    assert not list((project / ".crucible/sources/data").glob("*evidence*"))
+    assert target_bib.read_text() == before
+
+
+def test_merge_reuses_identical_source_with_same_key(project, tmp_path, monkeypatch):
+    source = _ingest_into_new_crucible(tmp_path, monkeypatch, "source", "Shared bytes.\n")
+    target = _ingest_into_new_crucible(tmp_path, monkeypatch, "target", "Shared bytes.\n")
+    before = sorted(p.name for p in (target / ".crucible/sources/data").iterdir())
+
+    monkeypatch.chdir(target)
+    result = CliRunner().invoke(cli, ["merge", str(source), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "Skipped 1 existing sources" in result.output
+    assert sorted(p.name for p in (target / ".crucible/sources/data").iterdir()) == before
