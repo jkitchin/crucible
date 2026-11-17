@@ -1,5 +1,6 @@
 """Crucible CLI - knowledge base management."""
 
+import errno
 import json
 import os
 import re
@@ -164,26 +165,58 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     `.#name.org` lock symlinks Emacs creates while a buffer has unsaved
     changes.
 
+    Symlinked directories are followed (a wiki kept in Dropbox is often
+    linked in), each real directory once, so a symlink loop cannot recurse
+    forever. Paths are returned under `wiki_dir` as spelled, not resolved.
+
     Errors are raised rather than suppressed, so an incomplete scan can never
     be mistaken for deleted articles. That is why this walks with scandir:
-    rglob and os.walk skip entries whose type cannot be read.
+    rglob and os.walk skip entries whose type cannot be read. The exception
+    is an entry that vanishes during the scan, which really is gone.
     """
     index_path = wiki_dir / "index.org"
     org_files = []
+    seen_dirs = set()
     pending = [wiki_dir]
     while pending:
-        with os.scandir(pending.pop()) as entries:
-            for entry in entries:
-                path = Path(entry.path)
+        directory = pending.pop()
+        try:
+            dir_stat = directory.stat()
+        except FileNotFoundError:
+            continue
+        dir_key = (dir_stat.st_dev, dir_stat.st_ino)
+        if dir_key in seen_dirs:
+            continue
+        seen_dirs.add(dir_key)
+        try:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            try:
                 mode = entry.stat(follow_symlinks=False).st_mode
-                if stat.S_ISDIR(mode):
-                    pending.append(path)
-                elif (
-                    entry.name.endswith(".org")
-                    and path != index_path
-                    and (stat.S_ISREG(mode) or path.is_file())
-                ):
-                    org_files.append(path)
+                if stat.S_ISLNK(mode):
+                    # A dangling link, such as an Emacs `.#name.org` lock,
+                    # or a link to itself is skipped; a link to a directory
+                    # is followed.
+                    try:
+                        mode = entry.stat(follow_symlinks=True).st_mode
+                    except OSError as exc:
+                        if isinstance(exc, FileNotFoundError) or exc.errno == errno.ELOOP:
+                            continue
+                        raise
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(mode):
+                pending.append(path)
+            elif (
+                entry.name.endswith(".org")
+                and path != index_path
+                and stat.S_ISREG(mode)
+            ):
+                org_files.append(path)
     return sorted(org_files)
 
 
@@ -411,7 +444,8 @@ def init(root):
         "Conventions: org-mode with scimax, org-ref citations, narrative prose.\n"
         "Each article's top heading has :ARTICLE_TYPE:, :SOURCE_KEYS: (the cite keys\n"
         "`crucible ingest` prints), :STATUS:, :CREATED: and :MODIFIED: (update it on\n"
-        "every edit). Run `crucible sync` after writing or editing articles.\n"
+        "every edit). Run `crucible sync` after writing or editing articles;\n"
+        "it also regenerates wiki/MANIFEST.md and wiki/index.org.\n"
         "The LLM maintains the wiki; manual edits are the exception.\n"
         "Run `crucible help all` for the full CLI reference.\n"
         f"{crucible_marker}\n"
@@ -670,6 +704,93 @@ def _safe_relative_to(target: Path, root: Path) -> str | None:
         return None
 
 
+def _link_path(org_path: Path, link: str) -> Path:
+    """The path a file link in `org_path` names, normalised as org does.
+
+    `~` is expanded and `..` is resolved lexically (like Emacs's
+    expand-file-name), without following symlinks: resolving would carry a
+    path inside a symlinked wiki out of the project root.
+    """
+    target = Path(os.path.expanduser(link))
+    if not target.is_absolute():
+        target = org_path.parent / target
+    return Path(os.path.normpath(target))
+
+
+def _on_disk_spelling(root: Path, rel: str) -> str | None:
+    """`rel` with each component spelled as it is on disk, or None.
+
+    On a case-insensitive filesystem [[file:B.org]] opens b.org, but the
+    database keys articles by their on-disk path, case-sensitively.
+    """
+    current = root
+    parts = []
+    for part in Path(rel).parts:
+        try:
+            names = os.listdir(current)
+        except OSError:
+            return None
+        if part not in names:
+            matches = [n for n in names if n.casefold() == part.casefold()]
+            if len(matches) != 1:
+                return None
+            part = matches[0]
+        parts.append(part)
+        current = current / part
+    return str(Path(*parts)) if parts else None
+
+
+def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
+    """The project-relative path a wiki file link points at, or None.
+
+    None means the target lies outside the project. An absolute link may
+    name the real location of a symlinked wiki or project, so the resolved
+    path is also tried against the resolved wiki and root.
+    """
+    target = _link_path(org_path, link)
+    rel = _safe_relative_to(target, root)
+    if rel is not None:
+        return rel
+    try:
+        real = target.resolve()
+    except OSError:
+        return None
+    wiki_dir = cdir(root) / "wiki"
+    for base, spelled in ((wiki_dir, wiki_dir), (root, root)):
+        try:
+            within = real.relative_to(base.resolve())
+        except (ValueError, OSError):
+            continue
+        return str((spelled / within).relative_to(root))
+    return None
+
+
+def _link_is_broken(root: Path, org_path: Path, link: str) -> bool:
+    """True if a file link in `org_path` names nothing on disk.
+
+    Links into sources/external/ are exempt: those files are gitignored,
+    so a fresh clone legitimately lacks them.
+    """
+    target = _link_path(org_path, link)
+    if target.exists():
+        return False
+    rel = _link_target_rel(root, org_path, link)
+    external = (CRUCIBLE_DIR, "sources", "external")
+    return rel is None or Path(rel).parts[:3] != external
+
+
+def _find_linked_article(db: CrucibleDB, root: Path, rel: str | None) -> dict | None:
+    """The article stored at project-relative `rel`, matching on-disk case."""
+    if rel is None:
+        return None
+    article = db.get_article_by_path(rel)
+    if article is None and (root / rel).exists():
+        spelled = _on_disk_spelling(root, rel)
+        if spelled is not None and spelled != rel:
+            article = db.get_article_by_path(spelled)
+    return article
+
+
 def _source_key_index(
     sources: list[dict],
 ) -> tuple[dict[str, list[int]], list[dict]]:
@@ -730,15 +851,41 @@ def _resolve_source_keys(
     }
 
 
-def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
+ARTICLE_TYPES = ("concept", "summary", "comparison", "method")
+
+
+def _normalize_article_type(value: str | None) -> str:
+    """An :ARTICLE_TYPE: value as stored: lowercase, defaulting to concept."""
+    return (value or "").strip().lower() or "concept"
+
+
+def _report_unreadable(path: Path, exc: Exception) -> None:
+    """Tell the user on stderr that an article could not be read."""
+    if isinstance(exc, UnicodeDecodeError):
+        reason = "not valid UTF-8"
+    elif isinstance(exc, OSError) and exc.strerror:
+        reason = exc.strerror
+    else:
+        reason = str(exc)
+    click.echo(f"crucible: skipping unreadable article {path}: {reason}", err=True)
+
+
+def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
+                     on_unreadable=None) -> dict:
     """Core sync logic: scan wiki/*.org and reconcile with the DB.
 
     Returns a stats dict with counts. `on_skip` is called with the path
     of each file skipped due to concurrent modification (defaults to a
     no-op so callers that don't want CLI output stay quiet).
+    `on_unreadable` is called with the path and exception of each file
+    that cannot be read or decoded (by default it is reported on stderr);
+    such a file is skipped, like a concurrently modified one, so one bad
+    file never aborts a sync or an automatic rebuild.
     """
     if on_skip is None:
         on_skip = lambda _p: None  # noqa: E731
+    if on_unreadable is None:
+        on_unreadable = _report_unreadable
 
     wiki_dir = cdir(root) / "wiki"
     generated_index = str((wiki_dir / "index.org").relative_to(root))
@@ -750,6 +897,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         "article_links": 0,
         "concept_links": 0,
         "skipped": 0,
+        "unreadable": 0,
         "files": 0,
         "ambiguous_source_keys": 0,
     }
@@ -785,9 +933,14 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                 stats["skipped"] += 1
                 continue
 
-            meta = parse_org_file(org_path)
+            try:
+                meta = parse_org_file(org_path)
+            except (UnicodeDecodeError, OSError) as exc:
+                on_unreadable(org_path, exc)
+                stats["unreadable"] += 1
+                continue
             rel_path = str(org_path.relative_to(root))
-            article_type = meta.properties.get("ARTICLE_TYPE", "concept")
+            article_type = _normalize_article_type(meta.properties.get("ARTICLE_TYPE"))
             status = meta.properties.get("STATUS") or "draft"
             # :CREATED: and :MODIFIED: make an article's dates part of its
             # file, so they survive a rebuild; without them sync time is used.
@@ -858,7 +1011,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                 )
                 stats["added"] += 1
 
-            type_tags = {"concept", "summary", "comparison", "method"}
+            type_tags = set(ARTICLE_TYPES)
             for tag in meta.filetags:
                 if tag.lower() not in type_tags:
                     concept_id = db.add_concept(tag.lower())
@@ -884,15 +1037,12 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         source_index = _source_key_index(db.list_sources())
         for org_path, (article_id, meta) in parsed.items():
             for link_target in meta.file_links:
-                target_path = (org_path.parent / link_target).resolve()
-                if target_path.exists():
-                    target_rel = _safe_relative_to(target_path, root)
-                    if target_rel is None:
-                        continue  # link points outside the wiki tree; ignore
-                    target_article = db.get_article_by_path(target_rel)
-                    if target_article:
-                        db.add_article_link(article_id, target_article["id"])
-                        stats["article_links"] += 1
+                target_article = _find_linked_article(
+                    db, root, _link_target_rel(root, org_path, link_target)
+                )
+                if target_article:
+                    db.add_article_link(article_id, target_article["id"])
+                    stats["article_links"] += 1
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
             if source_keys:
@@ -902,18 +1052,21 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     for sid in source_ids:
                         db.link_article_source(article_id, sid)
 
-            derived_from = meta.properties.get("DERIVED_FROM", "").split()
-            for ref in derived_from:
-                if not ref:
-                    continue
-                ref_path = (org_path.parent / ref).resolve()
-                if ref_path.exists():
-                    ref_rel = _safe_relative_to(ref_path, root)
-                    if ref_rel is None:
-                        continue  # derivation points outside the wiki tree; ignore
-                else:
-                    ref_rel = f"wiki/{ref}" if not ref.startswith("wiki/") else ref
-                source_article = db.get_article_by_path(ref_rel)
+            # DERIVED_FROM paths are relative to the article, or to the wiki
+            # directory (optionally written with a leading wiki/).
+            wiki_rel = cdir(root) / "wiki"
+            for ref in meta.properties.get("DERIVED_FROM", "").split():
+                source_article = _find_linked_article(
+                    db, root, _link_target_rel(root, org_path, ref)
+                )
+                if source_article is None and not Path(ref).is_absolute():
+                    within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
+                    source_article = _find_linked_article(
+                        db, root,
+                        _safe_relative_to(
+                            Path(os.path.normpath(wiki_rel / within)), root
+                        ),
+                    )
                 if source_article:
                     db.add_derivation(article_id, source_article["id"])
 
@@ -948,8 +1101,8 @@ def sync():
     links, citations), and updates the articles, concepts, and links
     tables. Also upserts sources from references.bib and from the
     sources/notebooks and sources/data directories so new entries get
-    picked up automatically. Run this after Claude writes or updates
-    wiki articles.
+    picked up automatically, and regenerates wiki/MANIFEST.md and
+    wiki/index.org. Run this after Claude writes or updates wiki articles.
     """
     from crucible.ingest import reconcile_sources
 
@@ -968,6 +1121,9 @@ def sync():
                 f"  Skipping {p.name} (modified during sync)"
             ),
         )
+        # Keep the generated landing pages in step with the database.
+        _write_manifest(root, db)
+        _write_index(root, db)
     finally:
         db.close()
 
@@ -985,6 +1141,8 @@ def sync():
         msg += f", {sources_added} sources added"
     if stats["skipped"]:
         msg += f", {stats['skipped']} skipped (modified during sync)"
+    if stats["unreadable"]:
+        msg += f", {stats['unreadable']} unreadable (skipped)"
     click.echo(msg)
     if stats["ambiguous_source_keys"]:
         click.echo(
@@ -2818,6 +2976,12 @@ def _render_index(root: Path, db: CrucibleDB) -> str:
         except ValueError:
             return p.as_posix()
 
+    def _index_link(article: dict) -> str:
+        """An org link to an article. Brackets in the title would end the
+        link description early, so they become parentheses."""
+        title = (article["title"] or "").translate(str.maketrans("[]", "()"))
+        return f"[[file:{_link_path(article['path'])}][{title}]]"
+
     lines = [
         f"#+TITLE: Crucible Wiki Index",
         f"#+DATE: [{datetime.now().strftime('%Y-%m-%d %a')}]",
@@ -2832,16 +2996,21 @@ def _render_index(root: Path, db: CrucibleDB) -> str:
     # Articles by type
     lines.append("* Articles by Type")
     lines.append("")
-    for atype in ["concept", "summary", "comparison", "method"]:
-        articles = by_type.get(atype, [])
+    # Articles of an unrecognised :ARTICLE_TYPE: are listed under Other, so
+    # every article appears in the index.
+    sections = [(type_labels[t], by_type.get(t, [])) for t in ARTICLE_TYPES]
+    sections.append(("Other", [
+        a for t, arts in sorted(by_type.items()) if t not in type_labels
+        for a in arts
+    ]))
+    for label, articles in sections:
         if not articles:
             continue
-        label = type_labels.get(atype, atype.title())
         lines.append(f"** {label} ({len(articles)})")
         lines.append("")
         for a in articles:
             status = f" /{a['status']}/" if a.get("status") else ""
-            lines.append(f"- [[file:{_link_path(a['path'])}][{a['title']}]]{status}")
+            lines.append(f"- {_index_link(a)}{status}")
         lines.append("")
 
     # Articles by concept
@@ -2852,7 +3021,7 @@ def _render_index(root: Path, db: CrucibleDB) -> str:
         lines.append(f"** {concept.title()} ({len(articles)})")
         lines.append("")
         for a in articles:
-            lines.append(f"- [[file:{_link_path(a['path'])}][{a['title']}]] [{a['article_type']}]")
+            lines.append(f"- {_index_link(a)} [{a['article_type']}]")
         lines.append("")
 
     # Sources
@@ -2918,10 +3087,18 @@ def lint(json_output):
                 "path": article['path'],
             })
             continue
-        meta = parse_org_file(org_path)
+        try:
+            meta = parse_org_file(org_path)
+        except (UnicodeDecodeError, OSError) as exc:
+            issues.append({
+                "type": "unreadable_file",
+                "severity": "error",
+                "message": f"Cannot read {article['path']}: {exc}",
+                "path": article['path'],
+            })
+            continue
         for link in meta.file_links:
-            target = (org_path.parent / link).resolve()
-            if not target.exists():
+            if _link_is_broken(root, org_path, link):
                 issues.append({
                     "type": "broken_link",
                     "severity": "warning",
