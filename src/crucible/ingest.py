@@ -297,7 +297,7 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     for m in _BIB_FIELD_RE.finditer(body):
         name = m.group(1).lower()
         value = m.group(2) if m.group(2) is not None else m.group(3) or ""
-        fields[name] = " ".join(value.split())
+        fields[name] = value.strip() if name == "file" else " ".join(value.split())
     return fields
 
 
