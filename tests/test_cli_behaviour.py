@@ -64,7 +64,7 @@ def test_vscode_writes_viz_in_process(project, tmp_path, monkeypatch):  # noqa: 
 def test_publish_writes_index_in_process(project, tmp_path, monkeypatch):  # noqa: F811
     no_crucible_on_path(monkeypatch, tmp_path)
     index = project / ".crucible/wiki/index.org"
-    assert not index.exists()
+    index.unlink(missing_ok=True)  # sync writes it; publish must recreate it
     result = invoke("publish", "--init-only")
     assert result.exit_code == 0, result.output
     assert "activation-energy.org" in index.read_text()

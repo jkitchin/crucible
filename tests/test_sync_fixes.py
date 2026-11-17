@@ -1,6 +1,7 @@
 """Regression tests for sync, rebuild, index, manifest and link handling."""
 
 import os
+import re
 import shutil
 
 import pytest
@@ -279,3 +280,23 @@ def test_lint_broken_link_handles_home_and_external_sources(kb, tmp_path):
     broken = [i["link"] for i in json.loads(result.stdout)
               if i["type"] == "broken_link"]
     assert broken == ["missing.org"]
+
+
+def test_sync_leaves_generated_pages_alone_when_only_the_date_differs(kb):
+    write(kb, "concepts/a.org", title="A")
+    sync()
+    for name in ("index.org", "MANIFEST.md"):
+        page = wiki(kb) / name
+        text = page.read_text()
+        stale = re.sub(r"^(#\+DATE:|Updated:) .*$", r"\1 [1999-01-01 Fri]",
+                       text, flags=re.MULTILINE)
+        assert stale != text
+        page.write_text(stale)
+    sync()
+    for name in ("index.org", "MANIFEST.md"):
+        assert "1999-01-01" in (wiki(kb) / name).read_text()
+    # A real change rewrites the page, date and all.
+    write(kb, "concepts/b.org", title="B")
+    sync()
+    assert "1999-01-01" not in (wiki(kb) / "index.org").read_text()
+    assert "concepts/b.org" in (wiki(kb) / "index.org").read_text()

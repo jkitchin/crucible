@@ -3118,11 +3118,32 @@ def _render_manifest(root: Path, db: CrucibleDB) -> str:
     return "\n".join(lines) + "\n"
 
 
+_GENERATED_DATE_RE = re.compile(r"^(#\+DATE:|Updated:) .*$", re.MULTILINE)
+
+
+def _write_generated(path: Path, text: str) -> None:
+    """Write a generated page unless only its date line would change.
+
+    MANIFEST.md and index.org are rewritten on every sync; leaving them
+    alone when the content is unchanged keeps the date out of git churn.
+    """
+    if path.exists():
+        try:
+            old = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            old = None
+        if old is not None and (
+            _GENERATED_DATE_RE.sub("", old) == _GENERATED_DATE_RE.sub("", text)
+        ):
+            return
+    path.write_text(text, encoding="utf-8")
+
+
 def _write_manifest(root: Path, db: CrucibleDB) -> Path:
     """Write wiki/MANIFEST.md from the current DB state."""
     text = _render_manifest(root, db)
     manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
-    manifest_path.write_text(text, encoding="utf-8")
+    _write_generated(manifest_path, text)
     return manifest_path
 
 
@@ -3237,7 +3258,7 @@ def _write_index(root: Path, db: CrucibleDB) -> Path:
     """Write wiki/index.org from the current DB state."""
     text = _render_index(root, db)
     index_path = cdir(root) / "wiki" / "index.org"
-    index_path.write_text(text, encoding="utf-8")
+    _write_generated(index_path, text)
     return index_path
 
 
