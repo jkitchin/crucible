@@ -431,6 +431,25 @@ def test_sync_preserves_articles_when_wiki_traversal_fails(project, monkeypatch,
         db.close()
 
 
+def test_sync_closes_database_when_wiki_traversal_fails(project, monkeypatch):
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    close = Mock(wraps=db.close)
+    monkeypatch.setattr(db, "close", close)
+    monkeypatch.setattr("crucible.cli.get_db", lambda _root: db)
+    scandir = os.scandir
+    wiki = project / ".crucible" / "wiki"
+
+    def fail_scandir(path):
+        if os.fsdecode(path) == str(wiki):
+            raise PermissionError(errno.EACCES, "Synthetic traversal failure", str(wiki))
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_scandir)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert isinstance(result.exception, PermissionError)
+    close.assert_called_once_with()
+
+
 def test_sync_does_not_prune_when_wiki_directory_is_missing(project):
     cdir = project / ".crucible"
     wiki = cdir / "wiki"

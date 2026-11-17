@@ -755,21 +755,22 @@ def sync():
 
     root = get_root()
     db = get_db(root)
+    try:
+        # Auto-register in global registry (ensures pre-registry crucibles get registered)
+        from crucible.registry import register as registry_register
+        registry_register(root.name, str(root))
 
-    # Auto-register in global registry (ensures pre-registry crucibles get registered)
-    from crucible.registry import register as registry_register
-    registry_register(root.name, str(root))
+        sources_added = upsert_sources_from_bib(root, db)
+        sources_added += upsert_sources_from_disk(root, db)
 
-    sources_added = upsert_sources_from_bib(root, db)
-    sources_added += upsert_sources_from_disk(root, db)
-
-    stats = _sync_wiki_to_db(
-        root, db,
-        on_skip=lambda p: click.echo(
-            f"  Skipping {p.name} (modified during sync)"
-        ),
-    )
-    db.close()
+        stats = _sync_wiki_to_db(
+            root, db,
+            on_skip=lambda p: click.echo(
+                f"  Skipping {p.name} (modified during sync)"
+            ),
+        )
+    finally:
+        db.close()
 
     if stats["files"] == 0 and sources_added == 0 and stats["removed"] == 0:
         click.echo("No org files found in wiki/.")
