@@ -1218,34 +1218,46 @@ def sync():
 
 @cli.command()
 @click.option("--model", "-m", default="nomic-embed-text", help="Ollama embedding model")
-@click.option("--url", default="http://localhost:11434/api/embed", help="Ollama API URL")
-def embed(model, url):
+@click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
+              default="http://localhost:11434/api/embed", show_envvar=True,
+              help="Ollama embed API URL")
+@click.option("--force", is_flag=True, help="Re-embed every article")
+def embed(model, url, force):
     """Generate embeddings for all wiki articles.
 
     Uses ollama to create vector embeddings for semantic search.
-    Only embeds articles that don't already have embeddings. `crucible sync`
-    drops the embedding of any article whose file changed, so edited
-    articles are re-embedded here.
+    Only embeds articles that have no embedding from MODEL, so switching
+    models re-embeds everything with the new one. `crucible sync` drops
+    the embedding of any article whose file changed, so edited articles
+    are re-embedded here. The org header and drawers are stripped and the
+    first 8000 characters of the rest are embedded.
     Requires ollama running with an embedding model pulled.
     """
+    from crucible.embeddings import EmbeddingError
+
     root = get_root()
     db = get_db(root)
-    idx = EmbeddingIndex(db.conn, model=model, url=url)
-    idx.initialize()
+    try:
+        idx = EmbeddingIndex(db.conn, model=model, url=url)
+        idx.initialize()
 
-    # Get all articles with their content from FTS
-    articles = []
-    for a in db.list_articles():
-        org_path = root / a["path"]
-        if org_path.exists():
-            a["content"] = org_path.read_text(encoding="utf-8")
-        articles.append(a)
+        articles = []
+        for a in db.list_articles():
+            org_path = root / a["path"]
+            if org_path.exists():
+                a["content"] = org_path.read_text(encoding="utf-8", errors="replace")
+            articles.append(a)
 
-    click.echo(f"Embedding with {model}...")
-    count = idx.embed_missing(articles)
-    s = idx.stats()
-    db.close()
-    click.echo(f"Embedded {count} new articles ({s['embedded']}/{s['total_articles']} total)")
+        click.echo(f"Embedding with {model}...")
+        try:
+            count = idx.embed_missing(articles, force=force)
+        except EmbeddingError as e:
+            raise click.ClickException(str(e))
+        s = idx.stats()
+    finally:
+        db.close()
+    click.echo(f"Embedded {count} new articles "
+               f"({s['embedded_with_model']}/{s['total_articles']} total with {model})")
 
 
 @cli.group()
@@ -1349,12 +1361,17 @@ def registry_clean():
 @click.option("--all", "search_all", is_flag=True, help="Search all registered crucibles")
 @click.option("--mode", type=click.Choice(["auto", "fts", "semantic", "hybrid"]),
               default="auto", help="Search mode (default: auto)")
-@click.option("--model", "-m", default="nomic-embed-text", help="Embedding model")
+@click.option("--model", "-m", default=None,
+              help="Embedding model (default: the model of the stored embeddings)")
+@click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
+              default="http://localhost:11434/api/embed", show_envvar=True,
+              help="Ollama embed API URL")
 @click.option("--fts-weight", default=1.0, help="FTS weight for hybrid reranking")
 @click.option("--semantic-weight", default=1.0, help="Semantic weight for hybrid reranking")
 @click.option("--raw", is_flag=True, help="Skip dedup/quality filtering (return raw ranked results)")
 @json_option
-def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, raw, json_output):
+def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weight,
+           raw, json_output):
     """Search wiki articles.
 
     By default, returns deduplicated, quality-ranked results. Similar
@@ -1362,21 +1379,17 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
     --raw to disable this and see all raw hits.
 
     Modes:
-      auto      Hybrid if embeddings exist, FTS otherwise (default)
+      auto      Hybrid if embeddings exist, FTS otherwise (default).
+                Falls back to FTS with a warning if the embedding
+                service cannot be used.
       fts       Keyword search only (FTS5 with porter stemming)
       semantic  Vector similarity only (requires `crucible embed`)
       hybrid    Combines FTS + semantic with reciprocal rank fusion
     """
+    from crucible.embeddings import EmbeddingError
+
     root = get_root()
     db = get_db(root)
-
-    # Determine effective mode
-    effective_mode = mode
-    if mode == "auto":
-        idx = EmbeddingIndex(db.conn, model=model)
-        idx.initialize()
-        s = idx.stats()
-        effective_mode = "hybrid" if s["embedded"] > 0 else "fts"
 
     # Resolve peers from global registry for --all
     if search_all:
@@ -1385,84 +1398,74 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
     else:
         peers = []
 
-    if effective_mode == "hybrid":
-        idx = EmbeddingIndex(db.conn, model=model)
+    try:
+        idx = EmbeddingIndex(db.conn, model=model, url=url)
         idx.initialize()
-        if search_all and peers:
-            results = idx.hybrid_search_all(
-                query, peers=peers, limit=limit,
-                fts_weight=fts_weight, semantic_weight=semantic_weight,
-            )
-        else:
-            results = idx.hybrid_search(
-                query, limit=limit,
-                fts_weight=fts_weight, semantic_weight=semantic_weight,
-                raw=raw,
-            )
+        embedded = idx.stats()["embedded_with_model"]
+
+        effective_mode = mode
+        if mode == "auto":
+            effective_mode = "hybrid" if embedded > 0 else "fts"
+
+        results = None
+        if effective_mode in ("hybrid", "semantic"):
+            if effective_mode == "semantic" and embedded == 0:
+                raise click.ClickException(
+                    f"No embeddings from {idx.model} found. "
+                    f"Run `crucible embed -m {idx.model}` first."
+                )
+            try:
+                if effective_mode == "hybrid":
+                    kwargs = dict(limit=limit, fts_weight=fts_weight,
+                                  semantic_weight=semantic_weight, raw=raw)
+                    if search_all and peers:
+                        results = idx.hybrid_search_all(query, peers=peers, **kwargs)
+                    else:
+                        results = idx.hybrid_search(query, **kwargs)
+                elif search_all and peers:
+                    results = idx.search_all(query, peers=peers, limit=limit)
+                else:
+                    results = idx.search(query, limit=limit)
+            except EmbeddingError as e:
+                if mode != "auto":
+                    raise click.ClickException(str(e))
+                click.echo(f"Warning: {e}\nFalling back to keyword search.", err=True)
+                effective_mode = "fts"
+            for w in idx.warnings:
+                click.echo(f"Warning: {w}", err=True)
+
+        if effective_mode == "fts":
+            if search_all:
+                results = db.search_all(query, limit=limit, peers=peers)
+            else:
+                results = db.search(query, limit=limit)
+    finally:
         db.close()
-        if json_output:
-            _emit_json(results)
-            return
-        if not results:
-            click.echo("No results.")
-            return
-        for r in results:
+
+    if json_output:
+        _emit_json(results)
+        return
+    if not results:
+        click.echo("No results.")
+        return
+    for r in results:
+        source = r.get("_crucible", "")
+        prefix = f"[{source}] " if source and source not in ("local", "") else ""
+        if effective_mode == "hybrid":
             score = r.get("rrf_score", 0)
-            methods = r.get("methods", [])
-            method_str = " + ".join(m.split(":")[0] for m in methods)
-            source = r.get("_crucible", "")
-            prefix = f"[{source}] " if source and source not in ("local", "") else ""
-            click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  (score: {score:.4f}, via: {method_str})")
-            click.echo(f"    {r['path']}")
-            absorbed = r.get("dedup_absorbed")
-            if absorbed:
-                click.echo(f"    (absorbed: {', '.join(absorbed)})")
-
-    elif effective_mode == "semantic":
-        idx = EmbeddingIndex(db.conn, model=model)
-        idx.initialize()
-        s = idx.stats()
-        if s["embedded"] == 0:
-            raise click.ClickException(
-                "No embeddings found. Run `crucible embed` first."
-            )
-        if search_all and peers:
-            results = idx.search_all(query, peers=peers, limit=limit)
-        else:
-            results = idx.search(query, limit=limit)
-        db.close()
-        if json_output:
-            _emit_json(results)
-            return
-        if not results:
-            click.echo("No results.")
-            return
-        for r in results:
+            method_str = " + ".join(m.split(":")[0] for m in r.get("methods", []))
+            click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  "
+                       f"(score: {score:.4f}, via: {method_str})")
+        elif effective_mode == "semantic":
             sim = r.get("similarity", 0)
-            source = r.get("_crucible", "")
-            prefix = f"[{source}] " if source and source not in ("local", "") else ""
             click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  (similarity: {sim:.3f})")
-            click.echo(f"    {r['path']}")
-
-    else:  # fts
-        if search_all:
-            results = db.search_all(query, limit=limit, peers=peers)
         else:
-            results = db.search(query, limit=limit)
-
-        db.close()
-        if json_output:
-            _emit_json(results)
-            return
-        if not results:
-            click.echo("No results.")
-            return
-        for r in results:
-            source = r.get("_crucible", "")
-            prefix = f"[{source}] " if source and source not in ("local", "") else ""
             status = r.get("status", "")
             click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  ({status})")
-            click.echo(f"    {r['path']}")
+        click.echo(f"    {r['path']}")
+        absorbed = r.get("dedup_absorbed")
+        if absorbed:
+            click.echo(f"    (absorbed: {', '.join(absorbed)})")
 
 
 def _resolve_article_arg(root: Path, db: CrucibleDB, article_path: str) -> str:
@@ -2054,7 +2057,12 @@ def browse(port, no_open):
     viz_path = wiki_dir / "viz.html"
     if not viz_path.exists():
         click.echo("Generating knowledge graph...")
-        subprocess.run(["crucible", "viz"], cwd=str(root), capture_output=True)
+        # In-process: a `crucible` subprocess depends on PATH and its
+        # failure went unnoticed.
+        try:
+            click.get_current_context().invoke(viz, output=None, open_browser=False)
+        except Exception as e:
+            click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
 
     articles = db.list_articles()
     db_path = cdir(root) / "crucible.db"
@@ -2081,9 +2089,15 @@ def browse(port, no_open):
     except (OSError, subprocess.TimeoutExpired):
         pass
 
-    server = start_server(wiki_dir, db_path, articles, port=port,
-                          project_name=project_name,
-                          github_url=github_url)
+    try:
+        server = start_server(wiki_dir, db_path, articles, port=port,
+                              project_name=project_name,
+                              github_url=github_url)
+    except OSError as e:
+        raise click.ClickException(
+            f"Cannot serve on port {port}: {e.strerror or e}. "
+            "Is another server using it? Pick another with --port."
+        )
     url = f"http://localhost:{port}"
     click.echo(f"Serving {project_name} wiki at {url}  (Ctrl+C to stop)")
 
