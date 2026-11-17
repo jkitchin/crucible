@@ -5,15 +5,20 @@ and registering them in the database.
 """
 
 import hashlib
+import html
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
+from glob import escape as glob_escape
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from filelock import FileLock
@@ -203,14 +208,62 @@ def extract_title(path: Path, text: str) -> str:
     return path.stem.replace("-", " ").replace("_", " ").title()
 
 
+# Letters NFKD does not decompose into an ASCII base letter.
+_FOLD = str.maketrans({
+    "ø": "o", "Ø": "O", "ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE",
+    "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ð": "d", "Ð": "D", "þ": "th",
+    "Þ": "Th", "ı": "i",
+})
+
+
+def ascii_fold(text: str) -> str:
+    """Transliterate to ASCII: Müller -> Muller, Nørskov -> Norskov.
+
+    Characters with no ASCII equivalent (e.g. CJK) are dropped.
+    """
+    decomposed = unicodedata.normalize("NFKD", text.translate(_FOLD))
+    return decomposed.encode("ascii", "ignore").decode("ascii")
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    """A filename-safe slug of `text`, or "" if nothing usable remains."""
+    slug = ascii_fold(html.unescape(text)).lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+    return slug[:max_len].rstrip("-")
+
+
+_DATE_RE = re.compile(r"\d{4}(?:-\d{2}(?:-\d{2})?)?")
+
+
+def validate_date(date: str | None) -> str | None:
+    """Return `date` if it is ISO YYYY, YYYY-MM or YYYY-MM-DD, else raise ValueError."""
+    if date is None:
+        return None
+    date = date.strip()
+    ok = _DATE_RE.fullmatch(date) is not None
+    if ok and len(date) > 4:
+        fmt = {7: "%Y-%m", 10: "%Y-%m-%d"}[len(date)]
+        try:
+            datetime.strptime(date, fmt)
+        except ValueError:
+            ok = False
+    if not ok:
+        raise ValueError(
+            f"Invalid date {date!r}: use ISO format YYYY, YYYY-MM or YYYY-MM-DD"
+        )
+    return date
+
+
 def generate_cite_key(title: str, authors: list[str] | None, date: str | None) -> str:
     """Generate a BibTeX cite key from source metadata.
 
     Format: firstauthor_surname + year, e.g. smith2024.
-    Falls back to title slug + year.
+    Falls back to title slug + year. Accented letters are transliterated
+    (Müller -> muller).
     """
-    import re as _re
-    year = (date or "")[:4] or "nd"
+    year = (date or "")[:4]
+    if not re.fullmatch(r"\d{4}", year):
+        year = "nd"
 
     if authors and authors[0] and authors[0].strip():
         # Take last name of first author
@@ -221,13 +274,13 @@ def generate_cite_key(title: str, authors: list[str] | None, date: str | None) -
         else:
             parts = first.strip().split()
             surname = parts[-1] if parts else ""
-        surname = _re.sub(r"[^a-zA-Z]", "", surname).lower()
+        surname = re.sub(r"[^a-zA-Z]", "", ascii_fold(surname)).lower()
         if surname:
             return f"{surname}{year}"
         # No usable surname (e.g. all-punctuation author); fall through to title.
 
     # Fallback to first significant word of title
-    words = _re.sub(r"[^a-zA-Z\s]", "", title.lower()).split()
+    words = re.sub(r"[^a-zA-Z\s]", "", ascii_fold(title or "").lower()).split()
     stop = {"the", "a", "an", "of", "on", "in", "for", "and", "to", "with"}
     word = next((w for w in words if w not in stop), words[0] if words else "unknown")
     return f"{word}{year}"
@@ -778,9 +831,9 @@ def fetch_bibtex_from_doi(doi: str, timeout: float = 10.0) -> str | None:
     if doi.lower().startswith("doi:"):
         doi = doi[4:]
     if doi.startswith("http"):
-        url = doi
+        url = quote(doi, safe=":/?#[]@!$&'()*+,;=%~")
     else:
-        url = f"https://doi.org/{doi}"
+        url = "https://doi.org/" + quote(doi, safe="/:;()[]<>~")
 
     req = Request(url, headers={
         "Accept": "application/x-bibtex; charset=utf-8",
@@ -789,7 +842,8 @@ def fetch_bibtex_from_doi(doi: str, timeout: float = 10.0) -> str | None:
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read().decode("utf-8", errors="replace").strip()
-    except (URLError, OSError, TimeoutError):
+    except (URLError, OSError, TimeoutError, ValueError, http.client.HTTPException):
+        # ValueError covers malformed URLs (and UnicodeError, its subclass).
         return None
     if not data.startswith("@"):
         return None
@@ -798,7 +852,9 @@ def fetch_bibtex_from_doi(doi: str, timeout: float = 10.0) -> str | None:
 
 # DOIs are 10.<registrant>/<suffix>. Stop at whitespace/quotes/brackets and
 # strip trailing sentence punctuation that commonly abuts a DOI in running text.
-_DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\"'<>}\]]+", re.IGNORECASE)
+# Only printable ASCII: a non-ASCII character (an en dash typed for a hyphen,
+# say) ends the match instead of producing a URL that cannot be requested.
+_DOI_RE = re.compile(r"\b10\.\d{4,9}/[!#-&(-;=?-\\^-|~]+", re.IGNORECASE)
 
 
 def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | None:
@@ -822,24 +878,56 @@ def bib_has_key(text: str, cite_key: str) -> bool:
     return bibtex_mod.has_key(text, cite_key)
 
 
-def append_bib_entry(root: Path, entry: str, cite_key: str):
+def _bib_lock(root: Path) -> FileLock:
+    bib_path = root / CRUCIBLE_DIR / "references.bib"
+    return FileLock(bib_path.with_suffix(".bib.lock"), timeout=10)
+
+
+def _append_bib_unlocked(root: Path, entry: str, cite_key: str) -> bool:
+    bib_path = root / CRUCIBLE_DIR / "references.bib"
+    if bib_path.exists():
+        existing = bib_path.read_text(encoding="utf-8")
+        if bib_has_key(existing, cite_key):
+            return False
+        new_content = existing.rstrip() + "\n\n" + entry + "\n"
+    else:
+        new_content = entry + "\n"
+    atomic_write_text(bib_path, new_content)
+    return True
+
+
+def append_bib_entry(root: Path, entry: str, cite_key: str) -> bool:
     """Append a BibTeX entry to .crucible/references.bib if not already present.
 
     Uses file locking and atomic writes to prevent concurrent writers
-    from clobbering each other's entries.
+    from clobbering each other's entries. Returns False, writing nothing,
+    if an entry with `cite_key` already exists.
     """
-    bib_path = root / CRUCIBLE_DIR / "references.bib"
-    lock_path = bib_path.with_suffix(".bib.lock")
+    with _bib_lock(root):
+        return _append_bib_unlocked(root, entry, cite_key)
 
-    with FileLock(lock_path, timeout=10):
-        if bib_path.exists():
-            existing = bib_path.read_text(encoding="utf-8")
-            if bib_has_key(existing, cite_key):
-                return
-            new_content = existing.rstrip() + "\n\n" + entry + "\n"
-        else:
-            new_content = entry + "\n"
-        atomic_write_text(bib_path, new_content)
+
+def append_bib_entry_unique_key(root: Path, db: CrucibleDB, base_key: str,
+                                entry: str) -> str:
+    """Append `entry` under a cite key no source or bib entry uses yet.
+
+    The key is chosen from `base_key` (see _unique_cite_key) while holding
+    the bib lock, so two concurrent ingests never settle on the same key.
+    Returns the key used.
+    """
+    with _bib_lock(root):
+        cite_key = _unique_cite_key(base_key, db, root)
+        _append_bib_unlocked(root, replace_cite_key(entry, cite_key), cite_key)
+    return cite_key
+
+
+def _drop_bib_entry(root: Path, cite_key: str, rel_path: str) -> None:
+    """Remove the entry `cite_key` that names `rel_path` (undoing a failed ingest)."""
+    def repl(entry: bibtex_mod.Entry) -> str:
+        if entry.key == cite_key and (entry.get("file") or "").strip() == rel_path:
+            return ""
+        return entry.text
+    _rewrite_bib(root, repl)
 
 
 def set_bib_file_fields(root: Path, paths: dict[str, str]) -> None:
@@ -966,6 +1054,32 @@ def _unique_cite_key(base: str, db: CrucibleDB, root: Path | None = None) -> str
     return f"{base}{i}"
 
 
+def _dest_taken(dest_path: Path) -> bool:
+    """Whether storing a source at dest_path would collide with an existing file.
+
+    A source's text sidecar is <stem>.txt, so the name is taken if either
+    the file or its sidecar exists. A .txt source is also refused a name
+    that another file's sidecar would use (any <stem>.* sibling).
+    """
+    if dest_path.exists() or dest_path.with_suffix(".txt").exists():
+        return True
+    if dest_path.suffix.lower() == ".txt":
+        pattern = glob_escape(dest_path.stem) + ".*"
+        return any(p.is_file() for p in dest_path.parent.glob(pattern))
+    return False
+
+
+def _claim(path: Path, created: list[Path]) -> bool:
+    """Create path exclusively; record it in created and return True if we got it."""
+    try:
+        with open(path, "xb"):
+            pass
+    except FileExistsError:
+        return False
+    created.append(path)
+    return True
+
+
 def ingest_source(
     root: Path,
     db: CrucibleDB,
@@ -991,6 +1105,10 @@ def ingest_source(
     if bibtex and bibtex.strip().startswith("@") and bibtex_mod.first_entry(bibtex.strip()) is None:
         raise ValueError("The --bibtex entry is not a complete BibTeX entry "
                          "(check that its braces are balanced)")
+    if bibtex and len(bibtex_mod.entries(bibtex)) > 1:
+        raise ValueError("The --bibtex value holds more than one BibTeX entry; "
+                         "pass exactly one entry per ingested source")
+    date = validate_date(date)
 
     # If this exact file (same content hash) was already ingested, skip it:
     # don't copy, append bib, or add a duplicate DB row. Return the existing
@@ -1021,68 +1139,50 @@ def ingest_source(
     if shareable is None:
         shareable = source_type in ("notebook", "data")
 
-    # Copy to destination
-    dest_dir = destination_dir(root, source_type, shareable)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / source_path.name
-
-    # Handle name collisions
-    if dest_path.exists() and not dest_path.samefile(source_path):
-        stem = source_path.stem
-        suffix = source_path.suffix
-        counter = 1
-        while dest_path.exists():
-            dest_path = dest_dir / f"{stem}_{counter}{suffix}"
-            counter += 1
-
-    if not dest_path.exists():
-        shutil.copy2(str(source_path), str(dest_path))
-
-    # Extract text
-    text = extract_text(dest_path)
-
-    # Save extracted text alongside source
-    text_path = dest_path.with_suffix(".txt")
-    if text:
-        atomic_write_text(text_path, text)
-
-    # Determine title
-    if title is None:
-        title = extract_title(dest_path, text)
-
-    # Use today if no date given
-    date_given = date is not None
-    if date is None:
-        date = datetime.now().strftime("%Y-%m-%d")
-
-    # Relative path for database
-    rel_path = str(dest_path.relative_to(root))
+    # Everything that can fail (text extraction, DOI lookup, building the
+    # entry) runs before anything is written, from the original file.
+    text = extract_text(source_path)
 
     # If no DOI was supplied, try to recover one from the document text so we
     # can fetch a complete, correctly-typed entry instead of a bare @misc.
     if not doi:
         doi = extract_doi_from_text(text)
 
-    # Generate cite key and bib entry. Preference order:
+    # The bib entry. Preference order:
     #   1. user-provided --bibtex string
     #   2. fetched from doi.org content negotiation (real entry type + fields)
     #   3. minimal entry from known metadata
-    cite_key = _unique_cite_key(generate_cite_key(title, authors, date), db, root)
+    # Its key is a placeholder until the real one is chosen under the lock.
+    placeholder = "crucible-pending-key"
     bib_entry = None
     if bibtex and bibtex.strip().startswith("@"):
-        bib_entry = replace_cite_key(bibtex.strip(), cite_key)
+        bib_entry = replace_cite_key(bibtex.strip(), placeholder)
     elif doi:
         fetched = fetch_bibtex_from_doi(doi)
         if fetched and bibtex_mod.first_entry(fetched) is not None:
-            bib_entry = replace_cite_key(fetched, cite_key)
+            bib_entry = replace_cite_key(fetched, placeholder)
+    known = _parse_bib_fields(bib_entry) if bib_entry else {}
+
+    # Title, authors and date for the key: what the user gave, else what
+    # the entry says, else what the file says (title) or today (date).
+    if title is None:
+        title = known.get("title") or extract_title(source_path, text)
+    key_authors = authors or _authors_from_bib(known.get("author", "")) or None
+    date_given = date is not None
+    entry_year = (known.get("date") or known.get("year") or "")[:4]
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    key_date = date if date_given or not re.fullmatch(r"\d{4}", entry_year) else entry_year
+    base_key = generate_cite_key(title, key_authors, key_date)
+
     if bib_entry is None:
         bib_entry = generate_bib_entry(
-            cite_key, title, authors, date, url, source_type, doi=doi,
+            placeholder, title, authors, date, url, source_type, doi=doi,
         )
+        known = _parse_bib_fields(bib_entry)
     # The row is rebuilt from this entry on a fresh clone, so the entry must
     # carry what the row records: the authors and full date the user gave,
     # when a supplied or fetched entry lacks them.
-    known = _parse_bib_fields(bib_entry)
     if title and not known.get("title"):
         bib_entry = set_bib_field(bib_entry, "title", title)
     if authors and not known.get("author"):
@@ -1094,34 +1194,98 @@ def ingest_source(
             and (date_given or not known.get("year"))
             and known.get("year", date[:4]) == date[:4]):
         bib_entry = set_bib_field(bib_entry, "date", date)
-    # Record the stored copy, so a fresh clone can tie the entry to its file.
-    bib_entry = set_bib_field(bib_entry, "file", rel_path)
-    append_bib_entry(root, bib_entry, cite_key)
 
-    # Describe the source exactly as a rebuild from the entry would.
-    first = bibtex_mod.first_entry(bib_entry)
-    rebuilt = _fields_from_bib(
-        {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
-    )
-    title = rebuilt["title"]
-    authors = rebuilt["authors"] or authors
-    date = rebuilt["date"] or date
-    url = rebuilt["url"] or url
+    # Choose where to store it: a name that is free, and whose text sidecar
+    # (<stem>.txt) is free too, so neither overwrites an existing file.
+    dest_dir = destination_dir(root, source_type, shareable)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / source_path.name
+    in_place = dest_path.exists() and dest_path.samefile(source_path)
 
-    # Register in database (store cite_key and content hash in metadata)
-    metadata = {"cite_key": cite_key, "content_hash": content_hash}
-    if doi:
-        metadata["doi"] = doi
-    source_id = db.add_source(
-        path=rel_path,
-        title=title,
-        source_type=source_type,
-        shareable=shareable,
-        url=url,
-        authors=authors,
-        date=date,
-        metadata=metadata,
-    )
+    # Claim the names by exclusive create: a free name that another ingest
+    # takes first raises FileExistsError, and we move on to the next one.
+    # A file is never replaced. A .txt source is its own text; any other
+    # file gets a sidecar. Claiming happens inside the try, so a failure or
+    # interrupt before the copy still removes the empty placeholders.
+    created: list[Path] = []
+    cite_key = None
+    try:
+        write_sidecar = False
+        if in_place:
+            text_path = dest_path.with_suffix(".txt")
+            if text and text_path != dest_path:
+                write_sidecar = _claim(text_path, created)
+        else:
+            stem, suffix = source_path.stem, source_path.suffix
+            counter = 1
+            while True:
+                if not _dest_taken(dest_path) and _claim(dest_path, created):
+                    text_path = dest_path.with_suffix(".txt")
+                    if not text or text_path == dest_path:
+                        break
+                    if _claim(text_path, created):
+                        write_sidecar = True
+                        break
+                    created.pop().unlink(missing_ok=True)
+                dest_path = dest_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+
+        rel_path = str(dest_path.relative_to(root))
+        bib_entry = set_bib_field(bib_entry, "file", rel_path)
+
+        if not in_place:
+            with open(source_path, "rb") as src, open(dest_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            shutil.copystat(source_path, dest_path)
+        if write_sidecar:
+            atomic_write_text(text_path, text)
+
+        cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
+        bib_entry = replace_cite_key(bib_entry, cite_key)
+
+        # Describe the source exactly as a rebuild from the entry would.
+        first = bibtex_mod.first_entry(bib_entry)
+        rebuilt = _fields_from_bib(
+            {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
+        )
+        title = rebuilt["title"]
+        authors = rebuilt["authors"] or authors
+        date = rebuilt["date"] or date
+        url = rebuilt["url"] or url
+
+        # Register in database (store cite_key and content hash in metadata)
+        metadata = {"cite_key": cite_key, "content_hash": content_hash}
+        if write_sidecar:
+            # Lets delete tell this sidecar from a user's own <stem>.txt.
+            metadata["text_hash"] = file_sha256(text_path)
+        if doi:
+            metadata["doi"] = doi
+        source_id = db.add_source(
+            path=rel_path,
+            title=title,
+            source_type=source_type,
+            shareable=shareable,
+            url=url,
+            authors=authors,
+            date=date,
+            metadata=metadata,
+        )
+    except BaseException:
+        # Leave nothing behind: no orphan copy, sidecar or bib entry.
+        if cite_key is not None:
+            try:
+                _drop_bib_entry(root, cite_key, rel_path)
+            except Exception:
+                pass
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+
+    if text_path != dest_path and not text_path.exists():
+        text_path = None
 
     return {
         "source_id": source_id,
@@ -1131,7 +1295,7 @@ def ingest_source(
         "shareable": shareable,
         "stored_path": str(dest_path),
         "relative_path": rel_path,
-        "text_path": str(text_path) if text else None,
+        "text_path": str(text_path) if text and text_path else None,
         "text_length": len(text),
         "date": date,
         "duplicate": False,

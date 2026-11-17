@@ -1,5 +1,6 @@
 """Crucible CLI - knowledge base management."""
 
+import errno
 import json
 import os
 import re
@@ -13,11 +14,12 @@ from typing import NoReturn
 
 import click
 
+from crucible import DISTRIBUTION, package_version
 from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source
-from crucible.orgparse import parse_org_file
+from crucible.orgparse import FILE_LINK_RE, parse_org_file
 
 
 CRUCIBLE_DIR = ".crucible"
@@ -54,13 +56,32 @@ def _ensure_settings(root: Path) -> bool:
     if settings_path.exists():
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            settings = {}
+        except (ValueError, OSError) as e:
+            # Never replace a file we cannot read: it holds the user's
+            # other settings.
+            click.echo(
+                f"  Warning: could not read {settings_path} ({e}); "
+                "not adding crucible permissions to it.", err=True,
+            )
+            return False
     else:
         settings = {}
 
+    if not isinstance(settings, dict):
+        click.echo(
+            f"  Warning: {settings_path} is not a JSON object; "
+            "not adding crucible permissions to it.", err=True,
+        )
+        return False
     permissions = settings.setdefault("permissions", {})
-    allow = permissions.setdefault("allow", [])
+    allow = permissions.get("allow", []) if isinstance(permissions, dict) else None
+    if not isinstance(allow, list) or not all(isinstance(p, str) for p in allow):
+        click.echo(
+            f"  Warning: {settings_path} has an unexpected \"permissions\" "
+            "shape; not adding crucible permissions to it.", err=True,
+        )
+        return False
+    permissions["allow"] = allow
 
     # Drop obsolete rules, then add any missing crucible permissions
     added = [perm for perm in allow if perm in OBSOLETE_PERMISSIONS]
@@ -78,6 +99,10 @@ def _ensure_settings(root: Path) -> bool:
         json.dumps(settings, indent=2) + "\n", encoding="utf-8"
     )
     return True
+
+
+def _warn(message: str) -> None:
+    click.echo(message, err=True)
 
 
 def _is_registry_dir(candidate: Path) -> bool:
@@ -164,26 +189,58 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     `.#name.org` lock symlinks Emacs creates while a buffer has unsaved
     changes.
 
+    Symlinked directories are followed (a wiki kept in Dropbox is often
+    linked in), each real directory once, so a symlink loop cannot recurse
+    forever. Paths are returned under `wiki_dir` as spelled, not resolved.
+
     Errors are raised rather than suppressed, so an incomplete scan can never
     be mistaken for deleted articles. That is why this walks with scandir:
-    rglob and os.walk skip entries whose type cannot be read.
+    rglob and os.walk skip entries whose type cannot be read. The exception
+    is an entry that vanishes during the scan, which really is gone.
     """
     index_path = wiki_dir / "index.org"
     org_files = []
+    seen_dirs = set()
     pending = [wiki_dir]
     while pending:
-        with os.scandir(pending.pop()) as entries:
-            for entry in entries:
-                path = Path(entry.path)
+        directory = pending.pop()
+        try:
+            dir_stat = directory.stat()
+        except FileNotFoundError:
+            continue
+        dir_key = (dir_stat.st_dev, dir_stat.st_ino)
+        if dir_key in seen_dirs:
+            continue
+        seen_dirs.add(dir_key)
+        try:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            try:
                 mode = entry.stat(follow_symlinks=False).st_mode
-                if stat.S_ISDIR(mode):
-                    pending.append(path)
-                elif (
-                    entry.name.endswith(".org")
-                    and path != index_path
-                    and (stat.S_ISREG(mode) or path.is_file())
-                ):
-                    org_files.append(path)
+                if stat.S_ISLNK(mode):
+                    # A dangling link, such as an Emacs `.#name.org` lock,
+                    # or a link to itself is skipped; a link to a directory
+                    # is followed.
+                    try:
+                        mode = entry.stat(follow_symlinks=True).st_mode
+                    except OSError as exc:
+                        if isinstance(exc, FileNotFoundError) or exc.errno == errno.ELOOP:
+                            continue
+                        raise
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(mode):
+                pending.append(path)
+            elif (
+                entry.name.endswith(".org")
+                and path != index_path
+                and stat.S_ISREG(mode)
+            ):
+                org_files.append(path)
     return sorted(org_files)
 
 
@@ -254,6 +311,7 @@ def _emit_json(data) -> None:
 
 
 @click.group()
+@click.version_option(package_name=DISTRIBUTION, prog_name="crucible")
 @click.pass_context
 def cli(ctx):
     """Crucible - LLM-compiled knowledge base."""
@@ -267,12 +325,7 @@ def about(json_output):
     from crucible.database import SCHEMA_VERSION
     from crucible.registry import list_instances
 
-    # Package version
-    try:
-        from importlib.metadata import version as pkg_version
-        version = pkg_version("crucible")
-    except Exception:
-        version = "dev"
+    version = package_version()
 
     if json_output:
         project = None
@@ -411,7 +464,8 @@ def init(root):
         "Conventions: org-mode with scimax, org-ref citations, narrative prose.\n"
         "Each article's top heading has :ARTICLE_TYPE:, :SOURCE_KEYS: (the cite keys\n"
         "`crucible ingest` prints), :STATUS:, :CREATED: and :MODIFIED: (update it on\n"
-        "every edit). Run `crucible sync` after writing or editing articles.\n"
+        "every edit). Run `crucible sync` after writing or editing articles;\n"
+        "it also regenerates wiki/MANIFEST.md and wiki/index.org.\n"
         "The LLM maintains the wiki; manual edits are the exception.\n"
         "Run `crucible help all` for the full CLI reference.\n"
         f"{crucible_marker}\n"
@@ -441,9 +495,9 @@ def init(root):
     click.echo(f"Initialized crucible at {root}")
 
     # Auto-register in global registry
-    from crucible.registry import register as registry_register
-    actual_name = registry_register(root.name, str(root))
-    click.echo(f"  Registered in global registry as '{actual_name}'")
+    actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
+    if actual_name:
+        click.echo(f"  Registered in global registry as '{actual_name}'")
 
     # Install the skill and this project's manifest; the global CLAUDE.md
     # directive is left to an explicit `crucible install`.
@@ -488,12 +542,16 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
     import sys
     import tempfile
 
-    root = get_root()
-    db = get_db(root)
+    from crucible.ingest import slugify, validate_date
 
-    # --bibtex @file.bib reads bibtex from a file (distinguished from a literal
-    # @article{...} entry by checking for '{' before any non-path character).
-    if bibtex and bibtex.startswith("@") and "{" not in bibtex:
+    try:
+        date = validate_date(date)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="'--date'")
+
+    # --bibtex @file.bib reads bibtex from a file. A literal entry starts
+    # with @type{ or @type( ; anything else after the @ is a path.
+    if bibtex and bibtex.startswith("@") and not _BIB_ENTRY_HEAD_RE.match(bibtex):
         bib_path = Path(bibtex[1:])
         if not bib_path.exists():
             raise click.ClickException(f"BibTeX file not found: {bib_path}")
@@ -505,6 +563,27 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
                 "The --bibtex entry is not a complete BibTeX entry "
                 "(check that its braces are balanced)"
             )
+        if len(bibtex_mod.entries(bibtex)) > 1:
+            raise click.ClickException(
+                "The --bibtex value holds more than one BibTeX entry; "
+                "pass exactly one entry per ingested source"
+            )
+
+    root = get_root()
+    db = get_db(root)
+
+    def run_ingest(path: Path, **overrides) -> dict:
+        kwargs = dict(
+            root=root, db=db, source_path=path,
+            title=title, source_type=source_type, shareable=shareable,
+            url=url, date=date, authors=list(author) if author else None,
+            doi=doi, bibtex=bibtex,
+        )
+        kwargs.update(overrides)
+        try:
+            return ingest_source(**kwargs)
+        except ValueError as e:
+            raise click.ClickException(str(e))
 
     if source == "-":
         # Reading from stdin
@@ -515,86 +594,36 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
         if source_type is None:
             source_type = "web"
         if filename is None:
-            if title:
-                slug = title.lower().replace(" ", "-")
-                slug = re.sub(r"[^a-z0-9-]", "", slug)[:60]
-            else:
+            slug = slugify(title) if title else ""
+            if not slug:
                 from datetime import datetime as dt
                 slug = dt.now().strftime("stdin-%Y%m%d-%H%M%S")
             ext = ".org" if source_type in ("notebook",) else ".md"
             filename = f"{slug}{ext}"
 
         # Write to a temp file, then ingest normally
-        tmp = Path(tempfile.mkdtemp()) / filename
-        tmp.write_text(content, encoding="utf-8")
-        result = ingest_source(
-            root=root, db=db, source_path=tmp,
-            title=title, source_type=source_type, shareable=shareable,
-            url=url, date=date, authors=list(author) if author else None, doi=doi,
-            bibtex=bibtex,
-        )
-        tmp.unlink()
-        tmp.parent.rmdir()
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            tmp = tmp_dir / Path(filename).name
+            tmp.write_text(content, encoding="utf-8")
+            result = run_ingest(tmp, source_type=source_type)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         _print_ingest_result(result)
     elif source.startswith("http://") or source.startswith("https://"):
-        # URL: fetch, convert, and ingest
-        import subprocess
-        import tempfile
-        from urllib.request import Request, urlopen
-        from urllib.error import URLError
-
-        click.echo(f"Fetching {source}...")
-        try:
-            req = Request(source, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            })
-            resp = urlopen(req, timeout=30)
-            raw_html = resp.read().decode("utf-8", errors="replace")
-        except (URLError, OSError) as e:
-            raise click.ClickException(f"Failed to fetch URL: {e}")
-
-        # Extract title from HTML if not provided
-        if title is None:
-            import re as _re
-            m = _re.search(r"<title>(.*?)</title>", raw_html,
-                           _re.IGNORECASE | _re.DOTALL)
-            if m:
-                title = m.group(1).strip()
-                # Clean up common title cruft
-                for sep in [" | ", " - ", " :: "]:
-                    if sep in title:
-                        title = title.split(sep)[0].strip()
-
-        if title is None:
-            title = source.split("/")[-1] or "Untitled Web Page"
-
-        # Convert to plain text via pandoc if available
-        if shutil.which("pandoc"):
-            proc = subprocess.run(
-                ["pandoc", "-f", "html", "-t", "plain", "--wrap=none"],
-                input=raw_html, capture_output=True, text=True, timeout=60,
-            )
-            content = proc.stdout if proc.returncode == 0 else raw_html
-        else:
-            content = raw_html
-
-        # Also save the raw HTML
-        slug = re.sub(r"[^a-z0-9-]", "", title.lower().replace(" ", "-"))[:60]
+        # URL: fetch, then store what was served (HTML page, PDF, ...)
         tmp_dir = Path(tempfile.mkdtemp())
-        tmp_html = tmp_dir / f"{slug}.html"
-        tmp_html.write_text(raw_html, encoding="utf-8")
-
-        # Ingest the HTML file (text extraction will use pandoc)
-        result = ingest_source(
-            root=root, db=db, source_path=tmp_html,
-            title=title, source_type="web", shareable=False,
-            url=source, date=date, authors=list(author) if author else None,
-            doi=doi, bibtex=bibtex,
-        )
-        tmp_html.unlink()
-        tmp_dir.rmdir()
+        try:
+            tmp_file, fetched_title, fetched_type = _fetch_url_source(source, tmp_dir)
+            result = run_ingest(
+                tmp_file,
+                title=title or fetched_title,
+                source_type=source_type or fetched_type,
+                shareable=False if shareable is None else shareable,
+                url=source,
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         _print_ingest_result(result)
 
     else:
@@ -624,15 +653,85 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
             source_path = Path(source)
             if not source_path.exists():
                 raise click.ClickException(f"Source not found: {source}")
-            result = ingest_source(
-                root=root, db=db, source_path=source_path,
-                title=title, source_type=source_type, shareable=shareable,
-                url=url, date=date, authors=list(author) if author else None,
-                doi=doi, bibtex=bibtex,
-            )
+            result = run_ingest(source_path)
             _print_ingest_result(result)
 
     db.close()
+
+
+# A literal BibTeX entry passed to --bibtex: @type{ or @type(
+_BIB_ENTRY_HEAD_RE = re.compile(r"\s*@\s*[A-Za-z][\w-]*\s*[{(]")
+
+_HTML_TYPES = {"text/html", "application/xhtml+xml"}
+
+
+def _fetch_url_source(source: str, tmp_dir: Path) -> tuple[Path, str | None, str]:
+    """Download `source` into tmp_dir as the file to ingest.
+
+    Returns (path, title, source_type). An HTML page is decoded with the
+    charset it declares and saved as .html, with its <title> (entities
+    decoded) as the title; anything else (a PDF, say) is saved byte for
+    byte under the extension its Content-Type or URL names.
+    """
+    import html
+    import http.client
+    import mimetypes
+    from urllib.error import URLError
+    from urllib.parse import unquote, urlparse
+    from urllib.request import Request, urlopen
+
+    from crucible.ingest import detect_source_type, slugify
+
+    click.echo(f"Fetching {source}...")
+    try:
+        req = Request(source, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            content_type = resp.headers.get_content_type()
+            charset = resp.headers.get_content_charset()
+    except (URLError, OSError, ValueError, http.client.HTTPException) as e:
+        raise click.ClickException(f"Failed to fetch URL: {e}")
+
+    url_name = unquote(Path(urlparse(source).path).name)
+    url_ext = Path(url_name).suffix.lower()
+    is_html = content_type in _HTML_TYPES or (
+        content_type in ("application/octet-stream", "text/plain")
+        and url_ext in (".html", ".htm")
+    )
+
+    if is_html:
+        try:
+            raw_html = body.decode(charset or "utf-8", errors="replace")
+        except LookupError:   # a charset Python does not know
+            raw_html = body.decode("utf-8", errors="replace")
+        title = None
+        m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.IGNORECASE | re.DOTALL)
+        if m:
+            title = " ".join(html.unescape(m.group(1)).split())
+            # Clean up common title cruft
+            for sep in [" | ", " - ", " :: "]:
+                if sep in title:
+                    title = title.split(sep)[0].strip()
+        title = title or url_name or "Untitled Web Page"
+        stem = slugify(title) or slugify(Path(url_name).stem) or "web-page"
+        path = tmp_dir / f"{stem}.html"
+        # Stored as UTF-8, the encoding text extraction reads.
+        path.write_text(raw_html, encoding="utf-8")
+        return path, title, "web"
+
+    ext = url_ext if url_ext and mimetypes.guess_type(f"x{url_ext}")[0] == content_type else ""
+    ext = ext or mimetypes.guess_extension(content_type) or url_ext or ".bin"
+    stem = slugify(Path(url_name).stem) or "download"
+    path = tmp_dir / f"{stem}{ext}"
+    path.write_bytes(body)
+    source_type = detect_source_type(path)
+    if source_type not in ("pdf", "web"):
+        source_type = "web"
+    return path, None, source_type
 
 
 def _print_ingest_result(result: dict):
@@ -668,6 +767,93 @@ def _safe_relative_to(target: Path, root: Path) -> str | None:
         return str(target.relative_to(root))
     except ValueError:
         return None
+
+
+def _link_path(org_path: Path, link: str) -> Path:
+    """The path a file link in `org_path` names, normalised as org does.
+
+    `~` is expanded and `..` is resolved lexically (like Emacs's
+    expand-file-name), without following symlinks: resolving would carry a
+    path inside a symlinked wiki out of the project root.
+    """
+    target = Path(os.path.expanduser(link))
+    if not target.is_absolute():
+        target = org_path.parent / target
+    return Path(os.path.normpath(target))
+
+
+def _on_disk_spelling(root: Path, rel: str) -> str | None:
+    """`rel` with each component spelled as it is on disk, or None.
+
+    On a case-insensitive filesystem [[file:B.org]] opens b.org, but the
+    database keys articles by their on-disk path, case-sensitively.
+    """
+    current = root
+    parts = []
+    for part in Path(rel).parts:
+        try:
+            names = os.listdir(current)
+        except OSError:
+            return None
+        if part not in names:
+            matches = [n for n in names if n.casefold() == part.casefold()]
+            if len(matches) != 1:
+                return None
+            part = matches[0]
+        parts.append(part)
+        current = current / part
+    return str(Path(*parts)) if parts else None
+
+
+def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
+    """The project-relative path a wiki file link points at, or None.
+
+    None means the target lies outside the project. An absolute link may
+    name the real location of a symlinked wiki or project, so the resolved
+    path is also tried against the resolved wiki and root.
+    """
+    target = _link_path(org_path, link)
+    rel = _safe_relative_to(target, root)
+    if rel is not None:
+        return rel
+    try:
+        real = target.resolve()
+    except OSError:
+        return None
+    wiki_dir = cdir(root) / "wiki"
+    for base, spelled in ((wiki_dir, wiki_dir), (root, root)):
+        try:
+            within = real.relative_to(base.resolve())
+        except (ValueError, OSError):
+            continue
+        return str((spelled / within).relative_to(root))
+    return None
+
+
+def _link_is_broken(root: Path, org_path: Path, link: str) -> bool:
+    """True if a file link in `org_path` names nothing on disk.
+
+    Links into sources/external/ are exempt: those files are gitignored,
+    so a fresh clone legitimately lacks them.
+    """
+    target = _link_path(org_path, link)
+    if target.exists():
+        return False
+    rel = _link_target_rel(root, org_path, link)
+    external = (CRUCIBLE_DIR, "sources", "external")
+    return rel is None or Path(rel).parts[:3] != external
+
+
+def _find_linked_article(db: CrucibleDB, root: Path, rel: str | None) -> dict | None:
+    """The article stored at project-relative `rel`, matching on-disk case."""
+    if rel is None:
+        return None
+    article = db.get_article_by_path(rel)
+    if article is None and (root / rel).exists():
+        spelled = _on_disk_spelling(root, rel)
+        if spelled is not None and spelled != rel:
+            article = db.get_article_by_path(spelled)
+    return article
 
 
 def _source_key_index(
@@ -730,15 +916,41 @@ def _resolve_source_keys(
     }
 
 
-def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
+ARTICLE_TYPES = ("concept", "summary", "comparison", "method")
+
+
+def _normalize_article_type(value: str | None) -> str:
+    """An :ARTICLE_TYPE: value as stored: lowercase, defaulting to concept."""
+    return (value or "").strip().lower() or "concept"
+
+
+def _report_unreadable(path: Path, exc: Exception) -> None:
+    """Tell the user on stderr that an article could not be read."""
+    if isinstance(exc, UnicodeDecodeError):
+        reason = "not valid UTF-8"
+    elif isinstance(exc, OSError) and exc.strerror:
+        reason = exc.strerror
+    else:
+        reason = str(exc)
+    click.echo(f"crucible: skipping unreadable article {path}: {reason}", err=True)
+
+
+def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
+                     on_unreadable=None) -> dict:
     """Core sync logic: scan wiki/*.org and reconcile with the DB.
 
     Returns a stats dict with counts. `on_skip` is called with the path
     of each file skipped due to concurrent modification (defaults to a
     no-op so callers that don't want CLI output stay quiet).
+    `on_unreadable` is called with the path and exception of each file
+    that cannot be read or decoded (by default it is reported on stderr);
+    such a file is skipped, like a concurrently modified one, so one bad
+    file never aborts a sync or an automatic rebuild.
     """
     if on_skip is None:
         on_skip = lambda _p: None  # noqa: E731
+    if on_unreadable is None:
+        on_unreadable = _report_unreadable
 
     wiki_dir = cdir(root) / "wiki"
     generated_index = str((wiki_dir / "index.org").relative_to(root))
@@ -750,6 +962,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         "article_links": 0,
         "concept_links": 0,
         "skipped": 0,
+        "unreadable": 0,
         "files": 0,
         "ambiguous_source_keys": 0,
     }
@@ -785,9 +998,14 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                 stats["skipped"] += 1
                 continue
 
-            meta = parse_org_file(org_path)
+            try:
+                meta = parse_org_file(org_path)
+            except (UnicodeDecodeError, OSError) as exc:
+                on_unreadable(org_path, exc)
+                stats["unreadable"] += 1
+                continue
             rel_path = str(org_path.relative_to(root))
-            article_type = meta.properties.get("ARTICLE_TYPE", "concept")
+            article_type = _normalize_article_type(meta.properties.get("ARTICLE_TYPE"))
             status = meta.properties.get("STATUS") or "draft"
             # :CREATED: and :MODIFIED: make an article's dates part of its
             # file, so they survive a rebuild; without them sync time is used.
@@ -858,7 +1076,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                 )
                 stats["added"] += 1
 
-            type_tags = {"concept", "summary", "comparison", "method"}
+            type_tags = set(ARTICLE_TYPES)
             for tag in meta.filetags:
                 if tag.lower() not in type_tags:
                     concept_id = db.add_concept(tag.lower())
@@ -884,15 +1102,12 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         source_index = _source_key_index(db.list_sources())
         for org_path, (article_id, meta) in parsed.items():
             for link_target in meta.file_links:
-                target_path = (org_path.parent / link_target).resolve()
-                if target_path.exists():
-                    target_rel = _safe_relative_to(target_path, root)
-                    if target_rel is None:
-                        continue  # link points outside the wiki tree; ignore
-                    target_article = db.get_article_by_path(target_rel)
-                    if target_article:
-                        db.add_article_link(article_id, target_article["id"])
-                        stats["article_links"] += 1
+                target_article = _find_linked_article(
+                    db, root, _link_target_rel(root, org_path, link_target)
+                )
+                if target_article:
+                    db.add_article_link(article_id, target_article["id"])
+                    stats["article_links"] += 1
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
             if source_keys:
@@ -902,18 +1117,21 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     for sid in source_ids:
                         db.link_article_source(article_id, sid)
 
-            derived_from = meta.properties.get("DERIVED_FROM", "").split()
-            for ref in derived_from:
-                if not ref:
-                    continue
-                ref_path = (org_path.parent / ref).resolve()
-                if ref_path.exists():
-                    ref_rel = _safe_relative_to(ref_path, root)
-                    if ref_rel is None:
-                        continue  # derivation points outside the wiki tree; ignore
-                else:
-                    ref_rel = f"wiki/{ref}" if not ref.startswith("wiki/") else ref
-                source_article = db.get_article_by_path(ref_rel)
+            # DERIVED_FROM paths are relative to the article, or to the wiki
+            # directory (optionally written with a leading wiki/).
+            wiki_rel = cdir(root) / "wiki"
+            for ref in meta.properties.get("DERIVED_FROM", "").split():
+                source_article = _find_linked_article(
+                    db, root, _link_target_rel(root, org_path, ref)
+                )
+                if source_article is None and not Path(ref).is_absolute():
+                    within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
+                    source_article = _find_linked_article(
+                        db, root,
+                        _safe_relative_to(
+                            Path(os.path.normpath(wiki_rel / within)), root
+                        ),
+                    )
                 if source_article:
                     db.add_derivation(article_id, source_article["id"])
 
@@ -948,8 +1166,8 @@ def sync():
     links, citations), and updates the articles, concepts, and links
     tables. Also upserts sources from references.bib and from the
     sources/notebooks and sources/data directories so new entries get
-    picked up automatically. Run this after Claude writes or updates
-    wiki articles.
+    picked up automatically, and regenerates wiki/MANIFEST.md and
+    wiki/index.org. Run this after Claude writes or updates wiki articles.
     """
     from crucible.ingest import reconcile_sources
 
@@ -957,8 +1175,7 @@ def sync():
     db = get_db(root)
     try:
         # Auto-register in global registry (ensures pre-registry crucibles get registered)
-        from crucible.registry import register as registry_register
-        registry_register(root.name, str(root))
+        registry_module.register_or_warn(root.name, str(root), _warn)
 
         sources_added = reconcile_sources(root, db)
 
@@ -968,6 +1185,9 @@ def sync():
                 f"  Skipping {p.name} (modified during sync)"
             ),
         )
+        # Keep the generated landing pages in step with the database.
+        _write_manifest(root, db)
+        _write_index(root, db)
     finally:
         db.close()
 
@@ -985,6 +1205,8 @@ def sync():
         msg += f", {sources_added} sources added"
     if stats["skipped"]:
         msg += f", {stats['skipped']} skipped (modified during sync)"
+    if stats["unreadable"]:
+        msg += f", {stats['unreadable']} unreadable (skipped)"
     click.echo(msg)
     if stats["ambiguous_source_keys"]:
         click.echo(
@@ -996,34 +1218,46 @@ def sync():
 
 @cli.command()
 @click.option("--model", "-m", default="nomic-embed-text", help="Ollama embedding model")
-@click.option("--url", default="http://localhost:11434/api/embed", help="Ollama API URL")
-def embed(model, url):
+@click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
+              default="http://localhost:11434/api/embed", show_envvar=True,
+              help="Ollama embed API URL")
+@click.option("--force", is_flag=True, help="Re-embed every article")
+def embed(model, url, force):
     """Generate embeddings for all wiki articles.
 
     Uses ollama to create vector embeddings for semantic search.
-    Only embeds articles that don't already have embeddings. `crucible sync`
-    drops the embedding of any article whose file changed, so edited
-    articles are re-embedded here.
+    Only embeds articles that have no embedding from MODEL, so switching
+    models re-embeds everything with the new one. `crucible sync` drops
+    the embedding of any article whose file changed, so edited articles
+    are re-embedded here. The org header and drawers are stripped and the
+    first 8000 characters of the rest are embedded.
     Requires ollama running with an embedding model pulled.
     """
+    from crucible.embeddings import EmbeddingError
+
     root = get_root()
     db = get_db(root)
-    idx = EmbeddingIndex(db.conn, model=model, url=url)
-    idx.initialize()
+    try:
+        idx = EmbeddingIndex(db.conn, model=model, url=url)
+        idx.initialize()
 
-    # Get all articles with their content from FTS
-    articles = []
-    for a in db.list_articles():
-        org_path = root / a["path"]
-        if org_path.exists():
-            a["content"] = org_path.read_text(encoding="utf-8")
-        articles.append(a)
+        articles = []
+        for a in db.list_articles():
+            org_path = root / a["path"]
+            if org_path.exists():
+                a["content"] = org_path.read_text(encoding="utf-8", errors="replace")
+            articles.append(a)
 
-    click.echo(f"Embedding with {model}...")
-    count = idx.embed_missing(articles)
-    s = idx.stats()
-    db.close()
-    click.echo(f"Embedded {count} new articles ({s['embedded']}/{s['total_articles']} total)")
+        click.echo(f"Embedding with {model}...")
+        try:
+            count = idx.embed_missing(articles, force=force)
+        except EmbeddingError as e:
+            raise click.ClickException(str(e))
+        s = idx.stats()
+    finally:
+        db.close()
+    click.echo(f"Embedded {count} new articles "
+               f"({s['embedded_with_model']}/{s['total_articles']} total with {model})")
 
 
 @cli.group()
@@ -1072,9 +1306,22 @@ def registry_add(name, path, description):
             f"No crucible database found at {path.resolve()}. "
             f"Is this a crucible project?"
         )
-    actual_name = register(name, str(path.resolve()), description)
+    from crucible.registry import RegistryError, lookup_path
+    previous = lookup_path(str(path.resolve()))
+    try:
+        actual_name = register(name, str(path.resolve()), description,
+                               rename=True)
+    except RegistryError as e:
+        raise click.ClickException(str(e))
     if actual_name != name:
-        click.echo(f"Name '{name}' taken, registered as '{actual_name}'")
+        if previous == actual_name:
+            click.echo(f"Name '{name}' is taken by another crucible; "
+                       f"this one stays registered as '{actual_name}'")
+        else:
+            click.echo(f"Name '{name}' is taken by another crucible; "
+                       f"registered as '{actual_name}'")
+    elif previous and previous != name:
+        click.echo(f"Renamed '{previous}' to '{name}'")
     click.echo(f"Registered '{actual_name}' -> {path.resolve()}")
 
 
@@ -1082,18 +1329,24 @@ def registry_add(name, path, description):
 @click.argument("name")
 def registry_remove(name):
     """Remove a crucible from the global registry."""
-    from crucible.registry import unregister
-    if unregister(name):
-        click.echo(f"Removed '{name}' from registry")
-    else:
-        click.echo(f"'{name}' not found in registry")
+    from crucible.registry import RegistryError, unregister
+    try:
+        removed = unregister(name)
+    except RegistryError as e:
+        raise click.ClickException(str(e))
+    if not removed:
+        raise click.ClickException(f"'{name}' not found in registry")
+    click.echo(f"Removed '{name}' from registry")
 
 
 @registry.command("clean")
 def registry_clean():
     """Remove stale entries (crucibles that no longer exist on disk)."""
-    from crucible.registry import clean
-    removed = clean()
+    from crucible.registry import RegistryError, clean
+    try:
+        removed = clean()
+    except RegistryError as e:
+        raise click.ClickException(str(e))
     if not removed:
         click.echo("No stale entries found.")
         return
@@ -1108,12 +1361,17 @@ def registry_clean():
 @click.option("--all", "search_all", is_flag=True, help="Search all registered crucibles")
 @click.option("--mode", type=click.Choice(["auto", "fts", "semantic", "hybrid"]),
               default="auto", help="Search mode (default: auto)")
-@click.option("--model", "-m", default="nomic-embed-text", help="Embedding model")
+@click.option("--model", "-m", default=None,
+              help="Embedding model (default: the model of the stored embeddings)")
+@click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
+              default="http://localhost:11434/api/embed", show_envvar=True,
+              help="Ollama embed API URL")
 @click.option("--fts-weight", default=1.0, help="FTS weight for hybrid reranking")
 @click.option("--semantic-weight", default=1.0, help="Semantic weight for hybrid reranking")
 @click.option("--raw", is_flag=True, help="Skip dedup/quality filtering (return raw ranked results)")
 @json_option
-def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, raw, json_output):
+def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weight,
+           raw, json_output):
     """Search wiki articles.
 
     By default, returns deduplicated, quality-ranked results. Similar
@@ -1121,21 +1379,17 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
     --raw to disable this and see all raw hits.
 
     Modes:
-      auto      Hybrid if embeddings exist, FTS otherwise (default)
+      auto      Hybrid if embeddings exist, FTS otherwise (default).
+                Falls back to FTS with a warning if the embedding
+                service cannot be used.
       fts       Keyword search only (FTS5 with porter stemming)
       semantic  Vector similarity only (requires `crucible embed`)
       hybrid    Combines FTS + semantic with reciprocal rank fusion
     """
+    from crucible.embeddings import EmbeddingError
+
     root = get_root()
     db = get_db(root)
-
-    # Determine effective mode
-    effective_mode = mode
-    if mode == "auto":
-        idx = EmbeddingIndex(db.conn, model=model)
-        idx.initialize()
-        s = idx.stats()
-        effective_mode = "hybrid" if s["embedded"] > 0 else "fts"
 
     # Resolve peers from global registry for --all
     if search_all:
@@ -1144,84 +1398,115 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
     else:
         peers = []
 
-    if effective_mode == "hybrid":
-        idx = EmbeddingIndex(db.conn, model=model)
-        idx.initialize()
-        if search_all and peers:
-            results = idx.hybrid_search_all(
-                query, peers=peers, limit=limit,
-                fts_weight=fts_weight, semantic_weight=semantic_weight,
-            )
-        else:
-            results = idx.hybrid_search(
-                query, limit=limit,
-                fts_weight=fts_weight, semantic_weight=semantic_weight,
-                raw=raw,
-            )
+    try:
+        # Keyword search never touches the embeddings table: initialize()
+        # creates or migrates it, which a plain search must not do. Nor
+        # does auto mode in a crucible that has never been embedded.
+        idx = None
+        embedded = 0
+        has_embeddings = db.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embeddings'"
+        ).fetchone() is not None
+        if mode in ("semantic", "hybrid") or (mode == "auto" and has_embeddings):
+            idx = EmbeddingIndex(db.conn, model=model, url=url)
+            idx.initialize()
+            embedded = idx.stats()["embedded_with_model"]
+
+        effective_mode = mode
+        if mode == "auto":
+            effective_mode = "hybrid" if embedded > 0 else "fts"
+
+        results = None
+        if effective_mode in ("hybrid", "semantic"):
+            if effective_mode == "semantic" and embedded == 0:
+                raise click.ClickException(
+                    f"No embeddings from {idx.model} found. "
+                    f"Run `crucible embed -m {idx.model}` first."
+                )
+            try:
+                if effective_mode == "hybrid":
+                    kwargs = dict(limit=limit, fts_weight=fts_weight,
+                                  semantic_weight=semantic_weight, raw=raw)
+                    if search_all and peers:
+                        results = idx.hybrid_search_all(query, peers=peers, **kwargs)
+                    else:
+                        results = idx.hybrid_search(query, **kwargs)
+                elif search_all and peers:
+                    results = idx.search_all(query, peers=peers, limit=limit)
+                else:
+                    results = idx.search(query, limit=limit)
+            except EmbeddingError as e:
+                if mode != "auto":
+                    raise click.ClickException(str(e))
+                click.echo(f"Warning: {e}\nFalling back to keyword search.", err=True)
+                effective_mode = "fts"
+            for w in idx.warnings:
+                click.echo(f"Warning: {w}", err=True)
+
+        if effective_mode == "fts":
+            if search_all:
+                results = db.search_all(query, limit=limit, peers=peers)
+            else:
+                results = db.search(query, limit=limit)
+    finally:
         db.close()
-        if json_output:
-            _emit_json(results)
-            return
-        if not results:
-            click.echo("No results.")
-            return
-        for r in results:
+
+    if json_output:
+        _emit_json(results)
+        return
+    if not results:
+        click.echo("No results.")
+        return
+    for r in results:
+        source = r.get("_crucible", "")
+        prefix = f"[{source}] " if source and source not in ("local", "") else ""
+        if effective_mode == "hybrid":
             score = r.get("rrf_score", 0)
-            methods = r.get("methods", [])
-            method_str = " + ".join(m.split(":")[0] for m in methods)
-            source = r.get("_crucible", "")
-            prefix = f"[{source}] " if source and source not in ("local", "") else ""
-            click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  (score: {score:.4f}, via: {method_str})")
-            click.echo(f"    {r['path']}")
-            absorbed = r.get("dedup_absorbed")
-            if absorbed:
-                click.echo(f"    (absorbed: {', '.join(absorbed)})")
-
-    elif effective_mode == "semantic":
-        idx = EmbeddingIndex(db.conn, model=model)
-        idx.initialize()
-        s = idx.stats()
-        if s["embedded"] == 0:
-            raise click.ClickException(
-                "No embeddings found. Run `crucible embed` first."
-            )
-        if search_all and peers:
-            results = idx.search_all(query, peers=peers, limit=limit)
-        else:
-            results = idx.search(query, limit=limit)
-        db.close()
-        if json_output:
-            _emit_json(results)
-            return
-        if not results:
-            click.echo("No results.")
-            return
-        for r in results:
+            method_str = " + ".join(m.split(":")[0] for m in r.get("methods", []))
+            click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  "
+                       f"(score: {score:.4f}, via: {method_str})")
+        elif effective_mode == "semantic":
             sim = r.get("similarity", 0)
-            source = r.get("_crucible", "")
-            prefix = f"[{source}] " if source and source not in ("local", "") else ""
             click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  (similarity: {sim:.3f})")
-            click.echo(f"    {r['path']}")
-
-    else:  # fts
-        if search_all:
-            results = db.search_all(query, limit=limit, peers=peers)
         else:
-            results = db.search(query, limit=limit)
-
-        db.close()
-        if json_output:
-            _emit_json(results)
-            return
-        if not results:
-            click.echo("No results.")
-            return
-        for r in results:
-            source = r.get("_crucible", "")
-            prefix = f"[{source}] " if source and source not in ("local", "") else ""
             status = r.get("status", "")
             click.echo(f"  {prefix}[{r['article_type']}] {r['title']}  ({status})")
-            click.echo(f"    {r['path']}")
+        click.echo(f"    {r['path']}")
+        absorbed = r.get("dedup_absorbed")
+        if absorbed:
+            click.echo(f"    (absorbed: {', '.join(absorbed)})")
+
+
+def _resolve_article_arg(root: Path, db: CrucibleDB, article_path: str) -> str:
+    """Return the database path of the article that ARTICLE_PATH names.
+
+    Database paths are relative to the project root
+    (``.crucible/wiki/concepts/foo.org``). The argument may also be relative
+    to the current directory (``./.crucible/...``, or ``foo.org`` from inside
+    the wiki), absolute, or relative to the wiki directory
+    (``concepts/foo.org``). Raises a ClickException (exit 1) if no article
+    has that path, so a typo is not mistaken for "no results".
+    """
+    if db.get_article_by_path(article_path):
+        return article_path
+    candidates = []
+    given = Path(os.path.expanduser(article_path))
+    absolute = given if given.is_absolute() else Path.cwd() / given
+    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
+        for base in (root, root.resolve()):
+            rel = _safe_relative_to(target, base)
+            if rel is not None:
+                candidates.append(Path(rel).as_posix())
+    if not given.is_absolute():
+        candidates.append((Path(CRUCIBLE_DIR) / "wiki" / given).as_posix())
+    for candidate in candidates:
+        if db.get_article_by_path(candidate):
+            return candidate
+    raise click.ClickException(
+        f"No article at {article_path} (paths are relative to the current "
+        "directory, the project root, or the wiki; run `crucible sync` if "
+        "the file is new)"
+    )
 
 
 @cli.command()
@@ -1233,9 +1518,17 @@ def history(article_path, json_output):
     Shows what articles this one was derived from (upstream)
     and what articles have been derived from it (downstream).
     Traces the evolution of knowledge over time.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
 
     upstream = db.derived_from(article_path)
     downstream = db.derivatives(article_path)
@@ -1265,9 +1558,18 @@ def history(article_path, json_output):
 @click.argument("article_path")
 @json_option
 def backlinks(article_path, json_output):
-    """Show articles that link to the given article."""
+    """Show articles that link to the given article.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
+    """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
     results = db.backlinks(article_path)
     db.close()
     if json_output:
@@ -1290,7 +1592,7 @@ def source_info(source_path, json_output):
 
     Displays the source metadata and all articles distilled from it.
     Useful for resummarization: see what's already been captured before
-    asking Claude to reread the source.
+    asking Claude to reread the source. Exits 1 if no source matches.
     """
     root = get_root()
     db = get_db(root)
@@ -1304,11 +1606,7 @@ def source_info(source_path, json_output):
                 break
     if not src:
         db.close()
-        if json_output:
-            _emit_json(None)
-            return
-        click.echo(f"Source not found: {source_path}")
-        return
+        raise click.ClickException(f"Source not found: {source_path}")
 
     if json_output:
         articles = db.source_articles(src["id"])
@@ -1340,9 +1638,18 @@ def source_info(source_path, json_output):
 @click.argument("article_path")
 @json_option
 def sources(article_path, json_output):
-    """Show primary sources for an article."""
+    """Show primary sources for an article.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
+    """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
     results = db.article_sources(article_path)
     db.close()
     if json_output:
@@ -1387,7 +1694,10 @@ def concepts(query_all, json_output):
 @click.argument("name")
 @json_option
 def concept(name, json_output):
-    """Show articles covering a concept."""
+    """Show articles covering a concept.
+
+    NAME is matched case-insensitively (sync lowercases FILETAGS).
+    """
     root = get_root()
     db = get_db(root)
     results = db.concept_articles(name)
@@ -1446,9 +1756,17 @@ def related(article_path, json_output):
 
     Computes relationships via shared concepts, shared sources,
     temporal proximity, and explicit links.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
     results = db.related(article_path)
     db.close()
     if json_output:
@@ -1480,20 +1798,9 @@ def graph(output):
         click.echo(dot)
 
 
-@cli.command()
-@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
-              help="Output file (default: .crucible/wiki/viz.html)")
-@click.option("--open", "open_browser", is_flag=True, help="Open in browser after generating")
-def viz(output, open_browser):
-    """Generate an interactive knowledge graph visualization.
-
-    Creates a self-contained HTML file with a force-directed graph.
-    Nodes are articles (colored by type) and concepts. Edges are
-    explicit links, shared concepts, and derivations.
-    """
-    root = get_root()
-    db = get_db(root)
-
+def _write_viz(root: Path, db: CrucibleDB,
+               output: Path | None = None) -> tuple[Path, int, int]:
+    """Write the knowledge-graph HTML; return (path, node count, edge count)."""
     # Build graph data
     nodes = []
     node_ids = {}  # path -> index
@@ -1552,8 +1859,6 @@ def viz(output, open_browser):
             if src is not None and tgt is not None:
                 edges.append({"source": src, "target": tgt, "type": "derivation"})
 
-    db.close()
-
     graph_json = json.dumps({"nodes": nodes, "edges": edges})
     root_path = json.dumps(str(root.resolve()))
 
@@ -1564,7 +1869,27 @@ def viz(output, open_browser):
         output = cdir(root) / "wiki" / "viz.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html, encoding="utf-8")
-    click.echo(f"Visualization: {output} ({len(nodes)} nodes, {len(edges)} edges)")
+    return output, len(nodes), len(edges)
+
+
+@cli.command()
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Output file (default: .crucible/wiki/viz.html)")
+@click.option("--open", "open_browser", is_flag=True, help="Open in browser after generating")
+def viz(output, open_browser):
+    """Generate an interactive knowledge graph visualization.
+
+    Creates a self-contained HTML file with a force-directed graph.
+    Nodes are articles (colored by type) and concepts. Edges are
+    explicit links, shared concepts, and derivations.
+    """
+    root = get_root()
+    db = get_db(root)
+    try:
+        output, n_nodes, n_edges = _write_viz(root, db, output)
+    finally:
+        db.close()
+    click.echo(f"Visualization: {output} ({n_nodes} nodes, {n_edges} edges)")
 
     if open_browser:
         import webbrowser
@@ -1740,7 +2065,12 @@ def browse(port, no_open):
     viz_path = wiki_dir / "viz.html"
     if not viz_path.exists():
         click.echo("Generating knowledge graph...")
-        subprocess.run(["crucible", "viz"], cwd=str(root), capture_output=True)
+        # In-process: a `crucible` subprocess depends on PATH and its
+        # failure went unnoticed.
+        try:
+            _write_viz(root, db, viz_path)
+        except Exception as e:
+            click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
 
     articles = db.list_articles()
     db_path = cdir(root) / "crucible.db"
@@ -1767,9 +2097,15 @@ def browse(port, no_open):
     except (OSError, subprocess.TimeoutExpired):
         pass
 
-    server = start_server(wiki_dir, db_path, articles, port=port,
-                          project_name=project_name,
-                          github_url=github_url)
+    try:
+        server = start_server(wiki_dir, db_path, articles, port=port,
+                              project_name=project_name,
+                              github_url=github_url)
+    except OSError as e:
+        raise click.ClickException(
+            f"Cannot serve on port {port}: {e.strerror or e}. "
+            "Is another server using it? Pick another with --port."
+        )
     url = f"http://localhost:{port}"
     click.echo(f"Serving {project_name} wiki at {url}  (Ctrl+C to stop)")
 
@@ -1805,7 +2141,11 @@ def vscode(file):
     viz_path = wiki_dir / "viz.html"
     if not viz_path.exists():
         click.echo("Generating knowledge graph...")
-        subprocess.run(["crucible", "viz"], cwd=str(root), capture_output=True)
+        db = get_db(root)
+        try:
+            _write_viz(root, db, viz_path)
+        finally:
+            db.close()
 
     # Open the project root in VS Code
     cmd = ["code", str(root)]
@@ -1826,6 +2166,38 @@ def vscode(file):
             "'code' command not found. Install the VS Code shell command:\n"
             "  VS Code > Cmd+Shift+P > 'Shell Command: Install code command in PATH'"
         )
+
+
+def _is_own_sidecar(root: Path, db, src: dict, disk_path: Path, sidecar: Path) -> bool:
+    """Whether sidecar is the extracted text ingest wrote for this source.
+
+    A .txt that is itself a source is never a sidecar. Otherwise it must
+    match the text hash ingest recorded or, for sources ingested before
+    that was recorded (or rebuilt from the bibliography), the text
+    extracted from the source now. A user's own <stem>.txt matches neither.
+    """
+    from crucible.ingest import extract_text, file_sha256
+
+    if sidecar == disk_path or not sidecar.is_file():
+        return False
+    sidecar_rel = _safe_relative_to(sidecar, root)
+    if sidecar_rel is not None and db.get_source_by_path(sidecar_rel) is not None:
+        return False
+    meta = src.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = {}
+    if isinstance(meta, dict) and meta.get("text_hash"):
+        return file_sha256(sidecar) == meta["text_hash"]
+    # Whitespace is ignored: an upgraded extractor (pdftotext, pandoc)
+    # often changes only spacing and line breaks.
+    try:
+        return (sidecar.read_text(encoding="utf-8").split()
+                == extract_text(disk_path).split())
+    except Exception:
+        return False
 
 
 @cli.command()
@@ -1886,8 +2258,20 @@ def delete(path, yes, delete_file):
             click.confirm("Delete this source?", abort=True)
         disk_path = root / src["path"]
         if delete_file and disk_path.exists():
+            # Its extracted-text sidecar too, which sync would otherwise
+            # index as a new source, but only a .txt that is provably the
+            # sidecar: decided before the source file is gone.
+            sidecar = disk_path.with_suffix(".txt")
+            own_sidecar = _is_own_sidecar(root, db, src, disk_path, sidecar)
             disk_path.unlink()
             click.echo(f"  Deleted file: {disk_path}")
+            if own_sidecar:
+                sidecar.unlink()
+                click.echo(f"  Deleted text sidecar: {sidecar}")
+            elif sidecar != disk_path and sidecar.is_file():
+                click.echo(f"  Kept {sidecar}: it does not match this source's extracted "
+                           "text. If it is an old sidecar, delete it by hand, or the "
+                           "next sync indexes it as a source.")
         # The bibliography is what sync rebuilds sources from, so the entry
         # must stop naming the file or the next sync restores the row.
         from crucible.ingest import drop_bib_file_fields
@@ -2129,7 +2513,7 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
                 placed.append((staged, dest))
 
             # 3. The bibliography, in one atomic write.
-            if plan.bib_entries or plan.bib_file_fields:
+            if plan.bib_entries or plan.bib_file_fields or plan.bib_macros:
                 old_bib = bib_path.read_text(encoding="utf-8") if bib_path.exists() else None
                 new_bib = _merged_bib_text(old_bib or "", plan)
                 if new_bib != (old_bib or ""):
@@ -2221,10 +2605,29 @@ def _merged_bib_text(text: str, plan: "_MergePlan") -> str:
         raise click.ClickException(
             f"the bibliography entry '{sorted(missing)[0]}' changed while merging."
         )
+    # Macros first: BibTeX needs a @string defined before an entry uses it.
+    # A name the target already defines keeps the target's definition.
+    existing = bibtex.macro_blocks(text)
+    defined = {name for kind, name, _ in existing if kind == "string"}
+    preambles = {" ".join(block.split()) for kind, _, block in existing if kind == "preamble"}
+    additions: list[str] = []
+    for kind, name, block in plan.bib_macros:
+        if kind == "string":
+            if name is None or name in defined:
+                continue
+            defined.add(name)
+        else:
+            norm = " ".join(block.split())
+            if norm in preambles:
+                continue
+            preambles.add(norm)
+        additions.append(block)
     for cite_key, entry_text in plan.bib_entries:
         if bib_has_key(text, cite_key):
             continue
-        text = (text.rstrip() + "\n\n" + entry_text + "\n") if text.strip() else entry_text + "\n"
+        additions.append(entry_text)
+    for block in additions:
+        text = (text.rstrip() + "\n\n" + block + "\n") if text.strip() else block + "\n"
     return text
 
 
@@ -2248,6 +2651,9 @@ class _MergePlan:
     # Sidecars missing beside sources the target already has.
     sidecars: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
     bib_entries: list[tuple[str, str]] = dataclass_field(default_factory=list)
+    # Incoming @string / @preamble blocks (kind, name, text) the entries may
+    # rely on; added unless the target already defines them.
+    bib_macros: list[tuple[str, str | None, str]] = dataclass_field(default_factory=list)
     # Target entries with no `file` field that get one naming an incoming
     # source copied for them (cite key -> path relative to the target root).
     bib_file_fields: dict[str, str] = dataclass_field(default_factory=dict)
@@ -2296,6 +2702,8 @@ def _plan_source_merge(
         )
     except _MergeConflict as exc:
         _raise_merge_problems([str(exc)])
+    if source_bib.exists():
+        plan.bib_macros = bibtex.macro_blocks(source_bib.read_text(encoding="utf-8"))
 
     target_sources = target_db.list_sources()
     # Real paths already taken in the target, plus every path planned below.
@@ -2657,11 +3065,18 @@ def _rewrite_article_links(
     count = 0
 
     for org_file, final_path in files:
-        content = org_file.read_text(encoding="utf-8")
+        # surrogateescape round-trips bytes that are not valid UTF-8, so
+        # one badly encoded file neither aborts the merge nor is mangled.
+        content = org_file.read_text(encoding="utf-8", errors="surrogateescape")
 
         def repl(match: re.Match) -> str:
+            # FILE_LINK_RE is the pattern sync reads links with, so every
+            # form it counts ([[file:x]], [[./x.org]], [[x.org]]) is
+            # rewritten. Group 1 is the path alone: an org search option
+            # (::*Heading) and the description stay as they were.
             link_path = match.group(1)
-            resolved = (final_path.parent / link_path).resolve()
+            target = Path(os.path.expanduser(link_path))
+            resolved = (final_path.parent / target).resolve()
             try:
                 wiki_rel = str(resolved.relative_to(target_wiki_resolved))
             except ValueError:
@@ -2669,12 +3084,23 @@ def _rewrite_article_links(
             if wiki_rel not in wiki_renames:
                 return match.group(0)
             new_target = target_wiki / wiki_renames[wiki_rel]
-            return f"[[file:{os.path.relpath(new_target, final_path.parent)}]"
+            if target.is_absolute():
+                new_link = str(new_target.resolve())
+            else:
+                new_link = os.path.relpath(new_target, final_path.parent)
+                bare_link = not match.group(0).startswith("[[file:")
+                if bare_link and not new_link.startswith(("./", "../")):
+                    new_link = "./" + new_link  # keep it a link org reads
+            start = match.start(1) - match.start(0)
+            end = match.end(1) - match.start(0)
+            whole = match.group(0)
+            return whole[:start] + new_link + whole[end:]
 
         # One pass, so a link already rewritten is not rewritten again.
-        new_content = re.sub(r"\[\[file:(.*?)\]", repl, content)
+        new_content = FILE_LINK_RE.sub(repl, content)
         if new_content != content:
-            org_file.write_text(new_content, encoding="utf-8")
+            org_file.write_text(new_content, encoding="utf-8",
+                                errors="surrogateescape")
             count += 1
 
     return count
@@ -2765,11 +3191,32 @@ def _render_manifest(root: Path, db: CrucibleDB) -> str:
     return "\n".join(lines) + "\n"
 
 
+_GENERATED_DATE_RE = re.compile(r"^(#\+DATE:|Updated:) .*$", re.MULTILINE)
+
+
+def _write_generated(path: Path, text: str) -> None:
+    """Write a generated page unless only its date line would change.
+
+    MANIFEST.md and index.org are rewritten on every sync; leaving them
+    alone when the content is unchanged keeps the date out of git churn.
+    """
+    if path.exists():
+        try:
+            old = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            old = None
+        if old is not None and (
+            _GENERATED_DATE_RE.sub("", old) == _GENERATED_DATE_RE.sub("", text)
+        ):
+            return
+    path.write_text(text, encoding="utf-8")
+
+
 def _write_manifest(root: Path, db: CrucibleDB) -> Path:
     """Write wiki/MANIFEST.md from the current DB state."""
     text = _render_manifest(root, db)
     manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
-    manifest_path.write_text(text, encoding="utf-8")
+    _write_generated(manifest_path, text)
     return manifest_path
 
 
@@ -2818,6 +3265,12 @@ def _render_index(root: Path, db: CrucibleDB) -> str:
         except ValueError:
             return p.as_posix()
 
+    def _index_link(article: dict) -> str:
+        """An org link to an article. Brackets in the title would end the
+        link description early, so they become parentheses."""
+        title = (article["title"] or "").translate(str.maketrans("[]", "()"))
+        return f"[[file:{_link_path(article['path'])}][{title}]]"
+
     lines = [
         f"#+TITLE: Crucible Wiki Index",
         f"#+DATE: [{datetime.now().strftime('%Y-%m-%d %a')}]",
@@ -2832,16 +3285,21 @@ def _render_index(root: Path, db: CrucibleDB) -> str:
     # Articles by type
     lines.append("* Articles by Type")
     lines.append("")
-    for atype in ["concept", "summary", "comparison", "method"]:
-        articles = by_type.get(atype, [])
+    # Articles of an unrecognised :ARTICLE_TYPE: are listed under Other, so
+    # every article appears in the index.
+    sections = [(type_labels[t], by_type.get(t, [])) for t in ARTICLE_TYPES]
+    sections.append(("Other", [
+        a for t, arts in sorted(by_type.items()) if t not in type_labels
+        for a in arts
+    ]))
+    for label, articles in sections:
         if not articles:
             continue
-        label = type_labels.get(atype, atype.title())
         lines.append(f"** {label} ({len(articles)})")
         lines.append("")
         for a in articles:
             status = f" /{a['status']}/" if a.get("status") else ""
-            lines.append(f"- [[file:{_link_path(a['path'])}][{a['title']}]]{status}")
+            lines.append(f"- {_index_link(a)}{status}")
         lines.append("")
 
     # Articles by concept
@@ -2852,7 +3310,7 @@ def _render_index(root: Path, db: CrucibleDB) -> str:
         lines.append(f"** {concept.title()} ({len(articles)})")
         lines.append("")
         for a in articles:
-            lines.append(f"- [[file:{_link_path(a['path'])}][{a['title']}]] [{a['article_type']}]")
+            lines.append(f"- {_index_link(a)} [{a['article_type']}]")
         lines.append("")
 
     # Sources
@@ -2873,7 +3331,7 @@ def _write_index(root: Path, db: CrucibleDB) -> Path:
     """Write wiki/index.org from the current DB state."""
     text = _render_index(root, db)
     index_path = cdir(root) / "wiki" / "index.org"
-    index_path.write_text(text, encoding="utf-8")
+    _write_generated(index_path, text)
     return index_path
 
 
@@ -2895,13 +3353,18 @@ def index():
 
 
 @cli.command()
+@click.option("--strict", is_flag=True,
+              help="Also exit nonzero when there are warnings")
 @json_option
-def lint(json_output):
+def lint(strict, json_output):
     """Check wiki health and report issues.
 
     Finds broken links, orphan articles, missing concept articles,
     stale sources, unresolved or ambiguous source keys, and other
     consistency problems.
+
+    Exits 1 if any issue has severity "error" (or "warning", with
+    --strict), so scripts and CI can gate on it; info never fails.
     """
     root = get_root()
     db = get_db(root)
@@ -2918,10 +3381,18 @@ def lint(json_output):
                 "path": article['path'],
             })
             continue
-        meta = parse_org_file(org_path)
+        try:
+            meta = parse_org_file(org_path)
+        except (UnicodeDecodeError, OSError) as exc:
+            issues.append({
+                "type": "unreadable_file",
+                "severity": "error",
+                "message": f"Cannot read {article['path']}: {exc}",
+                "path": article['path'],
+            })
+            continue
         for link in meta.file_links:
-            target = (org_path.parent / link).resolve()
-            if not target.exists():
+            if _link_is_broken(root, org_path, link):
                 issues.append({
                     "type": "broken_link",
                     "severity": "warning",
@@ -3042,7 +3513,10 @@ def lint(json_output):
         org_path = root / article["path"]
         if not org_path.exists():
             continue
-        meta = parse_org_file(org_path)
+        try:
+            meta = parse_org_file(org_path)
+        except (UnicodeDecodeError, OSError):
+            continue  # reported above as unreadable_file
         if not meta.properties.get("ARTICLE_TYPE"):
             issues.append({
                 "type": "missing_property",
@@ -3148,7 +3622,10 @@ def lint(json_output):
         org_path = root / article["path"]
         if not org_path.exists():
             continue
-        meta = parse_org_file(org_path)
+        try:
+            meta = parse_org_file(org_path)
+        except (UnicodeDecodeError, OSError):
+            continue  # reported above as unreadable_file
         for key in meta.cite_keys:
             if key not in bib_keys:
                 issues.append({
@@ -3161,8 +3638,13 @@ def lint(json_output):
 
     db.close()
 
+    failing = {"error", "warning"} if strict else {"error"}
+    failed = any(i["severity"] in failing for i in issues)
+
     if json_output:
         _emit_json(issues)
+        if failed:
+            raise SystemExit(1)
         return
 
     if not issues:
@@ -3183,6 +3665,8 @@ def lint(json_output):
                f"({sum(1 for i in issues if i['severity'] == 'error')} errors, "
                f"{sum(1 for i in issues if i['severity'] == 'warning')} warnings, "
                f"{sum(1 for i in issues if i['severity'] == 'info')} info)")
+    if failed:
+        raise SystemExit(1)
 
 
 @cli.command()
@@ -3497,6 +3981,11 @@ Structured queries:
   crucible orphans                     Articles with no incoming links
   crucible undigested                  Sources not yet distilled
 
+  Article paths may be relative to the project root (as shown), to the
+  current directory, or to the wiki (concepts/x.org), or absolute. A path
+  that names no article, or an unknown source, exits 1 with an error.
+  Concept names are case-insensitive.
+
 Graph export:
   crucible graph                       DOT format to stdout
   crucible graph -o wiki.dot           DOT format to file
@@ -3562,6 +4051,9 @@ Lint (health checks):
                                  references.bib (maybe the ingest day)
                                - Wiki files not in database
   crucible lint -j             JSON output (for agent consumption)
+  crucible lint --strict       Also fail on warnings
+                               Exit status: 1 if any error (or, with
+                               --strict, any warning); info never fails.
 
 Suggest (improvement recommendations):
   crucible suggest             Analyze the wiki graph and suggest:
@@ -3668,8 +4160,10 @@ a numeric suffix (e.g., my-project-2).
     elif topic in topics:
         click.echo(topics[topic])
     else:
-        click.echo(f"Unknown topic: {topic}")
-        click.echo(f"Available topics: {', '.join(topics.keys())}, all")
+        raise click.ClickException(
+            f"Unknown topic: {topic}\n"
+            f"Available topics: {', '.join(topics.keys())}, all"
+        )
 
 
 @cli.command()
@@ -3682,14 +4176,17 @@ def publish(output, init_only):
     Generates an .org-publish.json config in wiki/ and runs
     `scimax publish` to export all org articles as linked HTML pages.
     """
-    import shutil
     import subprocess
 
     root = get_root()
     wiki_dir = cdir(root) / "wiki"
 
     # Ensure index is up to date
-    subprocess.run(["crucible", "index"], cwd=str(root), capture_output=True)
+    db = get_db(root)
+    try:
+        _write_index(root, db)
+    finally:
+        db.close()
 
     out_dir = str(output.resolve()) if output else str(wiki_dir / "_build" / "html")
 
@@ -3723,11 +4220,17 @@ def publish(output, init_only):
         return
 
     # Run scimax publish
-    result = subprocess.run(
-        ["scimax", "publish"],
-        cwd=str(wiki_dir),
-        capture_output=True, text=True, timeout=300,
-    )
+    try:
+        result = subprocess.run(
+            ["scimax", "publish"],
+            cwd=str(wiki_dir),
+            capture_output=True, text=True, timeout=300,
+        )
+    except FileNotFoundError:
+        raise click.ClickException(
+            "'scimax' command not found. Install scimax, or use --init-only "
+            "to write the publish config without publishing."
+        )
     if result.returncode != 0:
         click.echo(result.stderr, err=True)
         raise click.ClickException("scimax publish failed")
@@ -3748,6 +4251,77 @@ def install():
     _install(root=None, directive=True)
 
 
+_SKILL_RECORD = ".crucible-installed.json"
+
+# sha256 of every skill file crucible shipped before installs recorded what
+# they wrote (_SKILL_RECORD). On the first install after upgrading there is
+# no record, so a file matching one of these is an unedited older copy, not
+# a local change. The record makes this list complete: it never grows.
+_PRE_RECORD_SKILL_HASHES = {
+    "SKILL.md": frozenset({
+        "108cf60820b1b4c43656d6732a151859615106c590935ba08a564a60841a4e3e",
+        "3a74c4559c9219f6d4885af4a4171228793b8b269b6ead81d18d652c67462bad",
+        "45e343e711965d4b64362c3fcffa3790aa622f804404742abdd81fd01b6d0c6b",
+        "58830c6d1c4f4606d3c0a44abf98b8ddfe72a2ca4e4a04ee371258abf30800fc",
+        "6700fbdd5491b608eeb6e019df3bc56989961aa498df08163c46b5db4b2cfeca",
+        "aa6a6d4a58d0231f6877a8e38390ca9774f4072e2cf3067508cfcfdb91688b49",
+        "c2a41534ecf0f7fd29ff25187aa63f475cd821396bc84c543dfc0827c512a937",
+        "d2461c5d0a49e0c555eeb7383bd389d4fc506bcdab2a6e5fb8934091845a7cc9",
+        "dd80d5f7ac844c224e26ae4eabf67243f31af6f4612d5fbf9a19c7104963b6f0",
+        "e986a207cfb3f66db9958d781927d39c22d527a97a54c3f34ef7eecf3e577b8e",
+        "f37dd608de0522523200c94c0e2627ee61c96d06148ec417861676b137180e7f",
+        "f7fa4428132bf1d54eb1f4ee4b5e7183ef21d07f864c9e18d469b04f7ee2b078",
+        "0f581a855e8edf8648b1a30d317f8cd33a440584fa2e739de7fbde09a1130216",
+        "c21dcd26fdf60350e4d6303c5db972c55263185dc1adabeeb0654a80f165f01e",
+    }),
+}
+
+
+def _skill_source() -> Path:
+    """The packaged skill directory.
+
+    Wheel installs bundle skills/crucible into the package; editable
+    installs read it from the repository root.
+    """
+    pkg_dir = Path(__file__).parent
+    skill_src = pkg_dir / "skills" / "crucible"
+    if not skill_src.exists():
+        skill_src = pkg_dir.parent.parent / "skills" / "crucible"
+    return skill_src
+
+
+def _skill_dest() -> Path:
+    return Path.home() / ".claude" / "skills" / "crucible"
+
+
+def _file_sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _read_skill_record(skill_dest: Path) -> dict[str, str]:
+    """Files crucible installed into skill_dest, mapped to their sha256.
+
+    Lets install tell a user-edited file from an older crucible copy, and
+    lets uninstall remove only what crucible put there.
+    """
+    try:
+        data = json.loads((skill_dest / _SKILL_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return {}
+    return {str(k): str(v) for k, v in files.items()}
+
+
+def _write_skill_record(skill_dest: Path, record: dict[str, str]) -> None:
+    (skill_dest / _SKILL_RECORD).write_text(
+        json.dumps({"files": record}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _install(root: Path | None, directive: bool) -> None:
     """Install the skill; for a project, also its manifest and registry entry.
 
@@ -3755,27 +4329,40 @@ def _install(root: Path | None, directive: bool) -> None:
     Only `crucible install` passes directive=True: init and update must not
     repoint the global ~/.claude/CLAUDE.md at the project they act on.
     """
-    import shutil
-    import subprocess
-
     # 1. Install skill files (works from anywhere)
-    # Wheel installs bundle skills/crucible into the package; editable
-    # installs read it from the repository root.
-    pkg_dir = Path(__file__).parent
-    skill_src = pkg_dir / "skills" / "crucible"
-    if not skill_src.exists():
-        skill_src = pkg_dir.parent.parent / "skills" / "crucible"
+    skill_src = _skill_source()
     if not skill_src.exists():
         raise click.ClickException(f"Skill source not found at {skill_src}")
 
-    skill_dest = Path.home() / ".claude" / "skills" / "crucible"
+    skill_dest = _skill_dest()
     skill_dest.mkdir(parents=True, exist_ok=True)
+    record = _read_skill_record(skill_dest)
 
-    for src_file in skill_src.iterdir():
+    for src_file in sorted(skill_src.iterdir()):
         if src_file.is_file():
             dest_file = skill_dest / src_file.name
+            new_hash = _file_sha256(src_file)
+            if dest_file.is_file():
+                current = _file_sha256(dest_file)
+                shipped = (
+                    {record[src_file.name]} if src_file.name in record
+                    else _PRE_RECORD_SKILL_HASHES.get(src_file.name, frozenset())
+                )
+                if current != new_hash and current not in shipped:
+                    # Not a copy crucible installed: keep the local edits,
+                    # in a backup no later install overwrites.
+                    backup = dest_file.with_name(dest_file.name + ".bak")
+                    n = 1
+                    while backup.exists():
+                        n += 1
+                        backup = dest_file.with_name(f"{dest_file.name}.bak{n}")
+                    shutil.copy2(str(dest_file), str(backup))
+                    click.echo(f"  Skill: {dest_file} had local changes; "
+                               f"saved a copy to {backup}")
             shutil.copy2(str(src_file), str(dest_file))
+            record[src_file.name] = new_hash
             click.echo(f"  Skill: {src_file.name} -> {dest_file}")
+    _write_skill_record(skill_dest, record)
 
     # 2. If inside a project, generate manifest and add CLAUDE.md directive
     if root is None:
@@ -3787,15 +4374,17 @@ def _install(root: Path | None, directive: bool) -> None:
             click.echo("Run `crucible install` from inside a project to complete setup.")
             return
 
-    subprocess.run(["crucible", "manifest"], cwd=str(root),
-                   capture_output=True, text=True)
-    manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
+    db = get_db(root)
+    try:
+        manifest_path = _write_manifest(root, db)
+    finally:
+        db.close()
     click.echo(f"  Manifest: {manifest_path}")
 
     # Auto-register in global registry
-    from crucible.registry import register as registry_register
-    actual_name = registry_register(root.name, str(root))
-    click.echo(f"  Registry: registered as '{actual_name}'")
+    actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
+    if actual_name:
+        click.echo(f"  Registry: registered as '{actual_name}'")
 
     if not directive:
         click.echo("  CLAUDE.md: unchanged (run `crucible install` here to point agents at this crucible)")
@@ -3828,7 +4417,10 @@ def _install(root: Path | None, directive: bool) -> None:
                 _re.escape(marker) + r".*?" + _re.escape(marker),
                 _re.DOTALL,
             )
-            updated = pattern.sub(directive_text.strip(), existing)
+            # A function, not a string: the directive holds the project
+            # path, and a string replacement would read its backslashes
+            # (every Windows path) as regex escapes.
+            updated = pattern.sub(lambda _m: directive_text.strip(), existing)
             claude_md.write_text(updated, encoding="utf-8")
             click.echo(f"  CLAUDE.md: updated existing directive")
         else:
@@ -3847,16 +4439,39 @@ def uninstall():
     """Remove the Crucible skill and CLAUDE.md directive.
 
     Reverses what `crucible install` did:
-    1. Removes ~/.claude/skills/crucible/
+    1. Removes the skill files crucible installed in ~/.claude/skills/crucible/
+       (files you added or edited there are left in place)
     2. Removes the crucible directive from ~/.claude/CLAUDE.md
     """
-    import shutil
-
-    # 1. Remove skill directory
-    skill_dest = Path.home() / ".claude" / "skills" / "crucible"
-    if skill_dest.exists():
-        shutil.rmtree(str(skill_dest))
-        click.echo(f"  Removed skill: {skill_dest}")
+    # 1. Remove the skill files crucible installed
+    skill_dest = _skill_dest()
+    if skill_dest.is_dir():
+        record = _read_skill_record(skill_dest)
+        if record:
+            installed = set(record)
+        else:
+            # Installed by a version that kept no record: only the files
+            # the package ships are crucible's.
+            skill_src = _skill_source()
+            installed = ({p.name for p in skill_src.iterdir() if p.is_file()}
+                         if skill_src.is_dir() else set())
+        for name in sorted(installed):
+            path = skill_dest / name
+            if not path.is_file() or path.is_symlink():
+                continue
+            if name in record and _file_sha256(path) != record[name]:
+                click.echo(f"  Kept {path}: it has local changes")
+                continue
+            path.unlink()
+            click.echo(f"  Removed skill file: {path}")
+        (skill_dest / _SKILL_RECORD).unlink(missing_ok=True)
+        leftover = sorted(p.name for p in skill_dest.iterdir())
+        if leftover:
+            click.echo(f"  Left {skill_dest} in place; it still holds: "
+                       f"{', '.join(leftover)}")
+        else:
+            skill_dest.rmdir()
+            click.echo(f"  Removed skill: {skill_dest}")
     else:
         click.echo(f"  Skill not found at {skill_dest}")
 
@@ -3891,8 +4506,6 @@ def update():
     Use this after upgrading the crucible package to apply schema
     changes and pick up new skill definitions.
     """
-    import subprocess
-
     root = get_root()
     click.echo("Updating crucible...")
 
@@ -3914,9 +4527,9 @@ def update():
         click.echo("  Settings: up to date")
 
     # 3. Global registry
-    from crucible.registry import register as registry_register
-    actual_name = registry_register(root.name, str(root))
-    click.echo(f"  Registry: registered as '{actual_name}'")
+    actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
+    if actual_name:
+        click.echo(f"  Registry: registered as '{actual_name}'")
 
     # 4. Reinstall skill
     _install(root=root, directive=False)

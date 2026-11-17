@@ -26,13 +26,26 @@ TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 # Org keywords, drawer names and property names are case-insensitive;
 # property names are normalized to uppercase in OrgMetadata.properties.
+# The body may be empty: an empty drawer must end at its own :END:, not run
+# on to the :END: of a later drawer.
 PROP_DRAWER_RE = re.compile(
-    r":PROPERTIES:\s*\n(.*?)\n\s*:END:", re.DOTALL | re.IGNORECASE
+    r"^[ \t]*:PROPERTIES:[ \t]*\n(.*?)^[ \t]*:END:[ \t]*$",
+    re.DOTALL | re.IGNORECASE | re.MULTILINE,
 )
 # [ \t], not \s: \s matches a newline, so an empty property would take
 # the next property line as its value.
 PROP_LINE_RE = re.compile(r"^[ \t]*:([A-Za-z_]+):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
-FILE_LINK_RE = re.compile(r"\[\[file:([^\]]+?)(?:::.*?)?\](?:\[([^\]]*)\])?\]")
+# File links: [[file:path]], plus the prefix-less forms org also reads as
+# file links: paths starting with ./ ../ / or ~/, and bare names ending in
+# .org (which contain no ':', so other link types such as id:, https: and
+# cite: are not taken). Group 1 is the path, group 2 the description.
+FILE_LINK_RE = re.compile(
+    r"\[\[(?:file:)?"
+    r"((?<=file:)[^\]]+?"
+    r"|(?<!file:)(?:\.{1,2}/|/|~/)[^\]]+?"
+    r"|(?<!file:)[^\]\s:*#<>\[][^\]:]*?\.org)"
+    r"(?:::.*?)?\](?:\[([^\]]*)\])?\]"
+)
 
 # org-ref citations. Both syntaxes are recognized:
 #   v2: cite:key1,key2          (also [[cite:key1,key2]])
@@ -79,33 +92,51 @@ def citation_keys(m: re.Match) -> list[str]:
     return [k.strip() for k in re.split(r"[,;]", body) if k.strip()]
 
 
+_HEADING_RE = re.compile(r"^\*+[ \t]", re.MULTILINE)
+
+
+def _article_property_sections(prose: str) -> list[str]:
+    """The text before the first heading, and the first heading's section."""
+    starts = [m.start() for m in _HEADING_RE.finditer(prose)]
+    if not starts:
+        return [prose]
+    sections = [prose[:starts[0]]]
+    end = starts[1] if len(starts) > 1 else len(prose)
+    sections.append(prose[starts[0]:end])
+    return sections
+
+
 def parse_org(text: str) -> OrgMetadata:
     """Parse org-mode text and extract metadata."""
     meta = OrgMetadata(content=text)
 
+    # Literal blocks hold examples, not this article's metadata, links or
+    # citations, so everything is read from the prose around them.
+    prose = _LITERAL_BLOCK_RE.sub("", text)
+
     # Title
-    m = TITLE_RE.search(text)
+    m = TITLE_RE.search(prose)
     if m:
         meta.title = m.group(1).strip()
 
     # Filetags
-    m = FILETAGS_RE.search(text)
+    m = FILETAGS_RE.search(prose)
     if m:
         raw = m.group(1).strip()
         meta.filetags = [t for t in raw.strip(":").split(":") if t]
 
-    # Properties from :PROPERTIES: drawers
-    for drawer in PROP_DRAWER_RE.finditer(text):
-        drawer_text = drawer.group(1)
-        for m in PROP_LINE_RE.finditer(drawer_text):
+    # Properties come from the file-level drawer (before the first heading,
+    # where org-id and org-roam put :ID:) and the first heading's drawer,
+    # first value winning. Drawers on later headings describe those
+    # sections, not the article.
+    for section in _article_property_sections(prose):
+        drawer = PROP_DRAWER_RE.search(section)
+        if not drawer:
+            continue
+        for m in PROP_LINE_RE.finditer(drawer.group(1)):
             key = m.group(1).upper()
-            val = m.group(2).strip()
-            # First occurrence wins (top-level heading properties)
             if key not in meta.properties:
-                meta.properties[key] = val
-
-    # Links and citations come from prose only, not literal blocks.
-    prose = _LITERAL_BLOCK_RE.sub("", text)
+                meta.properties[key] = m.group(2).strip()
 
     # File links
     for m in FILE_LINK_RE.finditer(prose):

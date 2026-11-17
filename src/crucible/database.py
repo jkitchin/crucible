@@ -7,9 +7,20 @@ search support (F32_BLOB, vector_distance_cos, libsql_vector_idx).
 
 import json
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import libsql
+
+
+def _concept_key(name: str) -> str:
+    """Normalize a concept name, slug or title for comparison.
+
+    Case and punctuation are ignored, so the tag ``activation_energy``, the
+    slug ``activation-energy`` and the title "Activation Energy" agree.
+    Letters and digits of any script are kept, so a non-ASCII concept such
+    as ``触媒`` has a key of its own rather than an empty one.
+    """
+    return "".join(ch for ch in name.casefold() if ch.isalnum())
 
 
 class DictCursor:
@@ -463,12 +474,12 @@ class CrucibleDB:
              created_at, updated_at),
         )
         article_id = cur.lastrowid
-        # Index content for FTS
-        if content:
-            self.conn.execute(
-                "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
-                (article_id, path, title, content),
-            )
+        # Index for FTS even when content is empty: sync compares the indexed
+        # row with the file, and a missing row reads as a change.
+        self.conn.execute(
+            "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
+            (article_id, path, title, content),
+        )
         self.conn.commit()
         return article_id
 
@@ -681,7 +692,7 @@ class CrucibleDB:
             JOIN concepts c ON c.id = ac.concept_id
             WHERE c.name = ?
             ORDER BY a.title
-        """, (concept_name,))]
+        """, (concept_name.lower(),))]
 
     def orphans(self) -> list[dict]:
         """Articles with no incoming links."""
@@ -849,20 +860,24 @@ class CrucibleDB:
         """)]
 
     def concepts_without_articles(self) -> list[str]:
-        """Concepts that are referenced in tags but have no dedicated concept article."""
-        # Get all concept names
+        """Concepts that are referenced in tags but have no dedicated concept article.
+
+        A concept's dedicated article is a concept-type article whose file
+        name (slug) or title names it: ``concepts/activation-energy.org`` or
+        "Activation Energy" covers the tag ``activation_energy``. Merely
+        carrying the tag is not enough, or one concept article tagged
+        ``:concept:a:b:c:`` would hide the missing articles for a, b and c.
+        """
         all_concepts = {r["name"] for r in self.conn.execute("SELECT name FROM concepts")}
-        # Get concepts that have a dedicated concept-type article
-        covered = set()
-        for row in self.conn.execute("""
-            SELECT DISTINCT c.name
-            FROM article_concepts ac
-            JOIN concepts c ON c.id = ac.concept_id
-            JOIN articles a ON a.id = ac.article_id
-            WHERE a.article_type = 'concept'
-        """):
-            covered.add(row["name"])
-        return sorted(all_concepts - covered)
+        names = set()
+        for row in self.conn.execute(
+            "SELECT path, title FROM articles WHERE article_type = 'concept'"
+        ):
+            names.add(_concept_key(PurePosixPath(row["path"]).stem))
+            names.add(_concept_key(row["title"] or ""))
+        names.discard("")  # an untitled article names no concept
+        return sorted(c for c in all_concepts
+                      if not _concept_key(c) or _concept_key(c) not in names)
 
     def single_concept_articles(self) -> list[dict]:
         """Articles that cover only one concept (potential merge candidates)."""

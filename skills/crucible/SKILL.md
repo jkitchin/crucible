@@ -63,6 +63,14 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Merge another crucible | `crucible merge SOURCE [-n] [-y]` |
 | Delete an article or source | `crucible delete PATH [--file] [-y]` |
 | Full help | `crucible help all` |
+| Installed version | `crucible --version` |
+
+Article paths given to `backlinks`, `sources`, `related` and `history` may be
+relative to the project root (as above and in `--json` output), to the
+current directory, or to the wiki (`concepts/x.org`), or absolute. A path
+that names no article, an unknown `source`, or an unknown `help` topic is an
+error (exit 1), not an empty result; run `crucible sync` first if the article
+is new. Concept names are matched case-insensitively.
 
 ## Working Directory
 
@@ -133,11 +141,12 @@ Wait for user approval before proceeding.
 2. **Always** sync the database after writing:
    ```bash
    crucible sync
-   crucible manifest
    ```
-   The database and MANIFEST.md are not updated automatically when wiki files
-   change on disk. Without `crucible sync`, the database will be stale and
-   MANIFEST.md will show incorrect counts (e.g. 0 articles even when files exist).
+   The database, MANIFEST.md and index.org are not updated automatically when
+   wiki files change on disk; `crucible sync` updates the database and
+   regenerates MANIFEST.md and index.org. Without it, the database will be
+   stale and MANIFEST.md will show incorrect counts (e.g. 0 articles even when
+   files exist).
 3. Report what was created/updated
 
 ### Updating Existing Articles
@@ -351,10 +360,9 @@ When the user asks a question about the knowledge base:
 Run the maintenance cycle regularly, especially after distilling new sources:
 
 ```bash
-crucible sync          # pick up any file changes
+crucible sync          # pick up file changes; regenerates MANIFEST.md and index.org
 crucible lint          # find problems (broken links, missing properties, orphans)
 crucible suggest       # find opportunities (new articles, missing links, comparisons)
-crucible index         # regenerate .crucible/wiki/index.org
 ```
 
 ### Lint
@@ -378,6 +386,14 @@ crucible index         # regenerate .crucible/wiki/index.org
 Fix a duplicate key by giving each entry or file its own key and updating
 the `SOURCE_KEYS` and citations that meant the other one.
 
+A concept's dedicated article is a concept article whose file name or title
+names it (`concepts/activation-energy.org` covers the tag
+`activation_energy`); carrying the tag alone does not count.
+
+`crucible lint` exits 1 when there are errors, and with `--strict` when there
+are warnings too; info never fails it. A nonzero exit therefore means "issues
+found", not that lint itself failed: read the report either way.
+
 Use `crucible lint -j` for JSON output when processing programmatically.
 
 ### Suggest
@@ -393,8 +409,9 @@ Use `crucible suggest -j` for JSON output when processing programmatically.
 
 ### Index
 
-`crucible index` regenerates `.crucible/wiki/index.org` with all articles organized by type
-and by concept. Always run this after adding or updating articles.
+`crucible sync` regenerates `.crucible/wiki/index.org` with all articles organized by type
+and by concept (`crucible index` regenerates it on its own). Articles with an
+unrecognised `:ARTICLE_TYPE:` are listed under "Other".
 
 ## Common Patterns
 
@@ -455,7 +472,7 @@ it (`crucible lint` then reports their `SOURCE_KEYS` as unresolved). Without
 again by the next sync's disk scan.
 
 ### Generating an index
-After syncing, run `crucible index` to regenerate .crucible/wiki/index.org with
-categorized links to all articles, organized by type and concept. The index
-is generated output: do not edit it by hand, since `crucible sync` does not
-treat it as an article and the next `crucible index` overwrites it.
+`crucible sync` regenerates .crucible/wiki/index.org with categorized links to
+all articles, organized by type and concept (`crucible index` does the same on
+its own). The index is generated output: do not edit it by hand, since
+`crucible sync` does not treat it as an article and overwrites it.
