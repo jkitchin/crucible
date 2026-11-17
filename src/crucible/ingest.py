@@ -302,6 +302,42 @@ def _bib_value(value: str) -> str:
     return " ".join(value.replace("{", "").replace("}", "").split())
 
 
+def _braces_balanced(value: str) -> bool:
+    """Whether every brace in value is closed, and closed in order."""
+    depth = 0
+    for c in value:
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _bib_file_value(path: str) -> str:
+    """A file path for a ``file = {...}`` field, written verbatim.
+
+    Balanced braces are kept: BibTeX allows them inside a braced value, and
+    the reader returns them unchanged, so ``run{2}.csv`` names the file that
+    is stored. Collapsing whitespace would name a different file too.
+    Unbalanced braces cannot be written at all; they are dropped (ingest
+    stores such a file under the name without them, see _storage_name).
+    """
+    if _braces_balanced(path):
+        return path
+    return path.replace("{", "").replace("}", "")
+
+
+def _storage_name(name: str) -> str:
+    """The name a source is stored under: its own, minus unbalanced braces.
+
+    The bib `file` field can only hold balanced braces, and the field must
+    name the stored file exactly.
+    """
+    return name if _braces_balanced(name) else name.replace("{", "").replace("}", "")
+
+
 def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
                        date: str | None, url: str | None,
                        source_type: str, doi: str | None = None,
@@ -337,7 +373,7 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
     if url:
         lines.append(f"  url = {{{_bib_value(url)}}},")
     if file:
-        lines.append(f"  file = {{{file.replace('{', '').replace('}', '')}}},")
+        lines.append(f"  file = {{{_bib_file_value(file)}}},")
     lines.append("}")
     return "\n".join(lines)
 
@@ -349,10 +385,8 @@ def replace_cite_key(bibtex: str, new_key: str) -> str:
 
 def set_bib_field(bibtex: str, name: str, value: str) -> str:
     """Set a field on the first @entry in a bibtex string, replacing any existing one."""
-    # A file path is written verbatim (only braces, which would unbalance the
-    # entry, are dropped): collapsing whitespace would name a different file.
     if name.lower() == "file":
-        value = value.replace("{", "").replace("}", "")
+        value = _bib_file_value(value)
     else:
         value = _bib_value(value)
     return bibtex_mod.set_field(bibtex, name, value)
@@ -457,7 +491,7 @@ def _disk_scan_files(root: Path) -> list[Path]:
             if not path.is_file() or path.name.startswith("."):
                 continue
             if path.suffix.lower() == ".txt":
-                siblings = [p for p in path.parent.glob(path.stem + ".*")
+                siblings = [p for p in path.parent.glob(glob_escape(path.stem) + ".*")
                             if p != path and p.is_file()]
                 if siblings:
                     continue
@@ -479,6 +513,30 @@ def _disk_scan_key(path: Path, taken: set[str]) -> str:
     while key in taken:
         key, n = f"{base}-{n}", n + 1
     return key
+
+
+def _disk_scan_fields(path: Path, rel_path: str) -> dict:
+    """The columns (but metadata) the disk scan gives a file's row."""
+    title = path.stem.replace("-", " ").replace("_", " ").title()
+    if path.suffix.lower() == ".org":
+        try:
+            meta = parse_org_file(path)
+            if meta.title:
+                title = meta.title
+        except Exception:
+            pass
+    try:
+        mtime_iso = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        mtime_iso = None
+    return {
+        "title": title,
+        "source_type": source_type_for_path(rel_path),
+        "shareable": True,
+        "url": None,
+        "authors": None,
+        "date": mtime_iso,
+    }
 
 
 def upsert_sources_from_disk(root: Path, db) -> int:
@@ -519,10 +577,7 @@ def upsert_sources_from_disk(root: Path, db) -> int:
 
     inserted = 0
     for path in files:
-        try:
-            rel_path = str(path.relative_to(root.resolve()))
-        except ValueError:
-            rel_path = str(path)
+        rel_path = _project_rel(root, path)
 
         existing = by_path.get(rel_path)
         if rel_path in entry_files or (
@@ -539,31 +594,10 @@ def upsert_sources_from_disk(root: Path, db) -> int:
                 db.update_source(existing["id"], metadata=metadata)
             continue
 
-        title = path.stem.replace("-", " ").replace("_", " ").title()
-        if path.suffix.lower() == ".org":
-            try:
-                meta = parse_org_file(path)
-                if meta.title:
-                    title = meta.title
-            except Exception:
-                pass
-
-        try:
-            mtime_iso = datetime.fromtimestamp(
-                path.stat().st_mtime
-            ).strftime("%Y-%m-%d")
-        except OSError:
-            mtime_iso = None
-
         try:
             db.add_source(
                 path=rel_path,
-                title=title,
-                source_type=source_type_for_path(rel_path),
-                shareable=True,
-                url=None,
-                authors=None,
-                date=mtime_iso,
+                **_disk_scan_fields(path, rel_path),
                 metadata={"cite_key": cite_key, "disk_scan": True},
             )
             by_path[rel_path] = None
@@ -577,17 +611,47 @@ def upsert_sources_from_disk(root: Path, db) -> int:
 PLACEHOLDER_PREFIX = f"{CRUCIBLE_DIR}/bib/"
 
 
+def _project_rel(root: Path, path: Path) -> str:
+    """`path` relative to the project root, as ingest stores it.
+
+    The path is normalised lexically (``a/../b`` is ``b``) and compared with
+    the root as given and as resolved, without resolving symlinks inside the
+    project: with sources/notebooks/ a symlink to a directory elsewhere, a
+    file in it is still .crucible/sources/notebooks/<name>, the path ingest
+    recorded. Only a path that is not lexically under the root (one through
+    a symlink to the project, say) is resolved. A path outside the project
+    stays absolute.
+    """
+    lexical = Path(os.path.normpath(path))
+    bases = [Path(os.path.normpath(root))]
+    try:
+        bases.append(root.resolve())
+    except OSError:
+        pass
+    for base in bases:
+        try:
+            return str(lexical.relative_to(base))
+        except ValueError:
+            pass
+    try:
+        resolved = lexical.resolve()
+    except OSError:
+        return str(lexical)
+    for base in bases:
+        try:
+            return str(resolved.relative_to(base))
+        except ValueError:
+            pass
+    return str(lexical)
+
+
 def _bib_file_path(root: Path, file_field: str) -> str:
     """A bib entry's file field as a path relative to the project root.
 
     _resolve_bib_file handles a path that a BibTeX formatter wrapped across
-    lines.
+    lines; _project_rel makes it relative the way ingest stores paths.
     """
-    abs_path = _resolve_bib_file(root, file_field)
-    try:
-        return str(abs_path.resolve().relative_to(root.resolve()))
-    except ValueError:
-        return str(abs_path)
+    return _project_rel(root, _resolve_bib_file(root, file_field))
 
 
 def _is_ingest_day(row_date: str, ingested_at: str | None) -> bool:
@@ -687,6 +751,42 @@ def _fields_from_bib(entry: dict, rel_path: str) -> dict:
     }
 
 
+def _release_unlisted_sources(root: Path, db, bib_keys: set[str]) -> None:
+    """Give ingested rows whose bib entry is gone the treatment a rebuild gives.
+
+    A rebuild makes rows only from bib entries with a `file` field and from
+    the disk scan, so once an ingested source's entry is removed its row has
+    no claim to the file: another entry may name it, and otherwise a file
+    the disk scan indexes (sources/notebooks/, sources/data/) becomes a
+    disk-scan row, which the scan then keys as it would on a rebuild. Any
+    other such row (an external file, a file that is gone) is dropped along
+    with its article links.
+
+    Only rows made by ingest are released. Rows with no content hash (from
+    the disk scan, or from versions before ingest wrote bib entries) are
+    left to step 3b and the scan.
+    """
+    scanned = {_project_rel(root, p): p for p in _disk_scan_files(root)}
+    for src in db.list_sources():
+        if not _from_ingest(src):
+            continue
+        metadata = _source_metadata(src)
+        key = metadata.get("cite_key")
+        if isinstance(key, str) and key in bib_keys:
+            continue
+        path = scanned.get(src["path"])
+        if path is None:
+            db.delete_source(src["id"])
+            continue
+        # The metadata a disk-scan row has (the scan sets its key), plus the
+        # sidecar's hash, which lets delete tell the sidecar from a user's
+        # own <stem>.txt.
+        new_md = {"cite_key": key if isinstance(key, str) else path.stem, "disk_scan": True}
+        if "text_hash" in metadata:
+            new_md["text_hash"] = metadata["text_hash"]
+        db.update_source(src["id"], **_disk_scan_fields(path, src["path"]), metadata=new_md)
+
+
 def reconcile_sources(root: Path, db) -> int:
     """Make the sources table agree with references.bib and the files on disk.
 
@@ -708,6 +808,10 @@ def reconcile_sources(root: Path, db) -> int:
     4. Files in sources/notebooks/ and sources/data/ that no entry claims
        get a row from the disk scan.
 
+    Before all this, an ingested row whose cite key has no bib entry loses
+    its claim to its file (see _release_unlisted_sources), as it has none on
+    a rebuild.
+
     Returns the number of source rows inserted.
     """
     bib_path = root / CRUCIBLE_DIR / "references.bib"
@@ -719,6 +823,7 @@ def reconcile_sources(root: Path, db) -> int:
     inserted = 0
 
     with db.conn.transaction():
+        _release_unlisted_sources(root, db, bib_keys)
         sources = db.list_sources()
         by_path = {src["path"]: src for src in sources}
         by_key: dict[str, dict] = {}
@@ -867,11 +972,39 @@ def fetch_bibtex_from_doi(doi: str, timeout: float = 10.0) -> str | None:
     return data
 
 
-# DOIs are 10.<registrant>/<suffix>. Stop at whitespace/quotes/brackets and
-# strip trailing sentence punctuation that commonly abuts a DOI in running text.
+# DOIs are 10.<registrant>/<suffix>. Stop at whitespace, quotes, ']' and '}'.
 # Only printable ASCII: a non-ASCII character (an en dash typed for a hyphen,
 # say) ends the match instead of producing a URL that cannot be requested.
-_DOI_RE = re.compile(r"\b10\.\d{4,9}/[!#-&(-;=?-\\^-|~]+", re.IGNORECASE)
+# Brackets of all kinds may occur inside a DOI (10.1061/(ASCE)0733-9399(2008)
+# 134:1(1), SICI DOIs with <...>), so closing ones are cut later only where
+# they do not balance.
+_DOI_RE = re.compile(r"\b10\.\d{4,9}/[!#-&(-\\^-|~]+", re.IGNORECASE)
+
+_DOI_PAIRS = {")": "(", "]": "[", ">": "<"}
+
+
+def _trim_doi(doi: str) -> str:
+    """Cut a matched DOI at its first unbalanced closing bracket, then drop
+    trailing punctuation and unclosed opening brackets.
+
+    The bracket that closes text around the DOI (``(doi 10.1/x)``,
+    ``[10.1/x](url)``) has no partner inside it. A closing tag
+    (``<doi>10.1/x</doi>``) ends the DOI too.
+    """
+    doi = doi.split("</", 1)[0]
+    depth = {opener: 0 for opener in _DOI_PAIRS.values()}
+    for i, c in enumerate(doi):
+        if c in depth:
+            depth[c] += 1
+        elif c in _DOI_PAIRS:
+            opener = _DOI_PAIRS[c]
+            if depth[opener] == 0:
+                doi = doi[:i]
+                break
+            depth[opener] -= 1
+    while doi and doi[-1] in ".,;:([<":
+        doi = doi[:-1]
+    return doi
 
 
 def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | None:
@@ -883,11 +1016,11 @@ def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | Non
     """
     if not text:
         return None
-    m = _DOI_RE.search(text[:scan_chars])
-    if not m:
-        return None
-    doi = m.group(0).rstrip(".,;:)]}>")
-    return doi or None
+    for m in _DOI_RE.finditer(text[:scan_chars]):
+        doi = _trim_doi(m.group(0))
+        if "/" in doi and not doi.endswith("/"):
+            return doi
+    return None
 
 
 def bib_has_key(text: str, cite_key: str) -> bool:
@@ -1029,14 +1162,22 @@ def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str,
     Matches on the stored ``content_hash`` metadata when present; for sources
     ingested before hashing existed, falls back to hashing the stored file on
     disk so re-ingesting an old source is still recognized as a duplicate.
+    A row whose stored file is missing is returned only when no row with
+    the file matches; the caller restores the file.
     """
     unhashed = []
+    missing = None
     for src in db.list_sources():
         stored = _source_metadata(src).get("content_hash")
         if stored is None:
             unhashed.append(src)
         elif stored == content_hash:
-            return src
+            # A row whose file is gone (deleted, or never there on a fresh
+            # clone) is returned only if no row has the file: ingest then
+            # restores it.
+            if (root / src["path"]).is_file():
+                return src
+            missing = missing or src
     # Rows without a hash (older ingests, disk scans, rebuilt databases) are
     # compared by hashing their files, but only those of the same size: on a
     # fresh clone every row lacks a hash, and hashing every stored file on
@@ -1053,7 +1194,7 @@ def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str,
             continue
         if stored == content_hash:
             return src
-    return None
+    return missing
 
 
 def _unique_cite_key(base: str, db: CrucibleDB, root: Path | None = None) -> str:
@@ -1109,6 +1250,82 @@ def _claim(path: Path, created: list[Path]) -> bool:
     return True
 
 
+def _source_result(root: Path, src: dict, **extra) -> dict:
+    """What ingest_source returns for an existing source row."""
+    return {
+        "source_id": src["id"],
+        "title": src["title"],
+        "cite_key": _source_metadata(src).get("cite_key", ""),
+        "source_type": src["source_type"],
+        "shareable": bool(src["shareable"]),
+        "stored_path": str(root / src["path"]),
+        "relative_path": src["path"],
+        "text_path": None,
+        "text_length": 0,
+        "date": src.get("date"),
+        **extra,
+    }
+
+
+def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
+                    content_hash: str) -> dict:
+    """Put source_path back as the missing stored file of the existing row src.
+
+    This is the same source: on a fresh clone the gitignored external copy
+    is absent and its row was rebuilt from the bib entry, or the stored file
+    was deleted. The row keeps its id, cite key and article links and the
+    bib entry is left alone; the file (and its text sidecar, unless one is
+    there) is copied back and the content hash recorded.
+    """
+    dest = root / src["path"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    try:
+        if not _claim(dest, created):
+            # Restored meanwhile (another ingest): nothing to do.
+            return _source_result(root, src, duplicate=True)
+        with open(source_path, "rb") as fin, open(dest, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+        shutil.copystat(source_path, dest)
+
+        metadata = _source_metadata(src)
+        text = extract_text(source_path)
+        text_path = dest.with_suffix(".txt")
+        wrote_text = False
+        if text and text_path != dest and _claim(text_path, created):
+            atomic_write_text(text_path, text)
+            metadata["text_hash"] = file_sha256(text_path)
+            wrote_text = True
+        if not _from_disk_scan(src):
+            # A disk-scan row is keyed by the scan, not by ingest.
+            metadata["content_hash"] = content_hash
+        db.update_source(src["id"], metadata=metadata)
+    except BaseException:
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+
+    if text_path == dest:
+        text_out = str(dest)
+    elif wrote_text or text_path.exists():
+        text_out = str(text_path)
+    else:
+        text_out = None
+    key = metadata.get("cite_key", "")
+    return _source_result(
+        root, src,
+        text_path=text_out if text else None,
+        text_length=len(text),
+        duplicate=False,
+        restored=True,
+        warnings=[(f"restored the missing stored file of existing source {key} "
+                   f"({src['path']}); its bib entry is unchanged")],
+    )
+
+
 def ingest_source(
     root: Path,
     db: CrucibleDB,
@@ -1153,20 +1370,9 @@ def ingest_source(
     existing = _find_duplicate_source(db, root, content_hash,
                                       size=source_path.stat().st_size)
     if existing is not None:
-        md = _source_metadata(existing)
-        return {
-            "source_id": existing["id"],
-            "title": existing["title"],
-            "cite_key": md.get("cite_key", ""),
-            "source_type": existing["source_type"],
-            "shareable": bool(existing["shareable"]),
-            "stored_path": str(root / existing["path"]),
-            "relative_path": existing["path"],
-            "text_path": None,
-            "text_length": 0,
-            "date": existing.get("date"),
-            "duplicate": True,
-        }
+        if not (root / existing["path"]).is_file():
+            return _restore_source(root, db, existing, source_path, content_hash)
+        return _source_result(root, existing, duplicate=True)
 
     # Detect type if not specified
     if source_type is None:
@@ -1175,6 +1381,19 @@ def ingest_source(
     # Determine shareability
     if shareable is None:
         shareable = source_type in ("notebook", "data")
+
+    # A row that already holds the path this file would be stored at, while
+    # the file itself is missing, is this source: on a fresh clone the
+    # gitignored copy is absent and the row, rebuilt from its bib entry, has
+    # no content hash to compare. Restore the file into that row rather than
+    # add a second source for the same path. (A row whose recorded hash
+    # differs is a different source; the name is then taken, see below.)
+    held = {src["path"]: src for src in db.list_sources()}
+    first_dest = destination_dir(root, source_type, shareable) / _storage_name(source_path.name)
+    holder = held.get(_project_rel(root, first_dest))
+    if (holder is not None and not first_dest.exists()
+            and "content_hash" not in _source_metadata(holder)):
+        return _restore_source(root, db, holder, source_path, content_hash)
 
     # Everything that can fail (text extraction, DOI lookup, building the
     # entry) runs before anything is written, from the original file.
@@ -1261,7 +1480,7 @@ def ingest_source(
     # (<stem>.txt) is free too, so neither overwrites an existing file.
     dest_dir = destination_dir(root, source_type, shareable)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / source_path.name
+    dest_path = dest_dir / _storage_name(source_path.name)
     in_place = dest_path.exists() and dest_path.samefile(source_path)
 
     # Claim the names by exclusive create: a free name that another ingest
@@ -1278,10 +1497,13 @@ def ingest_source(
             if text and text_path != dest_path:
                 write_sidecar = _claim(text_path, created)
         else:
-            stem, suffix = source_path.stem, source_path.suffix
+            stem, suffix = dest_path.stem, dest_path.suffix
             counter = 1
             while True:
-                if not _dest_taken(dest_path) and _claim(dest_path, created):
+                # A path a row holds is taken even when its file is missing.
+                if (not _dest_taken(dest_path)
+                        and _project_rel(root, dest_path) not in held
+                        and _claim(dest_path, created)):
                     text_path = dest_path.with_suffix(".txt")
                     if not text or text_path == dest_path:
                         break
