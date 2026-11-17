@@ -33,7 +33,38 @@ PROP_DRAWER_RE = re.compile(
 # the next property line as its value.
 PROP_LINE_RE = re.compile(r"^[ \t]*:([A-Za-z_]+):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 FILE_LINK_RE = re.compile(r"\[\[file:([^\]]+?)(?:::.*?)?\](?:\[([^\]]*)\])?\]")
-CITE_RE = re.compile(r"(?:cite[pt]?):([a-zA-Z0-9_,-]+)")
+
+# org-ref citations. Both syntaxes are recognized:
+#   v2: cite:key1,key2          (also [[cite:key1,key2]])
+#   v3: cite:&key1;&key2        (also [[cite:prefix;&key1 note;&key2]])
+# The link types are org-ref's natbib/biblatex commands. The lookbehind keeps
+# words such as "excite:" from being read as a citation.
+_CITE_TYPE = (
+    r"(?:[Cc]ite[a-z]*|[Pp]arencite|[Tt]extcite|[Aa]utocite|[Ff]ootcite[a-z]*"
+    r"|[Ss]martcite|[Ss]upercite|fullcite|nocite)"
+)
+# BibTeX keys may contain ':', '.', '/', '+' and '-', but a key never ends in
+# '.' or ':', so sentence punctuation after a bare citation is not captured.
+_CITE_KEY = r"[\w+/-](?:[\w:.+/-]*[\w+/-])?"
+CITATION_RE = re.compile(
+    rf"\[\[(?P<btype>{_CITE_TYPE}):(?P<bbody>[^\]]+)\](?:\[[^\]]*\])?\]"
+    rf"|(?<![\w\[])(?P<type>{_CITE_TYPE}):"
+    rf"(?P<body>&?{_CITE_KEY}(?:[;,]&?{_CITE_KEY})*)"
+)
+_V3_KEY_RE = re.compile(rf"&({_CITE_KEY})")
+
+
+def citation_type(m: re.Match) -> str:
+    """The link type (cite, citep, ...) of a CITATION_RE match."""
+    return m.group("btype") or m.group("type")
+
+
+def citation_keys(m: re.Match) -> list[str]:
+    """The cite keys of a CITATION_RE match, in order."""
+    body = m.group("bbody") or m.group("body")
+    if "&" in body:
+        return _V3_KEY_RE.findall(body)
+    return [k.strip() for k in body.split(",") if k.strip()]
 
 
 def parse_org(text: str) -> OrgMetadata:
@@ -67,9 +98,8 @@ def parse_org(text: str) -> OrgMetadata:
         meta.file_links.append(target)
 
     # Citation keys
-    for m in CITE_RE.finditer(text):
-        keys = m.group(1).split(",")
-        meta.cite_keys.extend(k.strip() for k in keys if k.strip())
+    for m in CITATION_RE.finditer(text):
+        meta.cite_keys.extend(citation_keys(m))
 
     return meta
 

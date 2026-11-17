@@ -11,6 +11,8 @@ import re
 import urllib.parse
 from pathlib import Path, PurePosixPath
 
+from crucible.orgparse import CITATION_RE, citation_keys, citation_type
+
 
 # ---------------------------------------------------------------------------
 # BibTeX parser (lightweight, no external deps)
@@ -115,7 +117,6 @@ _FILE_LINK_RE = re.compile(
 _PLAIN_LINK_RE = re.compile(
     r"\[\[([^\]]+)\]\[([^\]]*)\]\]"
 )
-_CITE_RE = re.compile(r"(cite[pt]?):([a-zA-Z0-9_:,-]+)")
 _BOLD_RE = re.compile(r"(?<![a-zA-Z0-9])\*([^\s*](?:.*?[^\s*])?)\*(?![a-zA-Z0-9])")
 _ITALIC_RE = re.compile(r"(?<![a-zA-Z0-9])/([^\s/](?:.*?[^\s/])?)/(?![a-zA-Z0-9])")
 _CODE_RE = re.compile(r"(?<![a-zA-Z0-9])~([^\s~](?:.*?[^\s~])?)~(?![a-zA-Z0-9])")
@@ -183,13 +184,11 @@ def _process_inline(text: str, current_path: str,
     # File links
     text = _FILE_LINK_RE.sub(lambda m: _hold(_rewrite_file_link(m, current_path)), text)
 
-    # Plain links
-    text = _PLAIN_LINK_RE.sub(lambda m: _hold(_rewrite_plain_link(m)), text)
-
-    # Citations (with bib tooltips, linked to references page)
+    # Citations (with bib tooltips, linked to references page). Before plain
+    # links, so [[cite:&key][description]] renders as a citation.
     def _cite_repl(m: re.Match) -> str:
-        cite_type = m.group(1)
-        keys = [k.strip() for k in m.group(2).split(",") if k.strip()]
+        cite_type = citation_type(m)
+        keys = citation_keys(m)
         spans = []
         for key in keys:
             entry = bib.get(key) if bib else None
@@ -205,7 +204,10 @@ def _process_inline(text: str, current_path: str,
                 )
         return _hold("".join(spans))
 
-    text = _CITE_RE.sub(_cite_repl, text)
+    text = CITATION_RE.sub(_cite_repl, text)
+
+    # Plain links
+    text = _PLAIN_LINK_RE.sub(lambda m: _hold(_rewrite_plain_link(m)), text)
 
     # LaTeX (before other inline markup to avoid conflicts)
     text = _LATEX_DISPLAY_RE.sub(

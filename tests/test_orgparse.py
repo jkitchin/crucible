@@ -1,5 +1,7 @@
 """Tests for org-mode article parsing."""
 
+import pytest
+
 from crucible.browse import org_to_html
 from crucible.orgparse import parse_org, parse_org_file
 
@@ -53,3 +55,35 @@ def test_property_drawer_is_case_insensitive():
     _, body, _ = org_to_html(text)
     assert "smith2024" in body
     assert ":properties:" not in body
+
+
+@pytest.mark.parametrize(
+    "text, keys",
+    [
+        # org-ref v2
+        ("cite:smith2024", ["smith2024"]),
+        ("citep:smith2024,doe2020", ["smith2024", "doe2020"]),
+        # org-ref v3, bare and as links with prefix/suffix notes
+        ("cite:&smith2024", ["smith2024"]),
+        ("see citep:&a;&b.", ["a", "b"]),
+        ("[[cite:&smith2024]]", ["smith2024"]),
+        ("[[citep:See;&a pp. 3;&b; and more]]", ["a", "b"]),
+        ("[[cite:&x][the paper]]", ["x"]),
+        # other org-ref link types
+        ("citeauthor:&x and Citet:&y", ["x", "y"]),
+        # BibTeX keys may contain '.' and ':'; trailing punctuation is not a key
+        ("cite:doe.2020.", ["doe.2020"]),
+        ("cite:doe:2020, then", ["doe:2020"]),
+        # words ending in "cite" are not citations
+        ("excite:foo", []),
+    ],
+)
+def test_citation_keys(text, keys):
+    assert parse_org(text).cite_keys == keys
+
+
+def test_v3_citations_render_as_citations():
+    _, body, _ = org_to_html("* A\nSee [[cite:&smith2024][Smith]] and citep:&a;&b.\n")
+    for key in ("smith2024", "a", "b"):
+        assert f'href="/_references#{key}"' in body
+    assert "&amp;" not in body
