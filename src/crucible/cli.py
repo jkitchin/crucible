@@ -409,6 +409,9 @@ def init(root):
         "`.crucible/crucible.db` (graph database).\n"
         "\n"
         "Conventions: org-mode with scimax, org-ref citations, narrative prose.\n"
+        "Each article's top heading has :ARTICLE_TYPE:, :SOURCE_KEYS: (the cite keys\n"
+        "`crucible ingest` prints), :STATUS:, :CREATED: and :MODIFIED: (update it on\n"
+        "every edit). Run `crucible sync` after writing or editing articles.\n"
         "The LLM maintains the wiki; manual edits are the exception.\n"
         "Run `crucible help all` for the full CLI reference.\n"
         f"{crucible_marker}\n"
@@ -3322,16 +3325,18 @@ Crucible ingests primary sources (papers, notebooks, data) and distills them
 into a structured, interlinked org-mode wiki. The wiki is maintained by an LLM;
 humans rarely edit it directly.
 
-Directory layout:
-  sources/external/     Copyrighted material (gitignored)
-  sources/notebooks/    Your own ELN entries (shareable)
-  sources/data/         Your own data files (shareable)
-  wiki/concepts/        Concept articles (one topic per file)
-  wiki/summaries/       Per-source summaries
-  wiki/comparisons/     Cross-source comparison articles
-  wiki/methods/         Methodology articles
-  wiki/index.org        Auto-maintained master index
-  db/crucible.db        Wiki graph database (SQLite)
+Directory layout (everything lives in .crucible/ at the project root):
+  .crucible/sources/external/   Copyrighted material (gitignored)
+  .crucible/sources/notebooks/  Your own ELN entries (shareable)
+  .crucible/sources/data/       Your own data files (shareable)
+  .crucible/wiki/concepts/      Concept articles (one topic per file)
+  .crucible/wiki/summaries/     Per-source summaries
+  .crucible/wiki/comparisons/   Cross-source comparison articles
+  .crucible/wiki/methods/       Methodology articles
+  .crucible/wiki/index.org      Auto-maintained master index
+  .crucible/references.bib      Bibliography; each entry's `file` field
+                                names the stored source file
+  .crucible/crucible.db         Wiki graph database (SQLite, regenerable)
 
 Run `crucible help all` for complete documentation.
 Run `crucible help <topic>` for a specific topic.
@@ -3346,10 +3351,10 @@ TYPICAL WORKFLOW
      curl URL | pandoc -t org | crucible ingest - -t "Title" --type web
 
 2. Distill the source (done by the LLM):
-   Read the source from sources/ and write org articles into wiki/.
-   Use the two-step process:
+   Read the source from .crucible/sources/ and write org articles into
+   .crucible/wiki/. Use the two-step process:
    a) Plan: identify concepts, propose articles, note cross-links
-   b) Write: create/update org files in wiki/ with proper metadata
+   b) Write: create/update org files in .crucible/wiki/ with proper metadata
 
 3. Sync the database:
      crucible sync
@@ -3357,11 +3362,11 @@ TYPICAL WORKFLOW
 4. Query the knowledge base:
      crucible search "query"
      crucible concepts
-     crucible related wiki/concepts/some-article.org
-     crucible backlinks wiki/concepts/some-article.org
+     crucible related .crucible/wiki/concepts/some-article.org
+     crucible backlinks .crucible/wiki/concepts/some-article.org
 
 5. Maintain the wiki:
-     crucible index            # regenerate wiki/index.org
+     crucible index            # regenerate .crucible/wiki/index.org
      crucible lint             # check for broken links, orphans, issues
      crucible suggest          # get improvement suggestions
      crucible orphans          # find unlinked articles
@@ -3389,6 +3394,8 @@ Options:
   --url TEXT                Original URL
   --date TEXT               ISO date (default: today)
   -a, --author TEXT         Author(s), repeatable
+  --doi TEXT                DOI; the full BibTeX entry is fetched from doi.org
+  --bibtex TEXT             A BibTeX entry to use for the source
   -f, --filename TEXT       Filename for stdin input
 
 Examples:
@@ -3398,14 +3405,22 @@ Examples:
   crucible ingest data.csv --type data --shareable
   cat article.md | crucible ingest - -t "Article Title" --type web --url "https://..."
   curl -s URL | pandoc -t org | crucible ingest - -t "Title" --type web
+  crucible ingest paper.pdf --doi 10.1038/s41586-020-2649-2
+  crucible ingest paper.pdf --bibtex "@article{x, title={...}, year={2024}}"
 
 Auto-detection:
   .pdf -> pdf (external)     .org -> notebook (shareable)
   .md/.html -> web (external)  .csv/.json/.xlsx/.hdf5 -> data (shareable)
 
 The source is copied to the appropriate directory, text is extracted,
-and a row is added to the sources table. The source is then ready
-for distillation by an LLM agent.
+and an entry is added to .crucible/references.bib. Its BibTeX entry is,
+in order of preference: --bibtex, the entry doi.org returns for --doi (or
+for a DOI found in the text), or a minimal entry from the options. The
+cite key is made unique against existing sources and bib entries
+(smith2024, smith2024a, ...), and the entry's `file` field records the
+stored copy. The sources-table row is described by that entry, so a fresh
+clone rebuilds the same row. Ingest prints the cite key: put it in the
+SOURCE_KEYS of the articles you distill from the source.
 """,
         "distill": """
 DISTILLATION GUIDE (for LLM agents)
@@ -3428,9 +3443,12 @@ STEP 2 - WRITE:
   Then run `crucible sync` to update the database.
 
 LINKING TO SOURCES:
-  In the :PROPERTIES: drawer, set SOURCE_KEYS to space-separated
-  identifiers that match the source filename or title in the database.
-  The sync command uses these to link articles to their sources.
+  In the :PROPERTIES: drawer, set SOURCE_KEYS to the space-separated
+  cite keys of the article's sources: the keys in references.bib that
+  `crucible ingest` printed. A file in sources/notebooks/ or sources/data/
+  that no bib entry claims is keyed <stem>-<ext> (results.csv ->
+  results-csv). Sync uses these keys to link articles to their sources;
+  `crucible lint` reports keys that resolve to no source or to several.
 
 UPDATING EXISTING ARTICLES:
   When a new source adds to an existing concept, add a new section
@@ -3443,14 +3461,20 @@ SEARCH AND QUERY COMMANDS
 Full-text search (FTS5 with porter stemming):
   crucible search "activation energy"
   crucible search "platinum catalysis" -n 5
+  crucible search "zeolites" --all     Search every registered crucible
+
+Semantic and hybrid search (after `crucible embed`, needs ollama):
+  crucible search "query" --mode semantic
+  crucible search "query" --mode hybrid
 
 Structured queries:
   crucible concepts                    List all concepts with article counts
   crucible concept thermodynamics      Articles covering a concept
-  crucible backlinks wiki/concepts/x.org   What links to this article
-  crucible sources wiki/concepts/x.org     Primary sources for an article
-  crucible related wiki/concepts/x.org     Implied links (shared concepts,
-                                           shared sources, temporal proximity)
+  crucible backlinks .crucible/wiki/concepts/x.org   What links here
+  crucible sources .crucible/wiki/concepts/x.org     Primary sources
+  crucible related .crucible/wiki/concepts/x.org     Implied links (shared
+                                    concepts, shared sources, temporal proximity)
+  crucible source SOURCE_PATH          Everything known about one source
   crucible orphans                     Articles with no incoming links
   crucible undigested                  Sources not yet distilled
 
@@ -3466,12 +3490,26 @@ SYNC COMMAND
 
   crucible sync
 
-Scans wiki/ for .org files and updates the database:
+Scans .crucible/wiki/ for .org files and updates the database:
   - Registers new articles (from path, title, ARTICLE_TYPE property)
-  - Updates FTS index for existing articles
+  - Rewrites only articles whose file changed (others count as unchanged
+    and keep their embeddings)
+  - Takes article dates from :CREATED: and :MODIFIED: (MODIFIED falls back
+    to CREATED, and an article with only MODIFIED uses it for both; with
+    neither, sync time is used, which a rebuild cannot reproduce)
   - Links articles to concepts (from #+FILETAGS)
   - Links articles to each other (from [[file:...]] links)
-  - Links articles to sources (from SOURCE_KEYS property)
+  - Links articles to sources (from SOURCE_KEYS cite keys)
+
+It also reconciles the sources table with .crucible/references.bib:
+  - An entry with a `file` field owns the row for that file
+  - An entry without one gets no row (lint reports keys cited this way)
+  - A file in sources/notebooks/ or sources/data/ that no entry claims gets
+    a row keyed <stem>-<ext> from a disk scan
+
+The database is regenerable: delete .crucible/crucible.db and the next
+command rebuilds it from the wiki, references.bib and the source files,
+with the same rows an incremental sync gives.
 
 Run sync after writing or updating any wiki articles.
 Sync is idempotent and safe to run repeatedly.
@@ -3480,7 +3518,7 @@ Sync is idempotent and safe to run repeatedly.
 WIKI MAINTENANCE COMMANDS
 
 Index generation:
-  crucible index               Regenerate wiki/index.org from database
+  crucible index               Regenerate .crucible/wiki/index.org
                                Organized by article type and by concept.
                                Re-run after any changes.
 
@@ -3492,6 +3530,15 @@ Lint (health checks):
                                - Undigested sources
                                - Missing concept articles
                                - Missing properties or filetags
+                               - Missing or unreadable :CREATED: and
+                                 :MODIFIED: dates
+                               - SOURCE_KEYS that resolve to no source
+                                 or to several
+                               - Cite keys shared by several sources, or
+                                 by several references.bib entries
+                               - references.bib entries never closed
+                               - Committed sources whose file is gone
+                               - Citations missing from references.bib
                                - Wiki files not in database
   crucible lint -j             JSON output (for agent consumption)
 
@@ -3510,6 +3557,16 @@ Merge another crucible:
                                SOURCE is a path or registry name.
   crucible merge SOURCE -n     Dry run (preview without changes)
   crucible merge SOURCE -y     Skip confirmation prompt
+                               A source crucible whose sources or bib
+                               entries repeat a cite key is refused:
+                               give each its own key there first.
+
+Delete:
+  crucible delete PATH         Remove an article or source from the
+                               database (--file also deletes the file).
+                               Deleting a source removes the `file` field
+                               from its references.bib entry so the next
+                               sync does not restore it.
 
 Typical maintenance cycle:
   crucible sync                # pick up any changes
@@ -3544,8 +3601,13 @@ Every wiki article must follow this structure:
 FILETAGS: include the article type (concept, summary, etc.) and
 all relevant topic tags. Tags become concepts in the database.
 
-SOURCE_KEYS: space-separated identifiers matching source filenames
-or titles. These create article-to-source links during sync.
+SOURCE_KEYS: space-separated cite keys from references.bib (the key
+`crucible ingest` printed), or <stem>-<ext> for a file in sources/notebooks/
+or sources/data/ with no bib entry. These create article-to-source links
+during sync.
+
+CREATED / MODIFIED: the article's dates; update MODIFIED on every edit.
+They are what the database records, so they survive a rebuild.
 
 ARTICLE TYPES:
   concept     - A single topic or idea (e.g., activation-energy.org)
