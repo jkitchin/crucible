@@ -439,6 +439,23 @@ def parse_bib_file(bib_path: Path) -> list[dict]:
     return parsed
 
 
+def _read_bib_entries(root: Path) -> tuple[list[dict], int]:
+    """references.bib parsed as parse_bib_file does, read under the bib lock,
+    plus the number of malformed entries (unbalanced braces, no key)."""
+    bib_path = root / CRUCIBLE_DIR / "references.bib"
+    with _bib_lock(root):
+        if not bib_path.exists():
+            return [], 0
+        text = bib_path.read_text(encoding="utf-8", errors="replace")
+    found, malformed = bibtex_mod.scan(text)
+    parsed = []
+    for e in found:
+        entry = {"entry_type": e.entry_type, "cite_key": e.key}
+        entry.update(e.as_dict())
+        parsed.append(entry)
+    return parsed, len(malformed)
+
+
 def _authors_from_bib(author_field: str) -> list[str]:
     """Split a BibTeX author field on ' and '."""
     if not author_field:
@@ -796,7 +813,7 @@ def _release_unlisted_sources(root: Path, db, bib_keys: set[str]) -> None:
         db.update_source(src["id"], **_disk_scan_fields(path, src["path"]), metadata=new_md)
 
 
-def reconcile_sources(root: Path, db) -> int:
+def reconcile_sources(root: Path, db, on_warning=None) -> int:
     """Make the sources table agree with references.bib and the files on disk.
 
     The database must be regenerable from committed files (#6). A bib
@@ -819,20 +836,35 @@ def reconcile_sources(root: Path, db) -> int:
 
     Before all this, an ingested row whose cite key has no bib entry loses
     its claim to its file (see _release_unlisted_sources), as it has none on
-    a rebuild.
+    a rebuild, unless the bibliography has malformed entries: then the
+    missing key may be one that failed to parse, so no row is released and
+    on_warning (if given) is called with a message.
 
     Returns the number of source rows inserted.
     """
-    bib_path = root / CRUCIBLE_DIR / "references.bib"
-    entries = parse_bib_file(bib_path)
-    bib_keys = {entry["cite_key"] for entry in entries}
-    key_counts: dict[str, int] = {}
-    for entry in entries:
-        key_counts[entry["cite_key"]] = key_counts.get(entry["cite_key"], 0) + 1
     inserted = 0
 
     with db.conn.transaction():
-        _release_unlisted_sources(root, db, bib_keys)
+        # The bibliography is read inside the write transaction, under the
+        # bib lock. Ingest appends its entry before it adds its row, and the
+        # row cannot be added while this transaction holds the write lock,
+        # so every ingested row seen here has its entry in what is read.
+        entries, malformed = _read_bib_entries(root)
+        bib_keys = {entry["cite_key"] for entry in entries}
+        key_counts: dict[str, int] = {}
+        for entry in entries:
+            key_counts[entry["cite_key"]] = key_counts.get(entry["cite_key"], 0) + 1
+        if malformed:
+            # A half-edited or partly unparseable bibliography would release
+            # every row whose entry was lost; keep them until it is fixed.
+            if on_warning is not None:
+                on_warning(
+                    f"references.bib has {malformed} malformed "
+                    f"entr{'y' if malformed == 1 else 'ies'}; sources whose entry "
+                    "is missing were kept (run `crucible lint` to find them)"
+                )
+        else:
+            _release_unlisted_sources(root, db, bib_keys)
         sources = db.list_sources()
         by_path = {src["path"]: src for src in sources}
         by_key: dict[str, dict] = {}
@@ -1278,6 +1310,58 @@ def _source_result(root: Path, src: dict, **extra) -> dict:
     }
 
 
+def _norm_doi(doi: str | None) -> str:
+    """A DOI for comparison: lowercase, without a resolver prefix."""
+    return re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "",
+                  (doi or "").strip().lower())
+
+
+def _norm_title(title: str | None) -> str:
+    """A title for comparison: braces, case, punctuation and spacing ignored."""
+    text = (title or "").replace("{", "").replace("}", "").casefold()
+    return " ".join(re.findall(r"\w+", text))
+
+
+def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str,
+                      title: str | None, doi: str | None) -> str | None:
+    """Why source_path may not be the missing file of the row src, or None.
+
+    The row was rebuilt from its bib entry, so it has no hash to compare.
+    The file is taken to be that source when its DOI (given, or found in a
+    paper's or web page's text) equals the row's, or failing a DOI on both
+    sides, when its title (given, or declared by the file) equals the
+    row's, or when its text equals the row's committed text sidecar. A
+    disagreeing DOI, or no evidence at all, is a problem.
+    """
+    key = _source_metadata(src).get("cite_key") or src["path"]
+    advice = ("If it is that source, run again with --restore; if not, "
+              "rename the file before ingesting it.")
+    text = extract_text(source_path)
+    row_doi = _norm_doi(_source_metadata(src).get("doi"))
+    file_doi = _norm_doi(doi or (extract_doi_from_text(text)
+                                 if source_type in ("pdf", "web") else None))
+    if row_doi and file_doi:
+        if row_doi == file_doi:
+            return None
+        return (f"{source_path.name} would be stored as {src['path']}, the missing "
+                f"file of source {key}, but its DOI {file_doi} differs from that "
+                f"source's DOI {row_doi}. {advice}")
+    row_title = _norm_title(src.get("title"))
+    file_title = _norm_title(title or declared_title(source_path, text))
+    if row_title and file_title and row_title == file_title:
+        return None
+    sidecar = (root / src["path"]).with_suffix(".txt")
+    if text and sidecar != root / src["path"] and sidecar.is_file():
+        try:
+            if sidecar.read_text(encoding="utf-8", errors="replace") == text:
+                return None
+        except OSError:
+            pass
+    return (f"{source_path.name} would be stored as {src['path']}, the missing "
+            f"file of source {key}, but nothing shows it is that source (no "
+            f"matching DOI, title or text). {advice}")
+
+
 def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
                     content_hash: str) -> dict:
     """Put source_path back as the missing stored file of the existing row src.
@@ -1349,8 +1433,14 @@ def ingest_source(
     authors: list[str] | None = None,
     doi: str | None = None,
     bibtex: str | None = None,
+    restore: bool = False,
 ) -> dict:
     """Ingest a source file into Crucible.
+
+    A file stored under the name of an existing source whose file is
+    missing is restored into that source when its DOI, title or text
+    sidecar shows it is that source; otherwise a ValueError is raised,
+    unless restore=True says it is.
 
     Returns a dict with source_id, stored_path, extracted_text_path, cite_key, and metadata.
     """
@@ -1404,6 +1494,14 @@ def ingest_source(
     holder = held.get(_project_rel(root, first_dest))
     if (holder is not None and not first_dest.exists()
             and "content_hash" not in _source_metadata(holder)):
+        # Only the name matches, so the file is checked against the row
+        # before it inherits that source's key, title and bib entry: a
+        # different paper.pdf must not be filed as the old one.
+        if not restore:
+            problem = _restore_mismatch(root, holder, source_path, source_type,
+                                        title, doi)
+            if problem:
+                raise ValueError(problem)
         return _restore_source(root, db, holder, source_path, content_hash)
 
     # Everything that can fail (text extraction, DOI lookup, building the

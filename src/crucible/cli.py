@@ -574,12 +574,16 @@ def init(root):
 @click.option("--date", default=None, help="Source date (ISO format, default: today)")
 @click.option("--author", "-a", multiple=True, help="Author(s), can be repeated")
 @click.option("--doi", default=None, help="DOI for the source")
+@click.option("--restore", is_flag=True,
+              help="The file is the missing stored copy of the existing source "
+                   "with its name: restore it without checking its DOI or title")
 @click.option("--bibtex", default=None,
               help="Full BibTeX entry (overrides DOI lookup and auto-generation). "
                    "Pass a path with --bibtex @file.bib to read from a file.")
 @click.option("--filename", "-f", default=None,
               help="Filename for stdin input (default: derived from title or timestamp)")
-def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex, filename):
+def ingest(source, title, source_type, shareable, url, date, author, doi, restore,
+           bibtex, filename):
     """Ingest a source into Crucible.
 
     SOURCE is a file path, URL, glob pattern, or - for stdin.
@@ -637,7 +641,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
             root=root, db=db, source_path=path,
             title=title, source_type=source_type, shareable=shareable,
             url=url, date=date, authors=list(author) if author else None,
-            doi=doi, bibtex=bibtex,
+            doi=doi, bibtex=bibtex, restore=restore,
         )
         kwargs.update(overrides)
         try:
@@ -710,6 +714,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
                         root=root, db=db, source_path=p,
                         title=None, source_type=source_type, shareable=shareable,
                         url=None, date=date, authors=list(author) if author else None,
+                        restore=restore,
                     )
                     for warning in result.get("warnings", ()):
                         click.echo(f"  Warning: {p}: {warning}", err=True)
@@ -1300,7 +1305,8 @@ def sync():
         # Auto-register in global registry (ensures pre-registry crucibles get registered)
         registry_module.register_or_warn(root.name, str(root), _warn)
 
-        sources_added = reconcile_sources(root, db)
+        sources_added = reconcile_sources(
+            root, db, on_warning=lambda m: _warn(f"Warning: {m}"))
 
         stats = _sync_wiki_to_db(
             root, db,

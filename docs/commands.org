@@ -93,6 +93,7 @@ SOURCE is a file path, URL, glob pattern, or =-= for stdin.
 | =-a=, =--author TEXT= | Author(s), repeatable |
 | =--doi TEXT= | DOI for the source |
 | =--bibtex TEXT= | Full BibTeX entry, or =@file.bib= to read one from a file |
+| =--restore= | The file is the missing stored copy of the source with its name |
 | =-f=, =--filename TEXT= | Filename for stdin input |
 
 Examples:
@@ -127,6 +128,16 @@ source row's title, authors and date are read back from the entry, so
 rebuilding the database from =references.bib= gives the same row. A file
 whose content was already ingested is reported as a duplicate and not
 added again.
+
+On a fresh clone the stored copies under =sources/external/= are absent
+(they are gitignored), and their rows, rebuilt from =references.bib=, have
+no content hash. Ingesting the file again restores it into its existing
+source (same cite key, bib entry unchanged) when it is that source: its
+DOI matches the entry's, or, when either has no DOI, its title does, or
+its text matches a committed text sidecar. A different file that only
+shares the name is refused with an error, so it is not filed under
+another paper's key. If it really is that source (a retitled copy, say),
+pass =--restore=; otherwise rename the file before ingesting it.
 
 * Database Commands
 
@@ -163,6 +174,13 @@ When that name is already a key
 in =references.bib= (or of an ingested source), the file is keyed
 =<name>-<extension>= instead (then =<name>-<extension>-2=, ...), so it
 cannot take that key's article links from the file the entry names.
+
+An ingested source whose cite key is no longer in =references.bib= loses
+its row (or, for a file under =sources/notebooks/= or =sources/data/=,
+becomes a disk-scanned source), as on a rebuild. When =references.bib=
+has malformed entries (unbalanced braces, a missing key), the missing key
+may be one that failed to parse, so sync keeps those sources and warns;
+=crucible lint= lists the malformed entries.
 
 A source's type comes from the folder it is stored in. Shareable PDFs and
 web sources are stored in =sources/data/=: a =.pdf= there is a PDF, and an
