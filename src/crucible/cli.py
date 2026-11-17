@@ -600,8 +600,6 @@ def _source_key_index(sources: list[dict]) -> tuple[dict[str, int], list[dict]]:
     legacy_sources = []
     for src in sources:
         md = _source_metadata(src)
-        if not isinstance(md, dict):
-            md = {}
         cite_key = md.get("cite_key")
         if isinstance(cite_key, str) and cite_key:
             key_to_src[cite_key] = src["id"]
@@ -795,13 +793,9 @@ def _rebuild_db_from_wiki(root: Path, db: CrucibleDB) -> dict:
     call on a DB that's already populated. Also regenerates MANIFEST.md
     and wiki/index.org so GitHub-rendered landing pages stay current.
     """
-    from crucible.ingest import (
-        upsert_sources_from_bib,
-        upsert_sources_from_disk,
-    )
+    from crucible.ingest import reconcile_sources
 
-    sources_added = upsert_sources_from_bib(root, db)
-    sources_added += upsert_sources_from_disk(root, db)
+    sources_added = reconcile_sources(root, db)
     sync_stats = _sync_wiki_to_db(root, db)
     _write_manifest(root, db)
     _write_index(root, db)
@@ -819,10 +813,7 @@ def sync():
     picked up automatically. Run this after Claude writes or updates
     wiki articles.
     """
-    from crucible.ingest import (
-        upsert_sources_from_bib,
-        upsert_sources_from_disk,
-    )
+    from crucible.ingest import reconcile_sources
 
     root = get_root()
     db = get_db(root)
@@ -831,8 +822,7 @@ def sync():
         from crucible.registry import register as registry_register
         registry_register(root.name, str(root))
 
-        sources_added = upsert_sources_from_bib(root, db)
-        sources_added += upsert_sources_from_disk(root, db)
+        sources_added = reconcile_sources(root, db)
 
         stats = _sync_wiki_to_db(
             root, db,
@@ -1896,7 +1886,7 @@ def merge(source, dry_run, yes):
         target_db.close()
 
     # --- Phase 4: Sync ---
-    if not dry_run and articles_copied > 0:
+    if not dry_run and (articles_copied or plan.sources or plan.bib_entries):
         click.echo()
         ctx = click.get_current_context()
         ctx.invoke(sync)
@@ -2153,8 +2143,9 @@ def _plan_source_merge(
                 problems.append(
                     f"Cannot safely merge source with citation key '{cite_key}': "
                     "the target bibliography already has an entry with this key "
-                    "but no matching indexed source. Run `crucible sync` in the "
-                    "target or rename one of the keys."
+                    "but no matching indexed source. Give the target's entry a "
+                    "file field naming its source file and run `crucible sync` "
+                    "there, or rename one of the keys."
                 )
             continue
 
@@ -2598,6 +2589,12 @@ def lint(json_output):
 
     # 5. Articles missing required properties or referencing unknown sources
     source_index = _source_key_index(db.list_sources())
+    from crucible.ingest import parse_bib_file
+    bib_without_file = {
+        entry["cite_key"]
+        for entry in parse_bib_file(cdir(root) / "references.bib")
+        if not entry.get("file")
+    }
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
@@ -2621,10 +2618,16 @@ def lint(json_output):
         else:
             for key, source_ids in _resolve_source_keys(source_keys, source_index).items():
                 if not source_ids:
+                    message = f"Unresolved SOURCE_KEYS value '{key}' in {article['path']}"
+                    if key in bib_without_file:
+                        message += (
+                            f" (references.bib has '{key}' but no file field naming"
+                            " its stored file; add file = {.crucible/sources/...})"
+                        )
                     issues.append({
                         "type": "unresolved_source_key",
                         "severity": "warning",
-                        "message": f"Unresolved SOURCE_KEYS value '{key}' in {article['path']}",
+                        "message": message,
                         "path": article['path'],
                         "key": key,
                     })

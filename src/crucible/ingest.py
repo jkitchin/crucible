@@ -246,17 +246,20 @@ def _bib_value(value: str) -> str:
 
 def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
                        date: str | None, url: str | None,
-                       source_type: str, doi: str | None = None) -> str:
+                       source_type: str, doi: str | None = None,
+                       file: str | None = None) -> str:
     """Generate a minimal BibTeX entry string.
 
     Used as a fallback when no DOI lookup or user-provided bibtex is available.
-    Contains only the bibliographic fields we know — no crucible-internal metadata.
+    Contains only the bibliographic fields we know — no crucible-internal
+    metadata — plus the standard `file` field naming the stored copy, which
+    lets a fresh clone tie the entry back to its file.
     """
     year = (date or "")[:4] or ""
 
     entry_type = {
         "pdf": "article",
-        "web": "misc",
+        "web": "online",  # biblatex; lets a rebuild tell web from data
         "notebook": "misc",
         "data": "misc",
     }.get(source_type, "misc")
@@ -268,10 +271,15 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
         lines.append(f"  author = {{{author_str}}},")
     if year:
         lines.append(f"  year = {{{_bib_value(year)}}},")
+    if date and re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", date):
+        # biblatex's date field keeps the full date, which a rebuild restores
+        lines.append(f"  date = {{{date}}},")
     if doi:
         lines.append(f"  doi = {{{_bib_value(doi)}}},")
     if url:
         lines.append(f"  url = {{{_bib_value(url)}}},")
+    if file:
+        lines.append(f"  file = {{{file.replace('{', '').replace('}', '')}}},")
     lines.append("}")
     return "\n".join(lines)
 
@@ -282,6 +290,30 @@ _CITE_KEY_RE = re.compile(r"(@\w+\s*\{\s*)([^,\s]+)")
 def replace_cite_key(bibtex: str, new_key: str) -> str:
     """Replace the citation key of the first @entry in a bibtex string."""
     return _CITE_KEY_RE.sub(lambda m: m.group(1) + new_key, bibtex, count=1)
+
+
+_ENTRY_HEAD_RE = re.compile(r"@\w+\s*\{\s*[^,\s]+\s*,")
+
+
+def set_bib_field(bibtex: str, name: str, value: str) -> str:
+    """Set a field on the first @entry in a bibtex string, replacing any existing one."""
+    field_re = re.compile(
+        rf"\n?[ \t]*\b{re.escape(name)}\s*=\s*"
+        r"(?:\{(?:[^{}]|\{[^{}]*\})*\}|\"[^\"]*\")\s*,?",
+        re.IGNORECASE,
+    )
+    head = _ENTRY_HEAD_RE.search(bibtex)
+    if head is None:
+        return bibtex
+    body = field_re.sub("", bibtex[head.end():])
+    # A file path is written verbatim (only braces, which would unbalance the
+    # entry, are dropped): collapsing whitespace would name a different file.
+    if name.lower() == "file":
+        value = value.replace("{", "").replace("}", "")
+    else:
+        value = _bib_value(value)
+    line = f"\n  {name} = {{{value}}},"
+    return bibtex[:head.end()] + line + body
 
 
 _BIB_ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,(.*?)\n\}", re.DOTALL)
@@ -343,19 +375,41 @@ def _authors_from_bib(author_field: str) -> list[str]:
     return [a.strip() for a in re.split(r"\s+and\s+", author_field) if a.strip()]
 
 
-def _source_type_for_entry(entry_type: str, path: Path | None) -> str:
-    """Best-effort source_type for a bibtex entry."""
-    if path is not None:
-        t = detect_source_type(path)
-        if t != "other":
-            return t
+def source_type_for_path(rel_path: str, entry_type: str | None = None) -> str:
+    """The source_type of a stored source, from the directory ingest put it in.
+
+    destination_dir() files sources by type and shareability, so the
+    directory is the reliable record: a markdown notebook in
+    sources/notebooks/ is a notebook, not "web" as its extension suggests.
+    Shareable PDFs and web sources are also stored in sources/data/, so a
+    .pdf there is a pdf, and an entry of type @online (which ingest writes
+    for web sources) is web.
+    """
+    parts = Path(rel_path).parts
+    if len(parts) >= 3 and parts[0] == CRUCIBLE_DIR and parts[1] == "sources":
+        area = parts[2]
+        if area == "external" and len(parts) >= 4:
+            if parts[3] == "pdfs":
+                return "pdf"
+            if parts[3] == "web":
+                return "web"
+        if area == "notebooks":
+            return "notebook"
+        if area == "data":
+            # Shareable web sources and PDFs are stored here too.
+            if entry_type == "online":
+                return "web"
+            return "pdf" if Path(rel_path).suffix.lower() == ".pdf" else "data"
+    detected = detect_source_type(Path(rel_path))
+    if detected != "other":
+        return detected
     return {
         "article": "pdf",
         "inproceedings": "pdf",
         "book": "pdf",
         "phdthesis": "pdf",
         "mastersthesis": "pdf",
-    }.get(entry_type, "other")
+    }.get(entry_type or "", "other")
 
 
 def upsert_sources_from_disk(root: Path, db) -> int:
@@ -374,11 +428,11 @@ def upsert_sources_from_disk(root: Path, db) -> int:
     inserted = 0
 
     subdirs = [
-        (root / CRUCIBLE_DIR / "sources" / "notebooks", "notebook"),
-        (root / CRUCIBLE_DIR / "sources" / "data", "data"),
+        root / CRUCIBLE_DIR / "sources" / "notebooks",
+        root / CRUCIBLE_DIR / "sources" / "data",
     ]
 
-    for subdir, default_type in subdirs:
+    for subdir in subdirs:
         if not subdir.is_dir():
             continue
         for path in sorted(subdir.rglob("*")):
@@ -410,8 +464,7 @@ def upsert_sources_from_disk(root: Path, db) -> int:
                 except Exception:
                     pass
 
-            detected = detect_source_type(path)
-            source_type = detected if detected != "other" else default_type
+            source_type = source_type_for_path(rel_path)
 
             metadata = {"cite_key": cite_key}
 
@@ -441,87 +494,170 @@ def upsert_sources_from_disk(root: Path, db) -> int:
     return inserted
 
 
-def upsert_sources_from_bib(root: Path, db) -> int:
-    """Create sources rows for every entry in .crucible/references.bib.
+PLACEHOLDER_PREFIX = f"{CRUCIBLE_DIR}/bib/"
 
-    Safe to call repeatedly: entries whose cite_key already exists in
-    sources.metadata are skipped. Used by auto-rebuild (no DB) and by
-    `crucible sync` so bib edits are picked up without re-ingesting.
 
-    Returns the number of new sources inserted.
+def _bib_file_path(root: Path, file_field: str) -> str:
+    """A bib entry's file field as a path relative to the project root.
+
+    _resolve_bib_file handles a path that a BibTeX formatter wrapped across
+    lines.
     """
-    import json as _json
+    abs_path = _resolve_bib_file(root, file_field)
+    try:
+        return str(abs_path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return str(abs_path)
 
+
+def _from_ingest(src: dict) -> bool:
+    """Whether a source row was created by ingest (or copied by merge).
+
+    Those rows carry a content hash and the metadata the user gave; rows
+    rebuilt from references.bib or the disk scan do not.
+    """
+    return "content_hash" in _source_metadata(src)
+
+
+def _knows_its_file(root: Path, src: dict, bib_keys: set[str]) -> bool:
+    """Whether a row can supply the file for its cite key's bib entry.
+
+    Rows from ingest qualify. So do rows ingested before ingest stored a
+    content hash (2026-06): any row whose file exists and whose cite key has
+    a bib entry, unless it is a placeholder or came from the disk scan.
+    """
+    if _from_ingest(src):
+        return True
+    return (
+        not src["path"].startswith(PLACEHOLDER_PREFIX)
+        and not _from_disk_scan(src)
+        and _source_metadata(src).get("cite_key") in bib_keys
+        and (root / src["path"]).is_file()
+    )
+
+
+def _from_disk_scan(src: dict) -> bool:
+    """Whether a source row came from upsert_sources_from_disk (keyed by file stem)."""
+    return (
+        not _from_ingest(src)
+        and _source_metadata(src).get("cite_key") == Path(src["path"]).stem
+        and src["path"].startswith((
+            f"{CRUCIBLE_DIR}/sources/notebooks/", f"{CRUCIBLE_DIR}/sources/data/",
+        ))
+    )
+
+
+def _fields_from_bib(entry: dict, rel_path: str) -> dict:
+    metadata: dict = {"cite_key": entry["cite_key"]}
+    if entry.get("doi"):
+        metadata["doi"] = entry["doi"]
+    return {
+        "path": rel_path,
+        "title": entry.get("title") or entry["cite_key"],
+        "source_type": source_type_for_path(rel_path, entry["entry_type"]),
+        "shareable": not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/"),
+        "url": entry.get("url"),
+        "authors": _authors_from_bib(entry.get("author", "")),
+        "date": entry.get("date") or entry.get("year") or None,
+        "metadata": metadata,
+    }
+
+
+def reconcile_sources(root: Path, db) -> int:
+    """Make the sources table agree with references.bib and the files on disk.
+
+    The database must be regenerable from committed files (#6). A bib
+    entry's `file` field ties its cite key to the stored file, so:
+
+    1. Rows created by ingest are authoritative. Their paths are written
+       into the `file` field of entries that lack one or have a stale one,
+       which upgrades projects ingested before ingest recorded `file`. Rows
+       ingested before content hashes existed fill in a missing field too
+       (see _knows_its_file).
+    2. Each entry with a `file` field owns the row at that path: a row the
+       disk scan created for the file, or a placeholder or stale row under
+       its cite key, takes the entry's metadata (duplicates are merged, and
+       their article links moved), or a row is inserted.
+    3. An entry without a `file` field gets no row. A placeholder path would
+       capture the article links; instead `crucible lint` reports the key.
+       Placeholder rows from earlier versions are removed.
+    4. Files in sources/notebooks/ and sources/data/ that no entry claims
+       get a row from the disk scan.
+
+    Returns the number of source rows inserted.
+    """
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     entries = parse_bib_file(bib_path)
-    if not entries:
-        return 0
-
-    existing_cite_keys: set[str] = set()
-    for src in db.list_sources():
-        raw = src.get("metadata") or "{}"
-        try:
-            meta = _json.loads(raw) if isinstance(raw, str) else (raw or {})
-        except (ValueError, TypeError):
-            meta = {}
-        key = meta.get("cite_key")
-        if key:
-            existing_cite_keys.add(key)
-
-    existing_paths: set[str] = {src["path"] for src in db.list_sources()}
-
+    bib_keys = {entry["cite_key"] for entry in entries}
     inserted = 0
-    for entry in entries:
-        cite_key = entry["cite_key"]
-        if cite_key in existing_cite_keys:
-            continue
 
-        file_field = entry.get("file")
-        rel_path: str | None = None
-        abs_path: Path | None = None
-        if file_field:
-            candidate = _resolve_bib_file(root, file_field)
-            if not Path(file_field).is_absolute():
-                abs_path = candidate.resolve()
+    with db.conn.transaction():
+        sources = db.list_sources()
+        by_path = {src["path"]: src for src in sources}
+        by_key: dict[str, dict] = {}
+        for src in sources:
+            key = _source_metadata(src).get("cite_key")
+            if isinstance(key, str) and (key not in by_key or _from_ingest(src)):
+                by_key[key] = src
+
+        # 1. Record ingested paths in the bibliography: fill in a missing
+        # file field from any row that knows its file, and correct a stale
+        # one (e.g. a source merge renamed) only from ingest's own rows, so a
+        # user's edit to an entry is not undone by a row rebuilt from it.
+        file_updates = {}
+        for entry in entries:
+            src = by_key.get(entry["cite_key"])
+            if src is None:
+                continue
+            missing = not entry.get("file")
+            stale = (not missing and _from_ingest(src)
+                     and _bib_file_path(root, entry["file"]) != src["path"])
+            if stale or (missing and _knows_its_file(root, src, bib_keys)):
+                file_updates[entry["cite_key"]] = src["path"]
+                entry["file"] = src["path"]
+        set_bib_file_fields(root, file_updates)
+
+        # 2. Entries with a file own the row for it.
+        for entry in entries:
+            if not entry.get("file"):
+                continue
+            key = entry["cite_key"]
+            rel_path = _bib_file_path(root, entry["file"])
+            row_key = by_key.get(key)
+            row_path = by_path.get(rel_path)
+            if row_key is not None and row_key is not row_path and _from_disk_scan(row_key):
+                row_key = None  # a different file whose name matches this key
+            if row_key is not None and _from_ingest(row_key):
+                continue  # step 1 made the entry's file match this row
+            if row_path is not None and row_path is not row_key:
+                other = _source_metadata(row_path).get("cite_key")
+                if _from_ingest(row_path) or (other != key and other in bib_keys):
+                    continue  # the file belongs to another source's entry
+            fields = _fields_from_bib(entry, rel_path)
+            if row_path is not None:
+                if row_key is not None and row_key is not row_path:
+                    db.merge_source_into(row_key["id"], row_path["id"])
+                    by_path.pop(row_key["path"], None)
+                db.update_source(row_path["id"], **fields)
+                target_id = row_path["id"]
+            elif row_key is not None:
+                by_path.pop(row_key["path"], None)
+                db.update_source(row_key["id"], **fields)
+                target_id = row_key["id"]
             else:
-                abs_path = candidate
-            try:
-                rel_path = str(abs_path.relative_to(root.resolve()))
-            except ValueError:
-                rel_path = str(abs_path)
+                target_id = db.add_source(**fields)
+                inserted += 1
+            updated = db.get_source(target_id)
+            by_path[rel_path] = updated
+            by_key[key] = updated
 
-        if rel_path is None:
-            rel_path = f"{CRUCIBLE_DIR}/bib/{cite_key}"
+        # 3. Placeholder rows from earlier versions never point at a file.
+        for src in list(by_path.values()):
+            if src["path"].startswith(PLACEHOLDER_PREFIX):
+                db.delete_source(src["id"])
 
-        if rel_path in existing_paths:
-            continue
-
-        source_type = _source_type_for_entry(entry["entry_type"], abs_path)
-        shareable = not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/")
-        authors = _authors_from_bib(entry.get("author", ""))
-        date = entry.get("year") or None
-
-        metadata: dict = {"cite_key": cite_key}
-        if entry.get("doi"):
-            metadata["doi"] = entry["doi"]
-
-        try:
-            db.add_source(
-                path=rel_path,
-                title=entry.get("title", cite_key),
-                source_type=source_type,
-                shareable=shareable,
-                url=entry.get("url"),
-                authors=authors,
-                date=date,
-                metadata=metadata,
-            )
-            existing_cite_keys.add(cite_key)
-            existing_paths.add(rel_path)
-            inserted += 1
-        except Exception:
-            continue
-
+    # 4. Committed files no entry claims.
+    inserted += upsert_sources_from_disk(root, db)
     return inserted
 
 
@@ -605,6 +741,26 @@ def append_bib_entry(root: Path, entry: str, cite_key: str):
         atomic_write_text(bib_path, new_content)
 
 
+def set_bib_file_fields(root: Path, paths: dict[str, str]) -> None:
+    """Set the `file` field of existing entries in references.bib (cite_key -> path)."""
+    if not paths:
+        return
+    bib_path = root / CRUCIBLE_DIR / "references.bib"
+    lock_path = bib_path.with_suffix(".bib.lock")
+    with FileLock(lock_path, timeout=10):
+        if not bib_path.exists():
+            return
+        text = bib_path.read_text(encoding="utf-8")
+
+        def repl(m: re.Match) -> str:
+            path = paths.get(m.group(2))
+            return set_bib_field(m.group(0), "file", path) if path else m.group(0)
+
+        new_text = _BIB_ENTRY_RE.sub(repl, text)
+        if new_text != text:
+            atomic_write_text(bib_path, new_text)
+
+
 def file_sha256(path: Path) -> str:
     """Return the SHA-256 hex digest of a file's bytes, read in chunks."""
     h = hashlib.sha256()
@@ -615,12 +771,17 @@ def file_sha256(path: Path) -> str:
 
 
 def _source_metadata(src: dict) -> dict:
-    """Parse a source row's metadata JSON into a dict (empty on any error)."""
+    """Parse a source row's metadata JSON into a dict (empty on any error).
+
+    Malformed metadata that parses to something other than an object, such
+    as a list or null, also gives an empty dict.
+    """
     raw = src.get("metadata") or "{}"
     try:
-        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+        md = json.loads(raw) if isinstance(raw, str) else raw
     except (ValueError, TypeError):
         return {}
+    return md if isinstance(md, dict) else {}
 
 
 def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str) -> dict | None:
@@ -774,6 +935,8 @@ def ingest_source(
         bib_entry = generate_bib_entry(
             cite_key, title, authors, date, url, source_type, doi=doi,
         )
+    # Record the stored copy, so a fresh clone can tie the entry to its file.
+    bib_entry = set_bib_field(bib_entry, "file", rel_path)
     append_bib_entry(root, bib_entry, cite_key)
 
     # Register in database (store cite_key and content hash in metadata)

@@ -409,6 +409,40 @@ class CrucibleDB:
     def list_sources(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM sources ORDER BY ingested_at DESC")]
 
+    _SOURCE_COLUMNS = ("path", "title", "source_type", "shareable", "url",
+                       "authors", "date", "metadata")
+
+    def update_source(self, source_id: int, **fields):
+        """Update a source row's columns; authors and metadata are JSON-encoded."""
+        unknown = set(fields) - set(self._SOURCE_COLUMNS)
+        if unknown:
+            raise ValueError(f"Unknown source columns: {sorted(unknown)}")
+        if not fields:
+            return
+        values = []
+        for name, value in fields.items():
+            if name in ("authors", "metadata"):
+                value = json.dumps(value or ([] if name == "authors" else {}))
+            elif name == "shareable":
+                value = int(value)
+            values.append(value)
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        self.conn.execute(
+            f"UPDATE sources SET {assignments} WHERE id = ?", (*values, source_id)
+        )
+        self.conn.commit()
+
+    def merge_source_into(self, duplicate_id: int, keep_id: int):
+        """Move a duplicate source's article links onto another source, then delete it."""
+        self.conn.execute(
+            """INSERT OR IGNORE INTO article_sources (article_id, source_id)
+               SELECT article_id, ? FROM article_sources WHERE source_id = ?""",
+            (keep_id, duplicate_id),
+        )
+        self.conn.execute("DELETE FROM article_sources WHERE source_id = ?", (duplicate_id,))
+        self.conn.execute("DELETE FROM sources WHERE id = ?", (duplicate_id,))
+        self.conn.commit()
+
     def delete_source(self, source_id: int):
         self.conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
         self.conn.commit()

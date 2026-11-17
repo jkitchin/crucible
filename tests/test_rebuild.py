@@ -21,6 +21,10 @@ SOURCES = [
     ("run.csv", "a,b\n1,2\n",
      ["--shareable", "--type", "data", "--title", "Run data", "--author", "Roe",
       "--date", "2025-01-01"]),
+    # A shareable web source is stored in sources/data/ next to data files.
+    ("page.html", "<p>A web page.</p>\n",
+     ["--shareable", "--type", "web", "--title", "A page", "--author", "Woe",
+      "--date", "2023-01-01", "--url", "https://example.com/page"]),
     ("paper.pdf", "%PDF-1.4 synthetic\n",
      ["--type", "pdf", "--title", "A Paper", "--author", "Poe", "--date", "2024-01-01"]),
 ]
@@ -63,10 +67,9 @@ QUERIES = {
         SELECT a.path AS from_path, b.path AS to_path FROM article_links x
         JOIN articles a ON a.id = x.from_id JOIN articles b ON b.id = x.to_id
     """,
-    # The date is compared by year: references.bib only records the year.
     "sources": """
-        SELECT path, source_type, title, authors, substr(date, 1, 4) AS year,
-               shareable, json_extract(metadata, '$.cite_key') AS cite_key
+        SELECT path, source_type, title, authors, date, url, shareable,
+               json_extract(metadata, '$.cite_key') AS cite_key
         FROM sources
     """,
     # By path: after #6's rebuild the phantom rows carry the right cite keys,
@@ -141,12 +144,6 @@ def test_rebuild_reproduces_wiki_tables(rebuilt, table):
     assert after[table] == before[table]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#6: rebuild duplicates sources, links articles to phantom "
-    ".crucible/bib/ paths, and loses titles, types and the shareable flag",
-)
 @pytest.mark.parametrize("table", ["sources", "provenance"])
 def test_rebuild_reproduces_sources_and_provenance(rebuilt, table):
     before, after = rebuilt

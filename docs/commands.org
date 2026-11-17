@@ -93,9 +93,25 @@ Sync the database from wiki org files.
 crucible sync
 #+END_SRC
 
-Two-pass process:
+First reconciles the sources table with =references.bib= and the files
+under =sources/=, then a two-pass process:
 1. Register/update all articles and concepts from org file metadata
 2. Process inter-article links, source links, and derivation chains
+
+Sources are tied to bibliography entries by the entry's standard =file=
+field, which =crucible ingest= writes with the stored file's path. An
+entry with a =file= field gets one source row for that file, keyed by its
+cite key, so a fresh clone rebuilds the same sources ingest created. An
+entry without one gets no source row, and =crucible lint= reports any
+=SOURCE_KEYS= value that names it. Sync fills in missing or stale =file=
+fields from sources ingested earlier, so running it once on a machine that
+has the database upgrades an older =references.bib=. Files under
+=sources/notebooks/= and =sources/data/= that no entry names get a source
+row keyed by file name.
+
+A source's type comes from the folder it is stored in. Shareable PDFs and
+web sources are stored in =sources/data/=: a =.pdf= there is a PDF, and an
+=@online= entry (what ingest writes for web sources) is a web source.
 
 Parses: =#+TITLE=, =#+FILETAGS=, =:ARTICLE_TYPE:=, =:SOURCE_KEYS:=,
 =:DERIVED_FROM:=, =[[file:...]]= links, and full text for FTS.
