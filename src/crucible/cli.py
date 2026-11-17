@@ -2244,7 +2244,9 @@ def delete(path, yes, delete_file):
         click.echo(f"  Type: {article['article_type']}, Status: {article['status']}")
         if not yes:
             click.confirm("Delete this article?", abort=True)
-        # The row first: if that fails, the file is still there.
+        # The row first: if that fails, the file is still there. If the
+        # unlink below fails instead, the next sync re-adds the article from
+        # its file, which is harmless.
         try:
             db.delete_article(article["id"])
         finally:
@@ -3492,7 +3494,7 @@ def _cdir_relative(path: Path, target_cdir: Path) -> tuple[str | None, bool]:
 
 def _map_article_paths(
     content: str, final_path: Path, target_cdir: Path, mapper,
-    incoming, canonical: bool = False,
+    incoming,
 ) -> str:
     """Apply `mapper` to the paths an article's text names.
 
@@ -3506,10 +3508,6 @@ def _map_article_paths(
     leading wiki/). `incoming` holds the .crucible/-relative paths of the
     articles that will be there (as the source names them), which decides
     between the two.
-
-    With canonical=True every mapped path is replaced by mapper's result
-    itself, however it was spelled: the text is then only for comparing
-    two articles while ignoring how their links are written.
     """
     final_dir = final_path.parent
 
@@ -3531,16 +3529,13 @@ def _map_article_paths(
         target = Path(os.path.expanduser(link_path))
         rel, lexical = _cdir_relative(final_dir / target, target_cdir)
         new_rel = mapper(rel) if rel is not None else None
-        if new_rel is None or (new_rel == rel and not canonical):
+        if new_rel is None or new_rel == rel:
             return match.group(0)
-        if canonical:
-            new_link = new_rel
-        else:
-            new_link = respell(new_rel, lexical, target.is_absolute(), final_dir)
-            bare_link = not match.group(0).startswith("[[file:")
-            if (bare_link and not target.is_absolute()
-                    and not new_link.startswith(("./", "../"))):
-                new_link = "./" + new_link  # keep it a link org reads
+        new_link = respell(new_rel, lexical, target.is_absolute(), final_dir)
+        bare_link = not match.group(0).startswith("[[file:")
+        if (bare_link and not target.is_absolute()
+                and not new_link.startswith(("./", "../"))):
+            new_link = "./" + new_link  # keep it a link org reads
         start = match.start(1) - match.start(0)
         end = match.end(1) - match.start(0)
         whole = match.group(0)
@@ -3557,10 +3552,8 @@ def _map_article_paths(
             if known(wiki_rel) or rel is None:
                 rel, lexical, wiki_style = wiki_rel, wiki_lexical, True
         new_rel = mapper(rel) if rel is not None else None
-        if new_rel is None or (new_rel == rel and not canonical):
+        if new_rel is None or new_rel == rel:
             return ref
-        if canonical:
-            return new_rel
         if not wiki_style:
             return respell(new_rel, lexical, target.is_absolute(), final_dir)
         new_ref = respell(new_rel, lexical, False, target_cdir / "wiki")

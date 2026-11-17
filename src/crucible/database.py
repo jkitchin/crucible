@@ -852,25 +852,6 @@ class CrucibleDB:
             ORDER BY a.title
         """, tuple(ids))]
 
-    def _concept_ids_by_key(self) -> dict[str, list[int]]:
-        """Concept ids grouped by _concept_key, cached until concepts change.
-
-        Callers such as suggest look up many concepts in a row, and
-        normalising every name on each lookup made that quadratic. This
-        connection's own concept writes clear the cache, and PRAGMA
-        data_version changes whenever another connection commits.
-        """
-        version = self.conn.execute("PRAGMA data_version").fetchone()
-        stamp = tuple(version.values()) if isinstance(version, dict) else tuple(version)
-        cached = getattr(self, "_concept_key_cache", None)
-        if cached is None or cached[0] != stamp:
-            by_key: dict[str, list[int]] = {}
-            for r in self.conn.execute("SELECT id, name FROM concepts"):
-                by_key.setdefault(_concept_key(r["name"]), []).append(r["id"])
-            cached = (stamp, by_key)
-            self._concept_key_cache = cached
-        return cached[1]
-
     def orphans(self) -> list[dict]:
         """Articles with no incoming links."""
         return [dict(r) for r in self.conn.execute("""
@@ -909,15 +890,16 @@ class CrucibleDB:
         """)]
         # Nodes are named by article id and labelled with the title, so
         # two articles that share a title stay two nodes.
-        ids = sorted({r["from_id"] for r in links} | {r["to_id"] for r in links})
-        if ids:
-            marks = ",".join("?" * len(ids))
-            for row in self.conn.execute(
-                f"SELECT id, title, path FROM articles WHERE id IN ({marks})"
-                " ORDER BY path", tuple(ids),
-            ):
-                lines.append(f'  a{row["id"]} [label={quoted(row["title"])},'
-                             f' tooltip={quoted(row["path"])}];')
+        # A subquery rather than one placeholder per id, which a large wiki
+        # could push past SQLite's variable limit.
+        for row in self.conn.execute("""
+            SELECT id, title, path FROM articles
+            WHERE id IN (SELECT from_id FROM article_links
+                         UNION SELECT to_id FROM article_links)
+            ORDER BY path
+        """):
+            lines.append(f'  a{row["id"]} [label={quoted(row["title"])},'
+                         f' tooltip={quoted(row["path"])}];')
         for r in links:
             lines.append(f'  a{r["from_id"]} -> a{r["to_id"]};')
         lines.append("}")

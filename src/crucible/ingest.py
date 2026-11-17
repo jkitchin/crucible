@@ -997,10 +997,12 @@ def _trim_doi(doi: str) -> str:
     trailing punctuation and unclosed opening brackets.
 
     The bracket that closes text around the DOI (``(doi 10.1/x)``,
-    ``[10.1/x](url)``) has no partner inside it. A closing tag
-    (``<doi>10.1/x</doi>``) ends the DOI too.
+    ``[10.1/x](url)``) has no partner inside it. An HTML or XML tag
+    (``</doi>``, ``<br>``, ``<br/>``) ends the DOI too: a ``<`` followed by
+    a letter or ``/``. In a SICI DOI (``...35:4<513::AID-JBM12>3.0.CO;2-R``)
+    the ``<`` is always followed by a digit.
     """
-    doi = doi.split("</", 1)[0]
+    doi = re.split(r"<(?=[A-Za-z/])", doi, maxsplit=1)[0]
     depth = {opener: 0 for opener in _DOI_PAIRS.values()}
     for i, c in enumerate(doi):
         if c in depth:

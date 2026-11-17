@@ -322,3 +322,42 @@ def test_concept_articles_caches_and_sees_writes(tmp_path):
 def test_browse_module_uses_orgparse_link_pattern():
     from crucible.orgparse import FILE_LINK_RE
     assert browse._FILE_LINK_RE is FILE_LINK_RE
+
+
+# -- review of #41: one concept cache, cleared by this connection's writes --
+
+def test_concept_cache_is_defined_once_and_follows_own_writes(tmp_path):
+    import inspect
+
+    import crucible.database as dbmod
+    source = inspect.getsource(dbmod.CrucibleDB)
+    assert source.count("def _concept_ids_by_key") == 1
+    db = CrucibleDB(tmp_path / "c.db")
+    db.initialize()
+    try:
+        aid = db.add_article(path="a.org", title="A", article_type="concept")
+        cid = db.add_concept("activation_energy")
+        db.link_article_concept(aid, cid)
+        assert [a["title"] for a in db.concept_articles("activation energy")] == ["A"]
+        # Written on this connection without going through add_concept.
+        db.conn.execute("INSERT INTO concepts (name) VALUES ('rate law')")
+        new = db.conn.execute("SELECT id FROM concepts WHERE name = 'rate law'").fetchone()["id"]
+        db.link_article_concept(aid, new)
+        assert [a["title"] for a in db.concept_articles("rate-law")] == ["A"]
+    finally:
+        db.close()
+
+
+def test_graph_dot_lists_only_linked_articles(tmp_path):
+    db = CrucibleDB(tmp_path / "g.db")
+    db.initialize()
+    try:
+        a = db.add_article(path="a.org", title="A", article_type="concept")
+        b = db.add_article(path="b.org", title="B", article_type="concept")
+        db.add_article(path="c.org", title="Lonely", article_type="concept")
+        db.add_article_link(a, b)
+        dot = db.graph_dot()
+        assert f"a{a} -> a{b};" in dot
+        assert "Lonely" not in dot
+    finally:
+        db.close()

@@ -279,3 +279,17 @@ def test_set_bib_field_keeps_balanced_braces():
 ])
 def test_doi_extraction_keeps_balanced_brackets(text, doi):
     assert ingest_module.extract_doi_from_text(text) == doi
+
+
+# -- review of #41: an HTML tag after a DOI is not part of it --------------
+
+@pytest.mark.parametrize("text, doi", [
+    ("doi: 10.1021/acs.x123<br>next", "10.1021/acs.x123"),
+    ("https://doi.org/10.1021/abc<br/>", "10.1021/abc"),
+    ("<p>10.1021/abc</p>", "10.1021/abc"),
+    ("10.1002/(SICI)1097-4636(199706)35:4<513::AID-JBM12>3.0.CO;2-R",
+     "10.1002/(SICI)1097-4636(199706)35:4<513::AID-JBM12>3.0.CO;2-R"),
+])
+def test_doi_stops_at_an_html_tag(text, doi):
+    from crucible.ingest import extract_doi_from_text
+    assert extract_doi_from_text(text) == doi
