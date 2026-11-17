@@ -2,6 +2,9 @@
 #+AUTHOR: John Kitchin
 #+DATE: [2026-04-03 Fri]
 
+[[https://pypi.org/project/crucible-llm/][https://img.shields.io/pypi/v/crucible-llm.svg]]
+[[https://github.com/jkitchin/crucible/actions/workflows/tests.yml][https://github.com/jkitchin/crucible/actions/workflows/tests.yml/badge.svg]]
+
 [[./crucible.png]]
 
 * Overview
