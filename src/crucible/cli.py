@@ -652,8 +652,8 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         "added": 0,
         "updated": 0,
         "removed": 0,
-        "links_added": 0,
-        "concepts_added": 0,
+        "article_links": 0,
+        "concept_links": 0,
         "skipped": 0,
         "files": 0,
     }
@@ -726,7 +726,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                 if tag.lower() not in type_tags:
                     concept_id = db.add_concept(tag.lower())
                     db.link_article_concept(article_id, concept_id)
-                    stats["concepts_added"] += 1
+                    stats["concept_links"] += 1
 
             parsed[org_path] = (article_id, meta)
 
@@ -755,7 +755,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     target_article = db.get_article_by_path(target_rel)
                     if target_article:
                         db.add_article_link(article_id, target_article["id"])
-                        stats["links_added"] += 1
+                        stats["article_links"] += 1
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
             if source_keys:
@@ -847,8 +847,8 @@ def sync():
     msg = (
         f"Sync complete: {stats['added']} added, {stats['updated']} updated, "
         f"{stats['removed']} removed, "
-        f"{stats['concepts_added']} concept links, "
-        f"{stats['links_added']} article links"
+        f"{stats['concept_links']} concept links, "
+        f"{stats['article_links']} article links"
     )
     if sources_added:
         msg += f", {sources_added} sources from bib"

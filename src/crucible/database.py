@@ -544,10 +544,17 @@ class CrucibleDB:
         self.conn.commit()
 
     def prune_unused_concepts(self):
-        """Delete concepts that no article is tagged with."""
+        """Delete concepts that no article is tagged with.
+
+        Concepts are treated as disposable: they hold nothing but a name
+        derived from FILETAGS. If curated data (e.g. aliases) is ever stored
+        on a concept, this would delete it and must be revisited.
+        """
+        # NOT EXISTS, not NOT IN: a single NULL concept_id would make
+        # NOT IN match nothing and silently skip the prune.
         self.conn.execute(
-            "DELETE FROM concepts WHERE id NOT IN "
-            "(SELECT concept_id FROM article_concepts)"
+            "DELETE FROM concepts WHERE NOT EXISTS ("
+            "SELECT 1 FROM article_concepts ac WHERE ac.concept_id = concepts.id)"
         )
         self.conn.commit()
 

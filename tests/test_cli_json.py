@@ -651,3 +651,22 @@ def test_incremental_sync_matches_a_fresh_rebuild(project, tmp_path):
     finally:
         synced.close()
         fresh.close()
+
+
+def test_concept_prune_survives_a_null_concept_id(project):
+    """A NULL concept_id must not stop unused concepts being pruned
+    (`id NOT IN (... NULL ...)` matches no rows)."""
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        article_id = db.get_article_by_path(CONCEPT_PATH)["id"]
+        db.conn.execute(
+            "INSERT INTO article_concepts (article_id, concept_id) VALUES (?, NULL)",
+            (article_id,),
+        )
+        db.add_concept("unused")
+        db.prune_unused_concepts()
+        names = {c["name"] for c in db.list_concepts()}
+    finally:
+        db.close()
+    assert "unused" not in names
+    assert "kinetics" in names
