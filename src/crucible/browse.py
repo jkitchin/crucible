@@ -75,8 +75,9 @@ _FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNOREC
 _KEYWORD_RE = re.compile(r"^#\+\w+:.*$", re.MULTILINE)
 # Any drawer (:PROPERTIES:, :LOGBOOK:, ...) up to its :END: line. Like org,
 # a drawer cannot span a heading, so a stray ":note:" line followed later by
-# some other drawer's :END: does not swallow the prose between them.
-_DRAWER_RE = re.compile(
+# some other drawer's :END: does not swallow the prose between them. Shared
+# with embeddings.embedding_text.
+DRAWER_RE = _DRAWER_RE = re.compile(
     r"^[ \t]*:(?!END:)([A-Za-z][\w-]*):[ \t]*\n"
     r"((?:(?![ \t]*:END:[ \t]*$)(?!\*+[ \t]).*\n)*?)"
     r"[ \t]*:END:[ \t]*$",
@@ -98,7 +99,15 @@ _QUOTE_BLOCK_RE = re.compile(
     r"^[ \t]*#\+BEGIN_QUOTE[^\n]*\n(.*?)^[ \t]*#\+END_QUOTE[ \t]*$",
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
-_HEADING_RE = re.compile(r"^(\*{1,4})\s+(.+)$", re.MULTILINE)
+# A heading: stars at column 0, its title and any trailing :tag1:tag2: list.
+_HEADING_RE = re.compile(
+    r"^(\*+)[ \t]+(.+?)(?:[ \t]+(:[\w@#%:]+:))?[ \t]*$", re.MULTILINE)
+# "# text" (or a lone "#") is an org comment line; #+KEYWORD lines are not.
+_COMMENT_LINE_RE = re.compile(r"^[ \t]*#(?:[ \t].*)?$", re.MULTILINE)
+_COMMENT_BLOCK_RE = re.compile(
+    r"^[ \t]*#\+BEGIN_COMMENT\b.*?^[ \t]*#\+END_COMMENT[ \t]*$\n?",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
 _TABLE_BLOCK_RE = re.compile(r"((?:^[ \t]*\|.*$\n?)+)", re.MULTILINE)
 
 # Inline patterns
@@ -121,16 +130,47 @@ _EMPH_PRE = r"(?<![^\s\-('\"{\x00\x01])"
 _EMPH_POST = r"(?![^\s\-.,:!?;'\")}\[\x00\x01])"
 _BOLD_RE = re.compile(_EMPH_PRE + r"\*([^\s*](?:.*?[^\s*])?)\*" + _EMPH_POST)
 _ITALIC_RE = re.compile(_EMPH_PRE + r"/([^\s/](?:.*?[^\s/])?)/" + _EMPH_POST)
-_CODE_RE = re.compile(r"(?<![a-zA-Z0-9])~([^\s~](?:.*?[^\s~])?)~(?![a-zA-Z0-9])")
-_VERBATIM_RE = re.compile(r"(?<![a-zA-Z0-9])=([^\s=](?:.*?[^\s=])?)=(?![a-zA-Z0-9])")
+# Code and verbatim follow the same boundary rules as emphasis, so the ~ in
+# a URL such as https://example.org/~user does not open a code span.
+_CODE_RE = re.compile(_EMPH_PRE + r"~([^\s~](?:.*?[^\s~])?)~" + _EMPH_POST)
+_VERBATIM_RE = re.compile(_EMPH_PRE + r"=([^\s=](?:.*?[^\s=])?)=" + _EMPH_POST)
 _LATEX_DISPLAY_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 _LATEX_INLINE_RE = re.compile(r"(?<![\\$])\$([^\s$][^$\n]*?[^\s$])\$(?!\$)|(?<![\\$])\$([^\s$])\$(?!\$)")
+
+# Placeholders: \x01I<n>\x01 holds an inline HTML fragment, \x00BLOCK<n>\x00
+# a block. A held fragment may itself contain earlier placeholders (a block
+# inside a quote, a link inside display math), so they are restored
+# recursively rather than in creation order.
+_INLINE_PH_RE = re.compile(r"\x01I\d+\x01")
+_BLOCK_PH_RE = re.compile(r"\x00BLOCK\d+\x00")
+
+
+def _restore(text: str, table: dict[str, str], pattern: re.Pattern) -> str:
+    """Replace the placeholders of `pattern` in text by their values in
+    table, including placeholders nested in those values. Unknown keys are
+    dropped, so no placeholder reaches the output."""
+    def repl(m: re.Match) -> str:
+        value = table.get(m.group(0))
+        return "" if value is None else pattern.sub(repl, value)
+    return pattern.sub(repl, text)
+
+
+# Link targets the server serves as images and the renderer shows inline.
+IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+}
 
 
 def _rewrite_file_link(match: re.Match, current_path: str) -> str:
     """Rewrite [[file:...][text]] to a working HTML link."""
     target = match.group(1).strip()
-    display = match.group(2) or target.rsplit("/", 1)[-1].replace(".org", "")
+    description = match.group(2)
+    display = description or target.rsplit("/", 1)[-1].replace(".org", "")
     display = html.escape(display)
     # Resolve relative to current file's directory
     current_dir = PurePosixPath(current_path).parent
@@ -143,7 +183,11 @@ def _rewrite_file_link(match: re.Match, current_path: str) -> str:
                 parts.pop()
         elif part and part != ".":
             parts.append(part)
-    return f'<a href="{_href("/".join(parts))}">{display}</a>'
+    href = _href("/".join(parts))
+    # [[file:fig.png]] with no description is an inline image, as in org.
+    if not description and PurePosixPath(target).suffix.lower() in IMAGE_TYPES:
+        return f'<img src="{href}" alt="{display}">'
+    return f'<a href="{href}">{display}</a>'
 
 
 def _external_link(url: str, display: str | None = None) -> str:
@@ -183,6 +227,11 @@ def _process_inline(text: str, current_path: str,
         _counter[0] += 1
         _ph[key] = fragment
         return key
+
+    # Code and verbatim first: their content is literal, so no link, cite or
+    # math inside them is processed.
+    text = _CODE_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
+    text = _VERBATIM_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
 
     # File links
     text = _FILE_LINK_RE.sub(lambda m: _hold(_rewrite_file_link(m, current_path)), text)
@@ -232,10 +281,6 @@ def _process_inline(text: str, current_path: str,
         text,
     )
 
-    # Code/verbatim (before bold/italic so * inside code is safe)
-    text = _CODE_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
-    text = _VERBATIM_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
-
     # Everything turned into HTML above is now a placeholder, so what remains
     # is article text: escape it before adding the bold and italic tags.
     text = html.escape(text, quote=False)
@@ -244,14 +289,12 @@ def _process_inline(text: str, current_path: str,
     text = _BOLD_RE.sub(r"<strong>\1</strong>", text)
     text = _ITALIC_RE.sub(r"<em>\1</em>", text)
 
-    # Restore placeholders
-    for key, value in _ph.items():
-        text = text.replace(key, value)
-
-    return text
+    # Restore placeholders (block placeholders are left for org_to_html)
+    return _restore(text, _ph, _INLINE_PH_RE)
 
 
-def _convert_table(table_text: str) -> str:
+def _convert_table(table_text: str, current_path: str = "",
+                   bib: dict[str, dict[str, str]] | None = None) -> str:
     """Convert org table lines to HTML table."""
     lines = [l.strip() for l in table_text.strip().splitlines() if l.strip()]
     rows = []
@@ -274,13 +317,15 @@ def _convert_table(table_text: str) -> str:
         tag = "th" if in_head and i == 0 else "td"
         out.append("<tr>")
         for cell in row:
-            out.append(f"  <{tag}>{html.escape(cell)}</{tag}>")
+            out.append(f"  <{tag}>{_process_inline(cell, current_path, bib)}</{tag}>")
         out.append("</tr>")
     out.append("</table>")
     return "\n".join(out)
 
 
-_LIST_ITEM_RE = re.compile(r"^([ \t]*)([-+]|\d+[.)])(?:[ \t]+(.*))?$")
+# "* item" is a list item only when indented; at column 0 it is a heading.
+_LIST_ITEM_RE = re.compile(
+    r"^([ \t]*)([-+]|\d+[.)]|(?<=[ \t])\*)(?:[ \t]+(.*))?$")
 _CHECKBOX_RE = re.compile(r"^\[([ xX-])\][ \t]+")
 
 
@@ -380,14 +425,20 @@ def org_to_html(text: str, current_path: str = "",
     title = ""
     filetags = []
 
+    # Placeholder delimiters in the source would be taken for placeholders.
+    text = text.replace("\x00", "").replace("\x01", "")
+
     # Replace blocks with placeholders to protect them from inline processing
-    placeholders = {}
+    placeholders: dict[str, str] = {}
+    originals: dict[str, str] = {}  # placeholder -> the org source it replaced
     counter = [0]
 
-    def _placeholder(content: str) -> str:
+    def _placeholder(content: str, original: str | None = None) -> str:
         key = f"\x00BLOCK{counter[0]}\x00"
         counter[0] += 1
         placeholders[key] = content
+        if original is not None:
+            originals[key] = original
         return key
 
     # Blocks come out first, so #+ lines inside them (a src block of org
@@ -396,22 +447,30 @@ def org_to_html(text: str, current_path: str = "",
         lang = html.escape(m.group(1).strip()) if m.group(1).strip() else ""
         code = html.escape(m.group(2))
         cls = f' class="language-{lang}"' if lang else ""
-        return _placeholder(f"<pre><code{cls}>{code}</code></pre>")
+        return _placeholder(f"<pre><code{cls}>{code}</code></pre>", m.group(0))
 
     text = _SRC_BLOCK_RE.sub(_src_repl, text)
 
     # Example blocks
     text = _EXAMPLE_BLOCK_RE.sub(
-        lambda m: _placeholder(f"<pre>{html.escape(m.group(1))}</pre>"), text
-    )
-
-    # Quote blocks
-    text = _QUOTE_BLOCK_RE.sub(
-        lambda m: _placeholder(
-            f"<blockquote>{_process_inline(m.group(1), current_path, bib)}</blockquote>"
-        ),
+        lambda m: _placeholder(f"<pre>{html.escape(m.group(1))}</pre>", m.group(0)),
         text,
     )
+
+    # Comments: #+BEGIN_COMMENT blocks and "# text" lines are not rendered.
+    text = _COMMENT_BLOCK_RE.sub("", text)
+    text = _COMMENT_LINE_RE.sub("", text)
+
+    # Quote blocks: their body is rendered as paragraphs and lists, with any
+    # src or example block placeholder inside it restored at the end.
+    def _quote_repl(m: re.Match) -> str:
+        parts = []
+        for chunk in re.split(r"\n\s*\n", m.group(1)):
+            parts.extend(_render_chunk(chunk, placeholders, current_path, bib))
+        return _placeholder(f"<blockquote>{chr(10).join(parts)}</blockquote>",
+                            m.group(0))
+
+    text = _QUOTE_BLOCK_RE.sub(_quote_repl, text)
 
     # Extract title
     m = _TITLE_RE.search(text)
@@ -445,6 +504,9 @@ def org_to_html(text: str, current_path: str = "",
             )
         if not body.strip():
             return ""
+        # A drawer shows its raw text: blocks inside it (an example block
+        # in a :RESULTS: drawer) go back to their org source.
+        body = _restore(body, originals, _BLOCK_PH_RE)
         return _placeholder(
             f'<details class="properties"><summary>{html.escape(name.title())}</summary>'
             f"<pre>{html.escape(body.rstrip())}</pre></details>"
@@ -454,14 +516,20 @@ def org_to_html(text: str, current_path: str = "",
 
     # Tables (org allows them to be indented)
     text = _TABLE_BLOCK_RE.sub(
-        lambda m: _placeholder(_convert_table(m.group(1))) + "\n", text
+        lambda m: _placeholder(_convert_table(m.group(1), current_path, bib)) + "\n",
+        text
     )
 
     # Headings
     def _heading_repl(m: re.Match) -> str:
-        level = len(m.group(1)) + 1  # * -> h2, ** -> h3, etc.
-        content = _process_inline(m.group(2), current_path, bib)
-        slug = re.sub(r"[^a-z0-9]+", "-", m.group(2).lower()).strip("-")
+        level = min(len(m.group(1)) + 1, 6)  # * -> h2, ** -> h3, ... h6
+        heading = m.group(2)
+        content = _process_inline(heading, current_path, bib)
+        tags = [t for t in (m.group(3) or "").split(":") if t]
+        if tags:
+            content += " " + "".join(
+                f'<span class="tag">{html.escape(t)}</span>' for t in tags)
+        slug = re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
         return _placeholder(f'<h{level} id="{slug}">{content}</h{level}>')
 
     text = _HEADING_RE.sub(_heading_repl, text)
@@ -473,9 +541,10 @@ def org_to_html(text: str, current_path: str = "",
 
     content = "\n".join(parts)
 
-    # Restore placeholders
-    for key, value in placeholders.items():
-        content = content.replace(key, value)
+    # Restore placeholders, including those nested inside other blocks.
+    content = _restore(content, placeholders, _BLOCK_PH_RE)
+    # Belt and braces: no placeholder delimiter may reach the page.
+    content = content.replace("\x00", "").replace("\x01", "")
 
     return title, content, filetags
 
@@ -615,6 +684,10 @@ a.citation {
   text-decoration: none; border-bottom: 1px dotted var(--accent);
 }
 a.citation:hover { border-bottom-style: solid; text-decoration: none; }
+
+/* Images */
+#content img { max-width: 100%; height: auto; }
+h2 .tag, h3 .tag, h4 .tag, h5 .tag, h6 .tag { vertical-align: middle; }
 
 /* Math (KaTeX) */
 .math-display { margin: 12px 0; text-align: center; }
@@ -1152,16 +1225,18 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
                                   self.articles, self.bib),
             )
         elif path == "/_graph":
-            viz_path = self.wiki_dir / "viz.html"
-            if viz_path.exists():
-                body = viz_path.read_bytes()
-                self._send_response(200, "text/html; charset=utf-8", body)
-            else:
-                self._serve_page(
-                    "Graph",
-                    "<h1>Knowledge Graph</h1>"
-                    "<p>No graph generated yet. Run <code>crucible viz</code> first.</p>",
-                )
+            # Built from the database on every request, so it is never stale,
+            # with node clicks opening browse pages rather than VS Code.
+            from crucible.cli import viz_html  # cli imports this module
+            from crucible.database import CrucibleDB
+            db = CrucibleDB(self.db_path)
+            try:
+                body, _, _ = viz_html(self.wiki_dir.parent.parent, db,
+                                      link_mode="browse")
+            finally:
+                db.close()
+            self._send_response(200, "text/html; charset=utf-8",
+                                body.encode("utf-8"))
         elif path == "/_static/style.css":
             self._send_response(200, "text/css", _BROWSE_CSS.encode("utf-8"))
         else:
@@ -1169,16 +1244,18 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
             self._serve_org(path)
 
     def _serve_org(self, url_path: str):
-        """Convert and serve an org file from the wiki directory."""
+        """Convert and serve an org file (or an image) from the wiki."""
         # Strip leading slash
         rel = url_path.lstrip("/")
-        # Security: only .org files inside the wiki directory. Compare
-        # resolved paths, not string prefixes, which would admit a sibling
-        # such as wiki-old/.
+        # Security: only .org files and images inside the wiki directory.
+        # Compare resolved paths (symlinks followed), not string prefixes,
+        # which would admit a sibling such as wiki-old/.
         try:
             wiki = self.wiki_dir.resolve()
             file_path = (wiki / rel).resolve()
-            if not file_path.is_relative_to(wiki) or file_path.suffix != ".org":
+            suffix = file_path.suffix.lower()
+            if not file_path.is_relative_to(wiki) or (
+                    file_path.suffix != ".org" and suffix not in IMAGE_TYPES):
                 self._send_error(403, "Forbidden")
                 return
         except (ValueError, OSError):
@@ -1187,6 +1264,10 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
 
         if not file_path.is_file():
             self._send_error(404, f"Not found: {rel}")
+            return
+
+        if file_path.suffix != ".org":
+            self._serve_image(file_path, IMAGE_TYPES[suffix])
             return
 
         text = file_path.read_text(encoding="utf-8", errors="replace")
@@ -1207,6 +1288,15 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
         parts.append(content_html)
 
         self._serve_page(title or rel, "\n".join(parts))
+
+    def _serve_image(self, file_path: Path, content_type: str):
+        """Serve an image file. An SVG can carry script, so it is sandboxed
+        by a Content-Security-Policy that allows no script or fetch."""
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if content_type == "image/svg+xml":
+            headers["Content-Security-Policy"] = (
+                "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        self._send_response(200, content_type, file_path.read_bytes(), headers)
 
     def _serve_page(self, title: str, content: str, code: int = 200):
         """Wrap content in the page template and serve it."""
@@ -1230,10 +1320,13 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
         self._serve_page(f"Error {code}", f"<h1>{code}</h1><p>{html.escape(message)}</p>",
                          code=code)
 
-    def _send_response(self, code: int, content_type: str, body: bytes):
+    def _send_response(self, code: int, content_type: str, body: bytes,
+                       headers: dict[str, str] | None = None):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 

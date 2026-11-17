@@ -17,6 +17,7 @@ from pathlib import Path
 
 import libsql
 
+from crucible.browse import DRAWER_RE
 from crucible.database import DictConnection, _fts_query
 
 DEFAULT_MODEL = "nomic-embed-text"
@@ -122,10 +123,10 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 _KEYWORD_LINE_RE = re.compile(r"^[ \t]*#\+(\w+):[ \t]*(.*)$")
-_DRAWER_RE = re.compile(
-    r"^[ \t]*:[A-Za-z][\w-]*:[ \t]*\n.*?^[ \t]*:END:[ \t]*(?:\n|$)",
-    re.MULTILINE | re.DOTALL | re.IGNORECASE,
-)
+# Drawers (:PROPERTIES:, :LOGBOOK:, ...), bounded by headings as in org; the
+# browser renders them with the same pattern (here with the line break after
+# :END:, so no blank line is left behind).
+_DRAWER_RE = re.compile(DRAWER_RE.pattern + r"\n?", DRAWER_RE.flags)
 
 
 def embedding_text(content: str, limit: int = MAX_EMBED_CHARS) -> str:
