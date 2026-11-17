@@ -75,11 +75,12 @@ def destination_dir(root: Path, source_type: str, shareable: bool) -> Path:
             return base / "external" / "web"
 
 
-def atomic_write_text(path: Path, content: str, encoding: str = "utf-8"):
+def atomic_write_text(path: Path, content: str, encoding: str = "utf-8",
+                      errors: str = "strict"):
     """Write content to path atomically via temp file + rename."""
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        os.write(fd, content.encode(encoding))
+        os.write(fd, content.encode(encoding, errors))
         os.close(fd)
         fd = -1
         os.replace(tmp_path, str(path))
@@ -194,6 +195,28 @@ def _title_key(title: str) -> str:
     entry and the title a file declares without making it another paper.
     """
     return "".join(ch for ch in title.casefold() if ch.isalnum())
+
+
+# Files that never carry their own DOI: a DOI in a deck or a Word document
+# is one it cites.
+_NO_OWN_DOI_SUFFIXES = frozenset({".docx", ".pptx"})
+
+
+def _title_on_first_page(title: str, text: str | None, scan_chars: int = 4000) -> bool:
+    """Whether `title` appears near the start of `text`, where a paper prints it.
+
+    The window is the one extract_doi_from_text scans. Words are compared,
+    not the whole string: a fetched title carries markup (CO<sub>2</sub>,
+    {\\"u}) and a PDF's text line breaks and hyphenation, so most of the
+    title's words of four or more letters must be there. A title with no
+    such words is accepted.
+    """
+    title = re.sub(r"<[^>]*>|\\[a-zA-Z]+|[{}]", " ", title)
+    words = set(re.findall(r"[^\W_]{4,}", title.casefold()))
+    if not words:
+        return True
+    page = set(re.findall(r"[^\W_]{4,}", (text or "")[:scan_chars].casefold()))
+    return len(words & page) >= 0.7 * len(words)
 
 
 def declared_title(path: Path, text: str) -> str | None:
@@ -1105,16 +1128,28 @@ def _bib_lock(root: Path) -> FileLock:
     return lock
 
 
+def read_bib_text(bib_path: Path) -> str:
+    """references.bib for rewriting: bytes that are not UTF-8 (an entry from a
+    Latin-1 export) are kept as surrogates, so write_bib_text puts them back
+    unchanged instead of the rewrite failing or replacing them."""
+    return bib_path.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def write_bib_text(bib_path: Path, text: str) -> None:
+    """Write text read by read_bib_text (plus new entries) atomically."""
+    atomic_write_text(bib_path, text, errors="surrogateescape")
+
+
 def _append_bib_unlocked(root: Path, entry: str, cite_key: str) -> bool:
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     if bib_path.exists():
-        existing = bib_path.read_text(encoding="utf-8")
+        existing = read_bib_text(bib_path)
         if bib_has_key(existing, cite_key):
             return False
         new_content = existing.rstrip() + "\n\n" + entry + "\n"
     else:
         new_content = entry + "\n"
-    atomic_write_text(bib_path, new_content)
+    write_bib_text(bib_path, new_content)
     return True
 
 
@@ -1175,10 +1210,10 @@ def _rewrite_bib(root: Path, fn) -> None:
     with _bib_lock(root):
         if not bib_path.exists():
             return
-        text = bib_path.read_text(encoding="utf-8")
+        text = read_bib_text(bib_path)
         new_text = bibtex_mod.map_entries(text, fn)
         if new_text != text:
-            atomic_write_text(bib_path, new_text)
+            write_bib_text(bib_path, new_text)
 
 
 def drop_bib_file_fields(root: Path, rel_path: str) -> list[str]:
@@ -1276,7 +1311,9 @@ def _unique_cite_key(base: str, db: CrucibleDB, root: Path | None = None) -> str
     silently reuses another's cite key (and its bib entry). Keys in
     references.bib count even without a source row: an entry with no
     `file` field has none, and reusing its key would attach the new file
-    to that unrelated entry.
+    to that unrelated entry. Keys articles cite count too: a summary of a
+    paper whose entry was removed still cites its key, and a new source
+    under that key would silently become what the summary describes.
     """
     used = {
         k for src in db.list_sources()
@@ -1284,6 +1321,7 @@ def _unique_cite_key(base: str, db: CrucibleDB, root: Path | None = None) -> str
     }
     if root is not None:
         used.update(e["cite_key"] for e in parse_bib_file(root / CRUCIBLE_DIR / "references.bib"))
+        used.update(_keys_cited_in_wiki(root))
     if base not in used:
         return base
     for suffix in "abcdefghijklmnopqrstuvwxyz":
@@ -1293,6 +1331,20 @@ def _unique_cite_key(base: str, db: CrucibleDB, root: Path | None = None) -> str
     while f"{base}{i}" in used:
         i += 1
     return f"{base}{i}"
+
+
+def _keys_cited_in_wiki(root: Path) -> set[str]:
+    """Cite keys the wiki's articles name, in :SOURCE_KEYS: or citations."""
+    keys: set[str] = set()
+    wiki = root / CRUCIBLE_DIR / "wiki"
+    for path in wiki.rglob("*.org"):
+        try:
+            meta = parse_org_file(path)
+        except (OSError, UnicodeDecodeError):
+            continue
+        keys.update(meta.properties.get("SOURCE_KEYS", "").split())
+        keys.update(meta.cite_keys)
+    return keys
 
 
 def _dest_taken(dest_path: Path) -> bool:
@@ -1541,10 +1593,11 @@ def ingest_source(
     # If no DOI was supplied, try to recover one from the document text so we
     # can fetch a complete, correctly-typed entry instead of a bare @misc.
     # Only a paper (a PDF) or a web page carries its own DOI near the top; a
-    # notebook or data file that mentions a DOI is citing someone else's
-    # paper, and must not become that paper.
+    # notebook, data file, slide deck or Word document that mentions a DOI
+    # is citing someone else's paper, and must not become that paper.
     doi_given = bool(doi)
-    if not doi and source_type in ("pdf", "web"):
+    if (not doi and source_type in ("pdf", "web")
+            and source_path.suffix.lower() not in _NO_OWN_DOI_SUFFIXES):
         doi = extract_doi_from_text(text)
 
     # The bib entry. Preference order:
@@ -1575,6 +1628,16 @@ def ingest_source(
             warnings.append(
                 f"Ignored DOI {doi} found in the text: it belongs to "
                 f"\"{known.get('title', '')}\", not \"{declared}\""
+            )
+            bib_entry, known, doi = None, {}, None
+        elif (not declared and source_type == "pdf"
+              and not _title_on_first_page(known.get("title", ""), text)):
+            # Nothing to compare with: a paper prints its own title near
+            # the top, next to its DOI. A report or thesis that cites a DOI
+            # there does not carry the cited paper's title with it.
+            warnings.append(
+                f"Ignored DOI {doi} found in the text: its title "
+                f"\"{known.get('title', '')}\" is not near the start of the document"
             )
             bib_entry, known, doi = None, {}, None
 
@@ -1612,6 +1675,10 @@ def ingest_source(
         bib_entry = set_bib_field(bib_entry, "title", title)
     if authors and not known.get("author"):
         bib_entry = set_bib_field(bib_entry, "author", " and ".join(authors))
+    if url and not known.get("url"):
+        bib_entry = set_bib_field(bib_entry, "url", url)
+    if doi and not known.get("doi"):
+        bib_entry = set_bib_field(bib_entry, "doi", doi)
     # A date is written only where it agrees with the entry's year: the
     # entry is the source's description, and a date it contradicts (say the
     # day the paper was read) would replace its publication year.

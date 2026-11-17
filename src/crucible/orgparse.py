@@ -192,7 +192,9 @@ def parse_org(text: str) -> OrgMetadata:
 
     # Filetags: org accumulates every #+FILETAGS: line.
     for m in FILETAGS_RE.finditer(prose):
-        for tag in m.group(1).strip().strip(":").split(":"):
+        # Org separates tags with colons or whitespace: ":a: :b:" and
+        # "a b" are both the tags a and b.
+        for tag in re.split(r"[\s:]+", m.group(1)):
             if tag and tag not in meta.filetags:
                 meta.filetags.append(tag)
 

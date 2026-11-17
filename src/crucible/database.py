@@ -204,12 +204,16 @@ def _fts_query(raw: str) -> str:
     FTS5 query operators in user input (-, :, parentheses, the bare keywords
     AND/OR/NOT/NEAR) are treated as ordinary text rather than crashing the
     parser. A token ending in * is a prefix query (catal* matches catalysis).
-    The porter tokenizer stems the prefix like any other word ("cataly"
-    becomes "catali", which misses the indexed "catalysi"; "cats" becomes
-    "cat"), so the query also takes the prefix one letter shorter. That
-    over-matches (cats* would find catalysis), so callers run it through
-    fts_rows, which keeps only rows that really contain a word starting
-    with each prefix.
+    The porter tokenizer stems indexed words and the prefix alike, and a
+    stem can be shorter than the prefix ("oxidation" is indexed as "oxid",
+    so oxidat* finds nothing) or differ from it ("catalys" stems to
+    "catali", not a prefix of the indexed "catalysi"). Stemming only
+    rewrites the end of a word, and leaves words of two letters alone, so
+    the query asks for the prefix's first two characters, which every
+    matching word's stem starts with (of the last word, in a token the
+    tokenizer splits, such as a-b*). That over-matches, so callers run it
+    through fts_rows, which keeps only rows that really contain a word
+    starting with each prefix.
     A token with no letter or digit in it ("&", "-", "/", an en dash) is
     dropped: the tokenizer reads it as an empty phrase, which, ANDed with
     the rest, would make every search return nothing.
@@ -233,10 +237,17 @@ def _fts_query(raw: str) -> str:
             continue  # "*", "&", "--": nothing the tokenizer would index
         if stem == token:
             terms.append(_fts_literal(token))
-        elif len(stem) > 3:
-            terms.append(f"({_fts_literal(stem)}* OR {_fts_literal(stem[:-1])}*)")
         else:
-            terms.append(f"{_fts_literal(stem)}*")
+            # Only the last word of the token is the prefix ("a-b*" is the
+            # phrase a, then a word starting with b); cut it to two characters.
+            # The full prefix is asked for too, so rows that match it rank
+            # as they would without the short one.
+            last = re.search(r"[^\W_]+$", stem)
+            if last and len(last.group(0)) > 2:
+                short = stem[:last.start() + 2]
+                terms.append(f"({_fts_literal(stem)}* OR {_fts_literal(short)}*)")
+            else:
+                terms.append(f"{_fts_literal(stem)}*")
     if not terms:
         return ""
     # Explicit AND: FTS5 allows implicit AND only between plain phrases.

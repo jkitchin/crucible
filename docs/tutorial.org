@@ -38,7 +38,11 @@ and registers it in the database. The output shows the source ID, its
 cite key, the stored path and how many characters of text were extracted.
 
 If the paper's DOI appears near the start of its text, or you give it
-with =--doi=, crucible fetches the full BibTeX entry from doi.org. You can
+with =--doi=, crucible fetches the full BibTeX entry from doi.org. A DOI
+found in the text is used only when the fetched title matches the file:
+for a PDF, the title must appear near the start of the text, so a thesis
+or report that cites a paper there is not filed as that paper. Slide
+decks and Word documents are never matched to a DOI in their text. You can
 also supply your own entry with =--bibtex @paper.bib=. The entry's =file=
 field records where the PDF is stored, which is how a fresh clone ties the
 entry back to the file.

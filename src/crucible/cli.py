@@ -18,7 +18,7 @@ from crucible import package_version
 from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
-from crucible.ingest import _source_metadata, ingest_source
+from crucible.ingest import _source_metadata, ingest_source, read_bib_text, write_bib_text
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
 from crucible.viz import _VIZ_TEMPLATE, _script_json, viz_html  # noqa: F401
 
@@ -193,8 +193,8 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     Symlinked directories are followed (a wiki kept in Dropbox is often
     linked in), each real directory once, so a symlink loop cannot recurse
     forever. Paths are returned under `wiki_dir` as spelled, not resolved.
-    A symlink to a directory inside the wiki is an alias of articles that
-    already have a path, so it is skipped: otherwise which spelling an
+    A symlink to a directory or file inside the wiki is an alias of
+    articles that already have a path, so it is skipped: otherwise which spelling an
     article got would depend on scan order. Entries are visited in name
     order, so the result never depends on the order scandir returns them.
 
@@ -231,15 +231,18 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
                 mode = entry.stat(follow_symlinks=False).st_mode
                 if stat.S_ISLNK(mode):
                     # A dangling link, such as an Emacs `.#name.org` lock,
-                    # or a link to itself is skipped; a link to a directory
-                    # is followed, unless it points back into the wiki.
+                    # or a link to itself is skipped. A link into the wiki
+                    # is an alias of articles indexed under their own path
+                    # (dft.org -> density-functional-theory.org), so it is
+                    # skipped too; links into the wiki resolve through it
+                    # (see _link_target_rel). Other links are followed.
                     try:
                         mode = entry.stat(follow_symlinks=True).st_mode
                     except OSError as exc:
                         if isinstance(exc, FileNotFoundError) or exc.errno == errno.ELOOP:
                             continue
                         raise
-                    if stat.S_ISDIR(mode) and path.resolve().is_relative_to(wiki_real):
+                    if path.resolve().is_relative_to(wiki_real):
                         continue
             except FileNotFoundError:
                 continue
@@ -617,7 +620,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
         bib_path = Path(bibtex[1:])
         if not bib_path.exists():
             raise click.ClickException(f"BibTeX file not found: {bib_path}")
-        bibtex = bib_path.read_text(encoding="utf-8")
+        bibtex = _read_bibtex_export(bib_path)
     if bibtex:
         # Decided by whether an entry is found, not by a leading "@": an
         # export may start with a comment such as "% Encoding: UTF-8".
@@ -648,6 +651,8 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
             return ingest_source(**kwargs)
         except ValueError as e:
             raise click.ClickException(str(e))
+        except OSError as e:
+            raise click.ClickException(f"Cannot read {path}: {e.strerror or e}")
 
     if source == "-":
         # Reading from stdin
@@ -729,10 +734,32 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
             source_path = Path(source)
             if not source_path.exists():
                 raise click.ClickException(f"Source not found: {source}")
+            if source_path.is_dir():
+                raise click.ClickException(
+                    f"{source} is a directory; ingest its files with a glob "
+                    f"such as '{source_path / '*.pdf'}'"
+                )
             result = run_ingest(source_path)
             _print_ingest_result(result)
 
     db.close()
+
+
+def _read_bibtex_export(path: Path) -> str:
+    """A BibTeX file's text: UTF-8, else the encoding its `% Encoding:` line
+    names (JabRef writes one), else Windows-1252, which decodes any bytes."""
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    m = re.search(rb"^%\s*Encoding:\s*([\w.-]+)", data, re.MULTILINE | re.IGNORECASE)
+    if m:
+        try:
+            return data.decode(m.group(1).decode("ascii"))
+        except (LookupError, UnicodeDecodeError):
+            pass
+    return data.decode("cp1252", errors="replace")
 
 
 # A literal BibTeX entry passed to --bibtex: @type{ or @type(
@@ -883,6 +910,24 @@ def _on_disk_spelling(root: Path, rel: str) -> str | None:
     return str(Path(*parts)) if parts else None
 
 
+def _alias_target(root: Path, target: Path) -> Path:
+    """The article a symlinked file in the wiki stands for, else `target`.
+
+    The wiki walk skips such an alias (see _wiki_article_files), so a link
+    to it must reach the article it points at.
+    """
+    try:
+        if not (target.is_symlink() and target.is_file()):
+            return target
+        wiki_dir = cdir(root) / "wiki"
+        real, wiki_real = target.resolve(), wiki_dir.resolve()
+    except OSError:
+        return target
+    if not real.is_relative_to(wiki_real):
+        return target
+    return wiki_dir / real.relative_to(wiki_real)
+
+
 def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
     """The project-relative path a wiki file link points at, or None.
 
@@ -890,7 +935,7 @@ def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
     name the real location of a symlinked wiki or project, so the resolved
     path is also tried against the resolved wiki and root.
     """
-    target = _link_path(org_path, link)
+    target = _alias_target(root, _link_path(org_path, link))
     rel = _safe_relative_to(target, root)
     if rel is not None:
         return rel
@@ -2715,7 +2760,7 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
     """
     import tempfile
 
-    from crucible.ingest import _bib_lock, atomic_write_text
+    from crucible.ingest import _bib_lock
 
     target_cdir = cdir(root)
     bib_path = target_cdir / "references.bib"
@@ -2763,15 +2808,15 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
                     raise click.ClickException(
                         f"{os.path.relpath(dest, root)} appeared while merging."
                     )
-                os.rename(staged, dest)
+                _move_into_place(staged, dest)
                 placed.append((staged, dest))
 
             # 3. The bibliography, in one atomic write.
             if plan.bib_entries or plan.bib_file_fields or plan.bib_macros:
-                old_bib = bib_path.read_text(encoding="utf-8") if bib_path.exists() else None
+                old_bib = read_bib_text(bib_path) if bib_path.exists() else None
                 new_bib = _merged_bib_text(old_bib or "", plan)
                 if new_bib != (old_bib or ""):
-                    atomic_write_text(bib_path, new_bib)
+                    write_bib_text(bib_path, new_bib)
                     bib_written = True
 
             # 4. The source rows, in one transaction.
@@ -2806,25 +2851,49 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
     return rewrites
 
 
+def _move_into_place(staged: Path, dest: Path) -> None:
+    """Move a staged file to dest, which must not exist.
+
+    Staging is in .crucible/, and dest may be on another filesystem (a wiki
+    or sources/ directory linked to another volume), where a rename fails.
+    Then the file is copied to a temporary name beside dest and renamed
+    there, so dest still appears complete or not at all.
+    """
+    try:
+        os.rename(staged, dest)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".crucible-merge-", suffix=dest.suffix)
+    os.close(fd)
+    try:
+        shutil.copy2(staged, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def _undo_merge(
     root: Path, bib_path: Path, old_bib: str | None, bib_written: bool,
     placed: list[tuple[Path, Path]], made_dirs: list[Path],
 ) -> list[str]:
     """Undo the writes _apply_merge made; return what could not be undone."""
-    from crucible.ingest import atomic_write_text
-
     leftovers = []
     if bib_written:
         try:
             if old_bib is None:
                 bib_path.unlink()
             else:
-                atomic_write_text(bib_path, old_bib)
+                write_bib_text(bib_path, old_bib)
         except OSError as exc:
             leftovers.append(f"{os.path.relpath(bib_path, root)} (could not restore: {exc})")
     for staged, dest in reversed(placed):
         try:
-            os.rename(dest, staged)
+            # The staged copy is discarded with the staging directory, so
+            # removing what was placed is enough (and works across devices).
+            dest.unlink()
         except OSError as exc:
             leftovers.append(f"{os.path.relpath(dest, root)} (could not remove: {exc})")
     for directory in reversed(made_dirs):
@@ -2965,13 +3034,13 @@ def _plan_source_merge(
 
     try:
         source_entries = (
-            _parse_bib_entries(source_bib.read_text(encoding="utf-8"))
+            _parse_bib_entries(read_bib_text(source_bib))
             if source_bib.exists() else {}
         )
     except _MergeConflict as exc:
         _raise_merge_problems([str(exc)])
     if source_bib.exists():
-        plan.bib_macros = bibtex.macro_blocks(source_bib.read_text(encoding="utf-8"))
+        plan.bib_macros = bibtex.macro_blocks(read_bib_text(source_bib))
 
     target_sources = target_db.list_sources()
     # Real paths already taken in the target, plus every path planned below.
@@ -3133,7 +3202,7 @@ def _plan_source_merge(
             remember(src_text, str(Path(new_rel).with_suffix(".txt")), cite_key)
 
     # Bibliography entries, with `file` fields pointing at the planned paths.
-    target_text = target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
+    target_text = read_bib_text(target_bib) if target_bib.exists() else ""
     target_entries: dict[str, list[str]] = {}
     for e in bibtex.entries(target_text):
         target_entries.setdefault(e.key, []).append(e.text)
