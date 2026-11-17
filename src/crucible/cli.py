@@ -590,19 +590,26 @@ def _safe_relative_to(target: Path, root: Path) -> str | None:
         return None
 
 
-def _source_key_index(sources: list[dict]) -> tuple[dict[str, int], list[dict]]:
-    """Split sources into a cite_key -> id map and the legacy sources without one.
+def _source_key_index(
+    sources: list[dict],
+) -> tuple[dict[str, list[int]], list[dict]]:
+    """Split sources into a cite_key -> ids map and the legacy sources without one.
+
+    A cite key normally names one source, but two sources can end up with the
+    same key (for example, files with the same stem in sources/notebooks/ and
+    sources/data/). Every source carrying the key is kept, so callers can link
+    all of them and report the collision instead of silently picking one.
 
     Build this once per command and pass it to _resolve_source_keys, rather
     than re-parsing every source's metadata for each article.
     """
-    key_to_src = {}
+    key_to_src: dict[str, list[int]] = {}
     legacy_sources = []
     for src in sources:
         md = _source_metadata(src)
         cite_key = md.get("cite_key")
         if isinstance(cite_key, str) and cite_key:
-            key_to_src[cite_key] = src["id"]
+            key_to_src.setdefault(cite_key, []).append(src["id"])
         else:
             legacy_sources.append(src)
     return key_to_src, legacy_sources
@@ -624,12 +631,18 @@ def _legacy_key_matches(key: str, src: dict) -> bool:
 
 
 def _resolve_source_keys(
-    keys: list[str], index: tuple[dict[str, int], list[dict]]
+    keys: list[str], index: tuple[dict[str, list[int]], list[dict]]
 ) -> dict[str, list[int]]:
-    """Resolve cite keys, falling back to legacy source file stems and titles."""
+    """Resolve cite keys, falling back to legacy source file stems and titles.
+
+    A canonical cite key takes precedence over legacy matching. A key that
+    resolves to more than one source is ambiguous: all candidates are
+    returned so none is presented as the single provenance, and lint
+    reports the collision.
+    """
     key_to_src, legacy_sources = index
     return {
-        key: [key_to_src[key]]
+        key: list(key_to_src[key])
         if key in key_to_src
         else [src["id"] for src in legacy_sources if _legacy_key_matches(key, src)]
         for key in keys
@@ -657,6 +670,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         "concept_links": 0,
         "skipped": 0,
         "files": 0,
+        "ambiguous_source_keys": 0,
     }
 
     try:
@@ -761,6 +775,8 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
             if source_keys:
                 for source_ids in _resolve_source_keys(source_keys, source_index).values():
+                    if len(source_ids) > 1:
+                        stats["ambiguous_source_keys"] += 1
                     for sid in source_ids:
                         db.link_article_source(article_id, sid)
 
@@ -848,6 +864,12 @@ def sync():
     if stats["skipped"]:
         msg += f", {stats['skipped']} skipped (modified during sync)"
     click.echo(msg)
+    if stats["ambiguous_source_keys"]:
+        click.echo(
+            f"Warning: {stats['ambiguous_source_keys']} SOURCE_KEYS value(s) match"
+            " more than one source and were linked to every match;"
+            " run `crucible lint` for details."
+        )
 
 
 @cli.command()
@@ -2529,7 +2551,8 @@ def lint(json_output):
     """Check wiki health and report issues.
 
     Finds broken links, orphan articles, missing concept articles,
-    stale sources, unresolved source keys, and other consistency problems.
+    stale sources, unresolved or ambiguous source keys, and other
+    consistency problems.
     """
     root = get_root()
     db = get_db(root)
@@ -2588,7 +2611,22 @@ def lint(json_output):
         })
 
     # 5. Articles missing required properties or referencing unknown sources
-    source_index = _source_key_index(db.list_sources())
+    all_sources = db.list_sources()
+    source_paths = {src["id"]: src["path"] for src in all_sources}
+    source_index = _source_key_index(all_sources)
+    for key, ids in sorted(source_index[0].items()):
+        if len(ids) > 1:
+            paths = sorted(source_paths[sid] for sid in ids)
+            issues.append({
+                "type": "duplicate_cite_key",
+                "severity": "warning",
+                "message": (
+                    f"Cite key '{key}' is shared by {len(paths)} sources: "
+                    f"{', '.join(paths)}"
+                ),
+                "key": key,
+                "sources": paths,
+            })
     from crucible.ingest import parse_bib_file
     bib_without_file = {
         entry["cite_key"]
@@ -2617,6 +2655,19 @@ def lint(json_output):
             })
         else:
             for key, source_ids in _resolve_source_keys(source_keys, source_index).items():
+                if len(source_ids) > 1:
+                    paths = sorted(source_paths[sid] for sid in source_ids)
+                    issues.append({
+                        "type": "ambiguous_source_key",
+                        "severity": "warning",
+                        "message": (
+                            f"Ambiguous SOURCE_KEYS value '{key}' in {article['path']}"
+                            f" matches {len(paths)} sources: {', '.join(paths)}"
+                        ),
+                        "path": article['path'],
+                        "key": key,
+                        "sources": paths,
+                    })
                 if not source_ids:
                     message = f"Unresolved SOURCE_KEYS value '{key}' in {article['path']}"
                     if key in bib_without_file:
