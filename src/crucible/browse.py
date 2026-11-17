@@ -125,8 +125,14 @@ _BARE_LINK_RE = re.compile(r"\[\[(https?://[^\]]+)\]\]")
 # A bare URL in prose. Trailing sentence punctuation is not part of it; a
 # trailing ')' is, only when it closes a '(' in the URL (see _bare_url).
 _URL_RE = re.compile(r"(?<![\w\"'=/])https?://[^\s<>\[\]\"']*[^\s<>\[\]\"'.,;:!?]")
-_BOLD_RE = re.compile(r"(?<![a-zA-Z0-9])\*([^\s*](?:.*?[^\s*])?)\*(?![a-zA-Z0-9])")
-_ITALIC_RE = re.compile(r"(?<![a-zA-Z0-9])/([^\s/](?:.*?[^\s/])?)/(?![a-zA-Z0-9])")
+# Org emphasis boundaries: a marker opens after whitespace or one of -('"{
+# and closes before whitespace or one of -.,:!?;'")}[ (the \x00/\x01
+# placeholder delimiters count as boundaries too). Without these, the
+# slashes in "</tag> ... /word/" were read as italics.
+_EMPH_PRE = r"(?<![^\s\-('\"{\x00\x01])"
+_EMPH_POST = r"(?![^\s\-.,:!?;'\")}\[\x00\x01])"
+_BOLD_RE = re.compile(_EMPH_PRE + r"\*([^\s*](?:.*?[^\s*])?)\*" + _EMPH_POST)
+_ITALIC_RE = re.compile(_EMPH_PRE + r"/([^\s/](?:.*?[^\s/])?)/" + _EMPH_POST)
 _CODE_RE = re.compile(r"(?<![a-zA-Z0-9])~([^\s~](?:.*?[^\s~])?)~(?![a-zA-Z0-9])")
 _VERBATIM_RE = re.compile(r"(?<![a-zA-Z0-9])=([^\s=](?:.*?[^\s=])?)=(?![a-zA-Z0-9])")
 _LATEX_DISPLAY_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
@@ -175,19 +181,6 @@ def _rewrite_plain_link(match: re.Match) -> str:
     if target.startswith(("http://", "https://")):
         return _external_link(target, display)
     return f'<span class="link-unknown" title="{html.escape(target)}">{display}</span>'
-
-
-def _inline_markup(text: str, current_path: str) -> str:
-    """Apply inline markup transformations to a text chunk."""
-    # Escape HTML first, but preserve our placeholders
-    text = html.escape(text)
-
-    # We need to un-escape the org syntax characters that html.escape touched
-    # since our regexes need to match the original patterns. Work on raw text
-    # instead: re-do this properly by processing raw text.
-    # Actually, let's process raw text and escape only the non-markup parts.
-    # Simpler approach: process before escaping, use safe HTML generation.
-    return text  # placeholder, replaced below
 
 
 def _process_inline(text: str, current_path: str,
@@ -239,15 +232,26 @@ def _process_inline(text: str, current_path: str,
 
     # LaTeX (before other inline markup to avoid conflicts)
     text = _LATEX_DISPLAY_RE.sub(
-        lambda m: _hold(f'<div class="math-display">\\[{m.group(1)}\\]</div>'), text)
+        lambda m: _hold(
+            f'<div class="math-display">\\[{html.escape(m.group(1), quote=False)}\\]</div>'
+        ),
+        text,
+    )
     text = _LATEX_INLINE_RE.sub(
-        lambda m: _hold(f'<span class="math-inline">\\({m.group(1) or m.group(2)}\\)</span>'),
+        lambda m: _hold(
+            f'<span class="math-inline">\\('
+            f'{html.escape(m.group(1) or m.group(2), quote=False)}\\)</span>'
+        ),
         text,
     )
 
     # Code/verbatim (before bold/italic so * inside code is safe)
     text = _CODE_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
     text = _VERBATIM_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
+
+    # Everything turned into HTML above is now a placeholder, so what remains
+    # is article text: escape it before adding the bold and italic tags.
+    text = html.escape(text, quote=False)
 
     # Bold and italic (safe now, all HTML-containing elements are placeholders)
     text = _BOLD_RE.sub(r"<strong>\1</strong>", text)

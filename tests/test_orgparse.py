@@ -154,3 +154,32 @@ def test_bare_urls_render_as_links(text, html):
 def test_italics_still_render_next_to_urls():
     _, body, _ = org_to_html("* A\nSee https://x.org/a/b and /this/ word.\n")
     assert "<em>this</em>" in body
+
+
+def test_article_text_is_html_escaped():
+    _, body, _ = org_to_html(
+        "* Head <b>x</b>\n"
+        "a < b & c <script>alert(1)</script> *bold <i>* $a<b$\n\n"
+        "$$x > 1$$\n"
+    )
+    assert "<script>" not in body and "<b>" not in body and "<i>" not in body
+    assert '<h2 id="head-b-x-b">Head &lt;b&gt;x&lt;/b&gt;</h2>' in body
+    assert "a &lt; b &amp; c &lt;script&gt;alert(1)&lt;/script&gt;" in body
+    assert "<strong>bold &lt;i&gt;</strong>" in body
+    assert r"\(a&lt;b\)" in body and r"\[x &gt; 1\]" in body
+
+
+@pytest.mark.parametrize(
+    "text, html",
+    [
+        ("an /it/, (/x/) and *b*.", "an <em>it</em>, (<em>x</em>) and <strong>b</strong>."),
+        ('"*q*"', '"<strong>q</strong>"'),
+        # slashes inside words or tags are not emphasis markers
+        ("and/or 3/4 and 1/2.", "and/or 3/4 and 1/2."),
+        # a '/' after ')' does not open emphasis (it did, swallowing "/b c /d")
+        ("(a)/b c /d/", "(a)/b c <em>d</em>"),
+    ],
+)
+def test_emphasis_follows_org_boundaries(text, html):
+    _, body, _ = org_to_html(f"* A\n{text}\n")
+    assert html in body
