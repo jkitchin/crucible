@@ -220,3 +220,83 @@ def test_sync_records_an_old_ingest_date_in_the_bib(project, tmp_path):  # noqa:
     assert "date = {2019-04-05}" in bib.read_text()
     rebuild(project)
     assert _rows(project) == ingested
+
+
+# Review of #38 ----------------------------------------------------------------
+
+def test_unclosed_bibtex_is_refused_before_anything_is_written(project, tmp_path):  # noqa: F811
+    src = tmp_path / "x.csv"
+    src.write_text("x\n")
+    bib = project / ".crucible/references.bib"
+    before = bib.read_text() if bib.exists() else ""
+    result = CliRunner().invoke(cli, ["ingest", str(src), "--type", "data",
+                                      "--bibtex", "@article{orig, title={T}, year={2024}"])
+    assert result.exit_code != 0
+    assert "not a complete BibTeX entry" in result.output
+    assert (bib.read_text() if bib.exists() else "") == before
+    assert not (project / DATA / "x.csv").exists()
+
+
+def test_ingest_title_is_written_when_the_entry_has_none(project, tmp_path):  # noqa: F811
+    src = tmp_path / "t.csv"
+    src.write_text("t\n")
+    _ingest(project, src, "--title", "My Title", "--author", "Ann Smith",
+            "--bibtex", "@misc{x, year={2024}}")
+    rows = _rows(project)
+    assert rows[0][1] == "My Title"
+    rebuild(project)
+    assert _rows(project) == rows
+
+
+def test_ingest_date_that_contradicts_the_year_is_not_written(project, tmp_path):  # noqa: F811
+    src = tmp_path / "d.csv"
+    src.write_text("d\n")
+    _ingest(project, src, "--title", "Old paper", "--date", "2025-01-10",
+            "--bibtex", "@article{x, title={Old paper}, author={Lee, Cy}, year={2019}}")
+    from crucible.ingest import parse_bib_file
+    entry = parse_bib_file(project / ".crucible/references.bib")[0]
+    assert entry["year"] == "2019" and "date" not in entry
+    rows = _rows(project)
+    assert rows[0][4] == "2019"
+    rebuild(project)
+    assert _rows(project) == rows
+
+
+def test_sync_does_not_record_the_ingest_day_as_a_date(project, tmp_path):  # noqa: F811
+    from datetime import datetime
+
+    from crucible import bibtex
+    today = datetime.now().strftime("%Y-%m-%d")
+    src = tmp_path / "today.csv"
+    src.write_text("t\n")
+    _ingest(project, src, "--title", "Today", "--author", "Ann Smith", "--date", today)
+    bib = project / ".crucible/references.bib"
+    bib.write_text(bibtex.remove_field(bib.read_text(), "date"))
+    sync()
+    assert "date =" not in bib.read_text()
+
+
+def test_delete_drops_the_file_field_through_a_symlinked_sources_dir(project, tmp_path):  # noqa: F811
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    data = project / DATA
+    if data.exists():
+        data.rmdir()
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.symlink_to(real, target_is_directory=True)
+    src = tmp_path / "linked.csv"
+    src.write_text("l\n")
+    _ingest(project, src, "--title", "Linked")
+    from crucible.ingest import drop_bib_file_fields
+    bib = project / ".crucible/references.bib"
+    text = bib.read_text().replace(f"{DATA}/linked.csv", str(real / "linked.csv"))
+    bib.write_text(text)
+    assert drop_bib_file_fields(project, f"{DATA}/linked.csv") != []
+    assert "file =" not in bib.read_text()
+
+
+def test_unreadable_created_is_not_also_reported_missing(project):  # noqa: F811
+    _set_props(project, CREATED="2024/01/02")
+    sync()
+    assert [i["path"] for i in lint_types("invalid_date")] == [CONCEPT_PATH]
+    assert not [i for i in lint_types("missing_property") if "MODIFIED" in i["message"]]

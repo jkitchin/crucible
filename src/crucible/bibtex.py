@@ -21,6 +21,7 @@ from typing import Callable
 _HEAD_RE = re.compile(r"@\s*(?P<type>[A-Za-z][\w-]*)\s*(?P<open>[{(])")
 _KEY_RE = re.compile(r"\s*(?P<key>[^,\s{}()]+)\s*")
 _NAME_RE = re.compile(r"\s*,?\s*(?P<name>[A-Za-z][\w:.+-]*)\s*=\s*")
+_BARE_RE = re.compile(r"[^\s,#{}()\"]+")
 _SKIPPED_TYPES = {"comment", "string", "preamble"}
 
 
@@ -145,7 +146,7 @@ def _parse_value(text: str, i: int) -> tuple[str, int, int, int] | None:
             span = span or (i + 1, j)
             i = j + 1
         else:
-            m = re.compile(r"[^\s,#{}()\"]+").match(text, i)
+            m = _BARE_RE.match(text, i)
             if not m:
                 return None
             parts.append(m.group(0))

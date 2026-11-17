@@ -498,6 +498,13 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
         if not bib_path.exists():
             raise click.ClickException(f"BibTeX file not found: {bib_path}")
         bibtex = bib_path.read_text(encoding="utf-8")
+    if bibtex and bibtex.strip().startswith("@"):
+        from crucible import bibtex as bibtex_mod
+        if bibtex_mod.first_entry(bibtex.strip()) is None:
+            raise click.ClickException(
+                "The --bibtex entry is not a complete BibTeX entry "
+                "(check that its braces are balanced)"
+            )
 
     if source == "-":
         # Reading from stdin
@@ -2985,11 +2992,12 @@ def lint(json_output):
     # The bibliography itself: a key used by two entries is ambiguous (each
     # citation can only mean one), and an entry with no closing brace is
     # ignored by everything that reads the file.
+    from crucible import bibtex
     bib_file = cdir(root) / "references.bib"
-    if bib_file.exists():
-        from crucible import bibtex
-        bib_text = bib_file.read_text(encoding="utf-8", errors="replace")
-        bib_entries, malformed = bibtex.scan(bib_text)
+    bib_text = (bib_file.read_text(encoding="utf-8", errors="replace")
+                if bib_file.exists() else "")
+    bib_entries, malformed = bibtex.scan(bib_text)
+    if bib_entries or malformed:
         counts: dict[str, int] = {}
         for e in bib_entries:
             counts[e.key] = counts.get(e.key, 0) + 1
@@ -3009,12 +3017,7 @@ def lint(json_output):
                 "message": f"references.bib line {line}: entry is never closed and is ignored",
                 "line": line,
             })
-    from crucible.ingest import parse_bib_file
-    bib_without_file = {
-        entry["cite_key"]
-        for entry in parse_bib_file(cdir(root) / "references.bib")
-        if not entry.get("file")
-    }
+    bib_without_file = {e.key for e in bib_entries if not e.get("file")}
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
@@ -3043,7 +3046,7 @@ def lint(json_output):
                     ),
                     "path": article['path'],
                 })
-        if not dates.get("CREATED") and not dates.get("MODIFIED"):
+        if not meta.properties.get("CREATED") and not meta.properties.get("MODIFIED"):
             issues.append({
                 "type": "missing_property",
                 "severity": "info",
@@ -3119,11 +3122,7 @@ def lint(json_output):
             })
 
     # 7. Citation keys not in references.bib
-    bib_path = cdir(root) / "references.bib"
-    bib_keys = set()
-    if bib_path.exists():
-        from crucible import bibtex
-        bib_keys = set(bibtex.keys(bib_path.read_text(encoding="utf-8", errors="replace")))
+    bib_keys = {e.key for e in bib_entries}
 
     for article in db.list_articles():
         org_path = root / article["path"]

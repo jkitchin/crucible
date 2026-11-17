@@ -23,10 +23,7 @@ def parse_bibtex(text: str) -> dict[str, dict[str, str]]:
     """Parse bibtex into {key: {field: value, ...}, ...} with the shared reader."""
     entries: dict[str, dict[str, str]] = {}
     for e in bibtex.entries(text):
-        fields: dict[str, str] = {"_type": e.entry_type}
-        for f in e.fields:
-            fields[f.name] = f.value.strip()
-        entries[e.key] = fields
+        entries[e.key] = {"_type": e.entry_type, **e.as_dict()}
     return entries
 
 

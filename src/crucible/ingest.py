@@ -533,6 +533,22 @@ def _bib_file_path(root: Path, file_field: str) -> str:
         return str(abs_path)
 
 
+def _is_ingest_day(row_date: str, ingested_at: str | None) -> bool:
+    """Whether a row date is (within a day of) the day its row was ingested.
+
+    ingested_at is UTC and ingest's default date was local, so they can
+    differ by a day.
+    """
+    if not ingested_at or len(row_date) != 10:
+        return False
+    try:
+        day = datetime.strptime(row_date, "%Y-%m-%d").date()
+        ingested = datetime.strptime(ingested_at[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return abs((day - ingested).days) <= 1
+
+
 def _from_ingest(src: dict) -> bool:
     """Whether a source row was created by ingest (or copied by merge).
 
@@ -652,10 +668,14 @@ def reconcile_sources(root: Path, db) -> int:
             # Rows ingested before ingest wrote `date` know a full date the
             # entry lacks; record it so a rebuild keeps it. A date whose
             # year disagrees with the entry's is not written: the entry wins.
+            # Before ingest wrote `date`, a source ingested without --date
+            # got the day of ingest; that is not a publication date, so a
+            # row date within a day of ingested_at is not written.
             row_date = src.get("date") or ""
             if (_from_ingest(src) and not entry.get("date")
                     and re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", row_date)
-                    and entry.get("year", row_date[:4]) == row_date[:4]):
+                    and entry.get("year", row_date[:4]) == row_date[:4]
+                    and not _is_ingest_day(row_date, src.get("ingested_at"))):
                 date_updates[entry["cite_key"]] = row_date
                 entry["date"] = row_date
         set_bib_file_fields(root, file_updates)
@@ -804,18 +824,23 @@ def set_bib_fields(root: Path, name: str, values: dict[str, str]) -> None:
     """Set field `name` on existing entries in references.bib (cite_key -> value)."""
     if not values:
         return
+
+    def repl(entry: bibtex_mod.Entry) -> str:
+        value = values.get(entry.key)
+        return set_bib_field(entry.text, name, value) if value else entry.text
+
+    _rewrite_bib(root, repl)
+
+
+def _rewrite_bib(root: Path, fn) -> None:
+    """Replace each references.bib entry with fn(entry), under the bib lock."""
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     lock_path = bib_path.with_suffix(".bib.lock")
     with FileLock(lock_path, timeout=10):
         if not bib_path.exists():
             return
         text = bib_path.read_text(encoding="utf-8")
-
-        def repl(entry: bibtex_mod.Entry) -> str:
-            value = values.get(entry.key)
-            return set_bib_field(entry.text, name, value) if value else entry.text
-
-        new_text = bibtex_mod.map_entries(text, repl)
+        new_text = bibtex_mod.map_entries(text, fn)
         if new_text != text:
             atomic_write_text(bib_path, new_text)
 
@@ -826,24 +851,19 @@ def drop_bib_file_fields(root: Path, rel_path: str) -> list[str]:
     The entries themselves stay: they are bibliography, and articles may
     still cite them. Returns the keys of the entries changed.
     """
-    bib_path = root / CRUCIBLE_DIR / "references.bib"
-    lock_path = bib_path.with_suffix(".bib.lock")
     changed: list[str] = []
-    with FileLock(lock_path, timeout=10):
-        if not bib_path.exists():
-            return changed
-        text = bib_path.read_text(encoding="utf-8")
+    # Both sides are resolved: with a symlinked sources directory the
+    # entry's path and the row's would otherwise never match.
+    target = (root / rel_path).resolve()
 
-        def repl(entry: bibtex_mod.Entry) -> str:
-            value = entry.get("file")
-            if value and _bib_file_path(root, value) == rel_path:
-                changed.append(entry.key)
-                return bibtex_mod.remove_field(entry.text, "file")
-            return entry.text
+    def repl(entry: bibtex_mod.Entry) -> str:
+        value = entry.get("file")
+        if value and _resolve_bib_file(root, value).resolve() == target:
+            changed.append(entry.key)
+            return bibtex_mod.remove_field(entry.text, "file")
+        return entry.text
 
-        new_text = bibtex_mod.map_entries(text, repl)
-        if new_text != text:
-            atomic_write_text(bib_path, new_text)
+    _rewrite_bib(root, repl)
     return changed
 
 
@@ -939,6 +959,11 @@ def ingest_source(
     source_path = source_path.resolve()
     if not source_path.exists():
         raise FileNotFoundError(f"Source not found: {source_path}")
+    # A supplied entry is checked before anything is copied or written: an
+    # unclosed one would otherwise reach references.bib unchanged.
+    if bibtex and bibtex.strip().startswith("@") and bibtex_mod.first_entry(bibtex.strip()) is None:
+        raise ValueError("The --bibtex entry is not a complete BibTeX entry "
+                         "(check that its braces are balanced)")
 
     # If this exact file (same content hash) was already ingested, skip it:
     # don't copy, append bib, or add a duplicate DB row. Return the existing
@@ -1021,7 +1046,7 @@ def ingest_source(
         bib_entry = replace_cite_key(bibtex.strip(), cite_key)
     elif doi:
         fetched = fetch_bibtex_from_doi(doi)
-        if fetched:
+        if fetched and bibtex_mod.first_entry(fetched) is not None:
             bib_entry = replace_cite_key(fetched, cite_key)
     if bib_entry is None:
         bib_entry = generate_bib_entry(
@@ -1031,10 +1056,16 @@ def ingest_source(
     # carry what the row records: the authors and full date the user gave,
     # when a supplied or fetched entry lacks them.
     known = _parse_bib_fields(bib_entry)
+    if title and not known.get("title"):
+        bib_entry = set_bib_field(bib_entry, "title", title)
     if authors and not known.get("author"):
         bib_entry = set_bib_field(bib_entry, "author", " and ".join(authors))
+    # A date is written only where it agrees with the entry's year: the
+    # entry is the source's description, and a date it contradicts (say the
+    # day the paper was read) would replace its publication year.
     if (re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", date) and not known.get("date")
-            and (date_given or not known.get("year"))):
+            and (date_given or not known.get("year"))
+            and known.get("year", date[:4]) == date[:4]):
         bib_entry = set_bib_field(bib_entry, "date", date)
     # Record the stored copy, so a fresh clone can tie the entry to its file.
     bib_entry = set_bib_field(bib_entry, "file", rel_path)
