@@ -595,12 +595,14 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
         if not bib_path.exists():
             raise click.ClickException(f"BibTeX file not found: {bib_path}")
         bibtex = bib_path.read_text(encoding="utf-8")
-    if bibtex and bibtex.strip().startswith("@"):
+    if bibtex:
+        # Decided by whether an entry is found, not by a leading "@": an
+        # export may start with a comment such as "% Encoding: UTF-8".
         from crucible import bibtex as bibtex_mod
-        if bibtex_mod.first_entry(bibtex.strip()) is None:
+        if bibtex_mod.first_entry(bibtex) is None:
             raise click.ClickException(
-                "The --bibtex entry is not a complete BibTeX entry "
-                "(check that its braces are balanced)"
+                "The --bibtex value is not a complete BibTeX entry "
+                "(it holds no @type{key, ...} entry, or its braces are not balanced)"
             )
         if len(bibtex_mod.entries(bibtex)) > 1:
             raise click.ClickException(
@@ -668,6 +670,16 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
     else:
         # Check for glob pattern
         if "*" in source or "?" in source:
+            # These describe one source; applied to every matched file they
+            # would give them all the same title, entry or DOI.
+            per_file = [opt for opt, value in (
+                ("--title", title), ("--url", url), ("--doi", doi), ("--bibtex", bibtex),
+            ) if value]
+            if per_file:
+                raise click.UsageError(
+                    f"{', '.join(per_file)} describe a single source and cannot be "
+                    "used with a glob pattern; ingest those files one at a time"
+                )
             paths = sorted(globmod.glob(source, recursive=True))
             paths = [Path(p) for p in paths if Path(p).is_file()]
             if not paths:
@@ -679,8 +691,9 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
                         root=root, db=db, source_path=p,
                         title=None, source_type=source_type, shareable=shareable,
                         url=None, date=date, authors=list(author) if author else None,
-                        doi=doi,
                     )
+                    for warning in result.get("warnings", ()):
+                        click.echo(f"  Warning: {p}: {warning}", err=True)
                     if result.get("duplicate"):
                         click.echo(f"  DUP  {result['title']} (identical to existing source, skipped)")
                     else:
@@ -781,6 +794,8 @@ def _print_ingest_result(result: dict):
         click.echo(f"  Stored: {result['relative_path']}")
         click.echo("  Skipped: no changes made.")
         return
+    for warning in result.get("warnings", ()):
+        click.echo(f"Warning: {warning}", err=True)
     click.echo(f"Ingested: {result['title']}")
     click.echo(f"  Source ID: {result['source_id']}")
     click.echo(f"  Cite key: {result['cite_key']}")
@@ -1318,8 +1333,13 @@ def registry():
 @json_option
 def registry_list(json_output):
     """List all registered crucible instances."""
-    from crucible.registry import list_instances, resolve_db_path
+    from crucible.registry import list_instances, problem, resolve_db_path
     instances = list_instances()
+    trouble = problem()
+    if trouble and not instances:
+        raise click.ClickException(trouble)
+    if trouble:
+        _warn(f"Warning: {trouble} Only its usable entries are listed.")
     if json_output:
         for inst in instances:
             db_path = resolve_db_path(inst)
@@ -2350,23 +2370,28 @@ def _is_own_sidecar(root: Path, db, src: dict, disk_path: Path, sidecar: Path) -
 def delete(path, yes, delete_file):
     """Delete an article or source from the database.
 
-    PATH can be a database path, partial path, or title fragment.
-    Searches articles first, then sources.
+    PATH can be an article or source path, a source's cite key, or a
+    partial path or title fragment. Exact matches win: an article path,
+    then a source path, then a cite key. A fragment must match exactly one
+    article or source; if it matches several, nothing is deleted and the
+    candidates are listed.
     """
     root = get_root()
     db = get_db(root)
 
-    # Try to find as article
+    # Exact matches first, so a cite key such as smith2024 deletes that
+    # source, not an article whose path merely contains it. Paths may be
+    # given relative to the cwd, the project, the wiki, or absolute.
     try:
         article = _lookup_project_path(root, path, db.get_article_by_path)
+        src = None if article else _lookup_project_path(root, path, db.get_source_by_path)
+        if not article and not src:
+            src = _source_by_cite_key(db, path)
+        if not article and not src:
+            article, src = _fuzzy_delete_match(db, path)
     except click.ClickException:
         db.close()
         raise
-    if not article:
-        for a in db.list_articles():
-            if path in a["path"] or path in a["title"]:
-                article = a
-                break
 
     if article:
         click.echo(f"Article: {article['title']}")
@@ -2383,14 +2408,6 @@ def delete(path, yes, delete_file):
         click.echo("  Deleted from database.")
         db.close()
         return
-
-    # Try to find as source
-    src = _lookup_project_path(root, path, db.get_source_by_path)
-    if not src:
-        for s in db.list_sources():
-            if path in s["path"] or path in s["title"]:
-                src = s
-                break
 
     if src:
         articles = db.source_articles(src["id"])
@@ -2437,6 +2454,33 @@ def delete(path, yes, delete_file):
 
     db.close()
     raise click.ClickException(f"Not found: {path}")
+
+
+def _source_by_cite_key(db, key: str) -> dict | None:
+    """The one source row with cite key `key`, or None (also when several share it)."""
+    found = [s for s in db.list_sources() if _source_metadata(s).get("cite_key") == key]
+    return found[0] if len(found) == 1 else None
+
+
+def _fuzzy_delete_match(db, fragment: str) -> tuple[dict | None, dict | None]:
+    """The single article or source whose path or title contains `fragment`.
+
+    Returns (article, None), (None, source) or (None, None). Raises a
+    ClickException listing the candidates when more than one matches, so
+    delete never picks one by the order rows happen to be listed in.
+    """
+    articles = [a for a in db.list_articles()
+                if fragment in a["path"] or fragment in (a["title"] or "")]
+    sources = [s for s in db.list_sources()
+               if fragment in s["path"] or fragment in (s["title"] or "")]
+    if len(articles) + len(sources) > 1:
+        lines = [f"  article: {a['path']} ({a['title']})" for a in articles]
+        lines += [f"  source:  {s['path']} ({s['title']})" for s in sources]
+        raise click.ClickException(
+            f"'{fragment}' matches {len(lines)} articles and sources; nothing was "
+            "deleted. Give the exact path or cite key of one:\n" + "\n".join(lines)
+        )
+    return (articles[0] if articles else None), (sources[0] if sources else None)
 
 
 @cli.command()
@@ -2512,6 +2556,11 @@ def merge(source, dry_run, yes):
                     click.echo(f"  article: {rel_within_wiki} -> {label} (renamed)")
                 else:
                     click.echo(f"  article: {rel_within_wiki}")
+            for wiki_file, dest_path in plan.wiki_files:
+                rel_within_wiki = str(wiki_file.relative_to(source_wiki))
+                label = plan.wiki_renames.get(rel_within_wiki)
+                suffix = f" -> {label} (renamed)" if label else ""
+                click.echo(f"  wiki file: {rel_within_wiki}{suffix}")
             for cite_key, _ in plan.bib_entries:
                 click.echo(f"  bib: {cite_key}")
             for cite_key, path in plan.bib_file_fields.items():
@@ -2526,7 +2575,8 @@ def merge(source, dry_run, yes):
 
     # Sync. Everything above is already in place, so a failure here leaves
     # a complete merge whose database the next sync brings up to date.
-    if not dry_run and (plan.articles or plan.sources or plan.bib_entries):
+    if not dry_run and (plan.articles or plan.sources or plan.bib_entries
+                        or plan.wiki_files or plan.bib_file_fields):
         click.echo()
         ctx = click.get_current_context()
         try:
@@ -2560,9 +2610,16 @@ def merge(source, dry_run, yes):
     if plan.sidecars:
         action = "Would copy" if dry_run else "Copied"
         click.echo(f"  {action} {len(plan.sidecars)} missing text sidecar(s)")
+    if plan.wiki_files:
+        action = "Would copy" if dry_run else "Copied"
+        click.echo(f"  {action} {len(plan.wiki_files)} other wiki file(s) (figures, data)")
+    if plan.wiki_unchanged:
+        click.echo(
+            f"  Skipped {plan.wiki_unchanged} wiki file(s) the target already has"
+        )
     if plan.wiki_renames:
         click.echo(
-            f"  Renamed {len(plan.wiki_renames)} article(s) to avoid conflicts"
+            f"  Renamed {len(plan.wiki_renames)} wiki file(s) to avoid conflicts"
         )
 
 
@@ -2572,25 +2629,100 @@ _MERGE_STAGING_PREFIX = ".merge-staging-"
 
 
 def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path) -> None:
-    """Add the incoming wiki articles to plan, renaming any that collide."""
+    """Add the incoming wiki files to plan, renaming any that collide.
+
+    Articles (.org) and the other files beside them (figures, data) follow
+    the same rules: an incoming file whose destination, or one of the
+    renamed copies an earlier merge made of it, already holds the same
+    bytes is not copied again, so merging a crucible twice adds nothing;
+    any other collision gets a free name (``name_1.org``) and links to it
+    are rewritten.
+    """
     if not source_wiki.exists():
         return
     planned: set[Path] = set()
+    target_cdir = target_wiki.parent
+
+    def free(path: Path) -> bool:
+        return not (path.exists() or path.is_symlink() or path in planned)
+
+    def already_there(src: Path, dest: Path, is_article: bool) -> bool:
+        """Whether dest, or a renamed copy of it, already has src's content."""
+        data = src.read_bytes()
+        stem, suffix = dest.stem, dest.suffix
+        candidate, counter = dest, 1
+        while candidate.exists() or candidate.is_symlink():
+            if candidate.is_file() and not candidate.is_symlink():
+                existing = candidate.read_bytes()
+                if existing == data:
+                    return True
+                if is_article and plan.path_renames:
+                    # An earlier merge may have rewritten its source links.
+                    text = data.decode("utf-8", errors="surrogateescape")
+                    rewritten = _rewrite_links_in_text(
+                        text, candidate, target_cdir, plan.path_renames)
+                    if rewritten.encode("utf-8", errors="surrogateescape") == existing:
+                        return True
+            candidate = dest.parent / f"{stem}_{counter}{suffix}"
+            counter += 1
+        return False
+
     # The same walk sync uses: only the top-level index.org is generated.
-    for org_path in _wiki_article_files(source_wiki):
-        rel_within_wiki = org_path.relative_to(source_wiki)
+    incoming = [(p, True) for p in _wiki_article_files(source_wiki)]
+    incoming += [(p, False) for p in _wiki_other_files(source_wiki)]
+    for src_path, is_article in incoming:
+        rel_within_wiki = src_path.relative_to(source_wiki)
         dest_path = target_wiki / rel_within_wiki
-        if dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
+        if dest_path.is_file() and already_there(src_path, dest_path, is_article):
+            plan.wiki_unchanged += 1
+            continue
+        if not free(dest_path):
             stem, suffix = dest_path.stem, dest_path.suffix
             counter = 1
-            while dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
+            while not free(dest_path):
                 dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
                 counter += 1
             plan.wiki_renames[str(rel_within_wiki)] = str(
                 dest_path.relative_to(target_wiki)
             )
         planned.add(dest_path)
-        plan.articles.append((org_path, dest_path))
+        if is_article:
+            plan.articles.append((src_path, dest_path))
+        else:
+            plan.wiki_files.append((src_path, dest_path))
+
+
+def _wiki_other_files(wiki_dir: Path) -> list[Path]:
+    """The files under a wiki's subdirectories that are not .org articles, sorted.
+
+    Figures and data that articles link to. Files at the top level of the
+    wiki (MANIFEST.md, viz.html, ...) are generated, and so is _build/;
+    hidden files and directories and editor backups are skipped too.
+    """
+    found: list[Path] = []
+    seen: set[tuple[int, int]] = set()
+
+    def walk(directory: Path, top: bool) -> None:
+        try:
+            st = directory.stat()
+        except OSError:
+            return
+        if (st.st_dev, st.st_ino) in seen:
+            return
+        seen.add((st.st_dev, st.st_ino))
+        for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+            name = entry.name
+            if name.startswith((".", "#")) or name.endswith("~"):
+                continue
+            path = Path(entry.path)
+            if entry.is_dir():
+                if not (top and name == "_build"):
+                    walk(path, False)
+            elif entry.is_file() and not top and not name.endswith(".org"):
+                found.append(path)
+
+    walk(wiki_dir, True)
+    return found
 
 
 def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
@@ -2622,6 +2754,7 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
         if copy.src_text is not None:
             copies.append((copy.src_text, copy.dest_file.with_suffix(".txt")))
     copies.extend(plan.sidecars)
+    copies.extend(plan.wiki_files)
     copies.extend(plan.articles)
 
     placed: list[tuple[Path, Path]] = []   # (staged, dest) moved into place
@@ -2636,9 +2769,8 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
             shutil.copy2(src, staged)
             staged_files.append((staged, dest))
         article_files = staged_files[len(copies) - len(plan.articles):]
-        rewrites = (
-            _rewrite_article_links(article_files, target_wiki, plan.wiki_renames)
-            if plan.wiki_renames else 0
+        rewrites = _rewrite_article_links(
+            article_files, target_cdir, _merge_renames(plan)
         )
 
         with FileLock(bib_path.with_suffix(".bib.lock"), timeout=10):
@@ -2808,6 +2940,12 @@ class _MergePlan:
     # wiki-relative renames of those that collide with existing articles.
     articles: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
     wiki_renames: dict[str, str] = dataclass_field(default_factory=dict)
+    # Other incoming wiki files (figures, data), (source path, destination).
+    wiki_files: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
+    wiki_unchanged: int = 0   # incoming wiki files the target already has
+    # Incoming sources (and sidecars) stored under another path in the
+    # target, relative to .crucible/, so article links can follow them.
+    path_renames: dict[str, str] = dataclass_field(default_factory=dict)
     skipped: int = 0   # identical sources the target already has
     outside: int = 0   # indexed sources stored outside .crucible/, not copied
     warnings: list[str] = dataclass_field(default_factory=list)
@@ -2832,7 +2970,10 @@ def _plan_source_merge(
     them all at once. Nothing has been written when it is raised.
     """
     from crucible import bibtex
-    from crucible.ingest import _parse_bib_fields, _resolve_bib_file, file_sha256
+    from crucible.ingest import (
+        _from_disk_scan, _parse_bib_fields, _resolve_bib_file, file_sha256,
+        generate_bib_entry,
+    )
 
     source_cdir = source_root / CRUCIBLE_DIR
     target_cdir = cdir(root)
@@ -2883,6 +3024,8 @@ def _plan_source_merge(
     incoming_keys: set[str] = set()
     mapped_keys: set[str] = set()   # keys whose source file is accounted for
     copied_keys: dict[str, str] = {}   # key -> new path, for sources copied as new
+    # Copied sources keyed by the disk scan (no bib entry): (key, copy).
+    disk_scanned: list[tuple[str, _SourceCopy]] = []
 
     for src in source_db.list_sources():
         try:
@@ -2987,12 +3130,24 @@ def _plan_source_merge(
                 ))
                 if cite_key:
                     copied_keys[cite_key] = new_rel
+                    if _from_disk_scan(src) and cite_key not in source_entries:
+                        disk_scanned.append((cite_key, plan.sources[-1]))
         except _MergeConflict as exc:
             problems.append(str(exc))
             continue
 
         if cite_key:
             mapped_keys.add(cite_key)
+        # Article links to the incoming file follow it to its new name.
+        try:
+            dest_within = str(Path(new_rel).relative_to(CRUCIBLE_DIR))
+        except ValueError:
+            dest_within = None   # a target row stored outside .crucible/
+        if dest_within is not None and dest_within != str(rel_within):
+            plan.path_renames[str(rel_within)] = dest_within
+            if src_text is not None:
+                plan.path_renames[str(rel_within.with_suffix(".txt"))] = str(
+                    Path(dest_within).with_suffix(".txt"))
         remember(src_file, new_rel, cite_key)
         if src_text is not None:
             remember(src_text, str(Path(new_rel).with_suffix(".txt")), cite_key)
@@ -3026,6 +3181,19 @@ def _plan_source_merge(
                     problems.append(problem)
                 else:
                     plan.bib_file_fields[cite_key] = copied_keys[cite_key]
+            elif cite_key not in mapped_keys:
+                # A bibliography-only entry the target already has under
+                # this key is dropped as a duplicate, which is only right
+                # when it is the same reference. If it is a different
+                # paper, the merge is refused, as for a source whose key
+                # collides: the user renames one key and merges again.
+                problem = _bib_identity_problem(
+                    f"Cannot safely merge bibliography entry '{cite_key}': the "
+                    "target bibliography already has an entry with this key",
+                    target_entries.get(cite_key, []), entry_text,
+                )
+                if problem:
+                    problems.append(problem)
             continue
 
         try:
@@ -3063,9 +3231,61 @@ def _plan_source_merge(
             continue
         plan.bib_entries.append((cite_key, entry_text))
 
+    # A source the disk scan keyed is keyed by its file's stem, so one the
+    # merge renames (foo.csv -> foo_1.csv), or whose key was not its stem,
+    # would get a new key on the next sync and break the incoming articles
+    # that cite it. Its key is pinned with a bibliography entry naming the
+    # file. A target entry with the key would capture it instead.
+    for cite_key, copy in disk_scanned:
+        if cite_key in target_entries:
+            problems.append(
+                f"Cannot safely merge '{copy.src['path']}' (citation key "
+                f"'{cite_key}', from its file name): the target bibliography "
+                "already has an entry with this key. Rename the file in the "
+                "source crucible, sync it, and merge again."
+            )
+            continue
+        if Path(copy.new_rel).stem == cite_key:
+            continue
+        entry = generate_bib_entry(
+            cite_key, copy.src["title"] or cite_key, None, copy.src.get("date"),
+            None, copy.src["source_type"], file=copy.new_rel,
+        )
+        plan.bib_entries.append((cite_key, entry))
+        copy.metadata = {k: v for k, v in copy.metadata.items() if k != "disk_scan"}
+
     if problems:
         _raise_merge_problems(problems)
     return plan
+
+
+def _bib_identity_problem(
+    prefix: str, target_entries: list[str], incoming_entry: str
+) -> str | None:
+    """Why entries sharing a key may be different references, if they may.
+
+    They may when they disagree on DOI or title.
+    """
+    from crucible.ingest import _parse_bib_fields
+
+    incoming_fields = _parse_bib_fields(incoming_entry)
+    identifying = [
+        ("doi", "DOIs", lambda v: re.sub(
+            r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "", v.strip().lower())),
+        # Braces only protect case: {E}vidence is Evidence.
+        ("title", "titles", lambda v: re.sub(
+            r"[\W_]+", " ", v.replace("{", "").replace("}", "").lower()).strip()),
+    ]
+    for target_entry in target_entries:
+        target_fields = _parse_bib_fields(target_entry)
+        for name, label, norm in identifying:
+            ours, theirs = target_fields.get(name), incoming_fields.get(name)
+            if ours and theirs and norm(ours) != norm(theirs):
+                return (
+                    f"{prefix}, and the two entries have different {label}, so they "
+                    "may not be the same reference. Rename one of the keys."
+                )
+    return None
 
 
 def _bib_attach_problem(
@@ -3096,22 +3316,7 @@ def _bib_attach_problem(
             "target (correcting the file field if the file has moved), or rename "
             "one of the keys."
         )
-    incoming_fields = _parse_bib_fields(incoming_entry)
-    identifying = [
-        ("doi", "DOIs", lambda v: re.sub(
-            r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "", v.strip().lower())),
-        # Braces only protect case: {E}vidence is Evidence.
-        ("title", "titles", lambda v: re.sub(
-            r"[\W_]+", " ", v.replace("{", "").replace("}", "").lower()).strip()),
-    ]
-    for name, label, norm in identifying:
-        ours, theirs = target_fields.get(name), incoming_fields.get(name)
-        if ours and theirs and norm(ours) != norm(theirs):
-            return (
-                f"{prefix}, and the two entries have different {label}, so they "
-                "may not be the same reference. Rename one of the keys."
-            )
-    return None
+    return _bib_identity_problem(prefix, target_entries, incoming_entry)
 
 
 def _raise_merge_problems(problems: list[str]) -> NoReturn:
@@ -3199,57 +3404,81 @@ def _resolve_merge_source(source: str) -> Path:
     )
 
 
+def _merge_renames(plan: "_MergePlan") -> dict[str, str]:
+    """Every file a merge puts at a path other than its own, relative to .crucible/.
+
+    Renamed sources and their sidecars, sources the target already holds
+    under another name, and renamed wiki files.
+    """
+    renames = dict(plan.path_renames)
+    for old, new in plan.wiki_renames.items():
+        renames[str(Path("wiki") / old)] = str(Path("wiki") / new)
+    return renames
+
+
+def _rewrite_links_in_text(
+    content: str, final_path: Path, target_cdir: Path, renames: dict[str, str]
+) -> str:
+    """Rewrite [[file:...]] links in an article's text for renamed files.
+
+    Links are resolved relative to final_path, the path the article has in
+    the target. renames maps paths relative to target_cdir (.crucible/).
+    """
+    target_cdir_resolved = target_cdir.resolve()
+
+    def repl(match: re.Match) -> str:
+        # FILE_LINK_RE is the pattern sync reads links with, so every
+        # form it counts ([[file:x]], [[./x.org]], [[x.org]]) is
+        # rewritten. Group 1 is the path alone: an org search option
+        # (::*Heading) and the description stay as they were.
+        link_path = match.group(1)
+        target = Path(os.path.expanduser(link_path))
+        resolved = (final_path.parent / target).resolve()
+        try:
+            rel = str(resolved.relative_to(target_cdir_resolved))
+        except ValueError:
+            return match.group(0)
+        if rel not in renames:
+            return match.group(0)
+        new_target = target_cdir / renames[rel]
+        if target.is_absolute():
+            new_link = str(new_target.resolve())
+        else:
+            new_link = os.path.relpath(new_target, final_path.parent)
+            bare_link = not match.group(0).startswith("[[file:")
+            if bare_link and not new_link.startswith(("./", "../")):
+                new_link = "./" + new_link  # keep it a link org reads
+        start = match.start(1) - match.start(0)
+        end = match.end(1) - match.start(0)
+        whole = match.group(0)
+        return whole[:start] + new_link + whole[end:]
+
+    # One pass, so a link already rewritten is not rewritten again.
+    return FILE_LINK_RE.sub(repl, content)
+
+
 def _rewrite_article_links(
-    files: list[tuple[Path, Path]], target_wiki: Path, wiki_renames: dict[str, str]
+    files: list[tuple[Path, Path]], target_cdir: Path, renames: dict[str, str]
 ) -> int:
     """Rewrite [[file:...]] links in copied articles for renamed files.
 
-    Each item is (file to edit, the path that file will have in the target
-    wiki); links are resolved relative to the latter. Returns the number of
-    files modified.
+    Each item is (file to edit, the path that file will have in the target);
+    links are resolved relative to the latter. renames maps paths relative
+    to the target's .crucible/ directory: renamed wiki files and sources
+    alike. Returns the number of files modified.
     """
-    target_wiki_resolved = target_wiki.resolve()
+    if not renames:
+        return 0
     count = 0
-
     for org_file, final_path in files:
         # surrogateescape round-trips bytes that are not valid UTF-8, so
         # one badly encoded file neither aborts the merge nor is mangled.
         content = org_file.read_text(encoding="utf-8", errors="surrogateescape")
-
-        def repl(match: re.Match) -> str:
-            # FILE_LINK_RE is the pattern sync reads links with, so every
-            # form it counts ([[file:x]], [[./x.org]], [[x.org]]) is
-            # rewritten. Group 1 is the path alone: an org search option
-            # (::*Heading) and the description stay as they were.
-            link_path = match.group(1)
-            target = Path(os.path.expanduser(link_path))
-            resolved = (final_path.parent / target).resolve()
-            try:
-                wiki_rel = str(resolved.relative_to(target_wiki_resolved))
-            except ValueError:
-                return match.group(0)
-            if wiki_rel not in wiki_renames:
-                return match.group(0)
-            new_target = target_wiki / wiki_renames[wiki_rel]
-            if target.is_absolute():
-                new_link = str(new_target.resolve())
-            else:
-                new_link = os.path.relpath(new_target, final_path.parent)
-                bare_link = not match.group(0).startswith("[[file:")
-                if bare_link and not new_link.startswith(("./", "../")):
-                    new_link = "./" + new_link  # keep it a link org reads
-            start = match.start(1) - match.start(0)
-            end = match.end(1) - match.start(0)
-            whole = match.group(0)
-            return whole[:start] + new_link + whole[end:]
-
-        # One pass, so a link already rewritten is not rewritten again.
-        new_content = FILE_LINK_RE.sub(repl, content)
+        new_content = _rewrite_links_in_text(content, final_path, target_cdir, renames)
         if new_content != content:
             org_file.write_text(new_content, encoding="utf-8",
                                 errors="surrogateescape")
             count += 1
-
     return count
 
 
