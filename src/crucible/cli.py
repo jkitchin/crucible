@@ -554,8 +554,12 @@ def _safe_relative_to(target: Path, root: Path) -> str | None:
         return None
 
 
-def _resolve_source_keys(keys: list[str], sources: list[dict]) -> dict[str, list[int]]:
-    """Resolve cite keys, falling back to legacy source paths and titles."""
+def _source_key_index(sources: list[dict]) -> tuple[dict[str, int], list[dict]]:
+    """Split sources into a cite_key -> id map and the legacy sources without one.
+
+    Build this once per command and pass it to _resolve_source_keys, rather
+    than re-parsing every source's metadata for each article.
+    """
     key_to_src = {}
     legacy_sources = []
     for src in sources:
@@ -567,18 +571,66 @@ def _resolve_source_keys(keys: list[str], sources: list[dict]) -> dict[str, list
             key_to_src[cite_key] = src["id"]
         else:
             legacy_sources.append(src)
+    return key_to_src, legacy_sources
 
+
+def _legacy_key_matches(key: str, src: dict) -> bool:
+    """Whether a key names a legacy source by its file stem or title.
+
+    The key must appear as a whole token (bounded by non-alphanumerics), so
+    `legacy-path` matches `legacy-path-file.pdf` but `ml` does not match
+    `page.html`.
+    """
+    token = re.compile(
+        rf"(?<![0-9A-Za-z]){re.escape(key)}(?![0-9A-Za-z])", re.IGNORECASE
+    )
+    return bool(
+        token.search(Path(src["path"]).stem) or token.search(src.get("title") or "")
+    )
+
+
+def _resolve_source_keys(
+    keys: list[str], index: tuple[dict[str, int], list[dict]]
+) -> dict[str, list[int]]:
+    """Resolve cite keys, falling back to legacy source file stems and titles."""
+    key_to_src, legacy_sources = index
     return {
         key: [key_to_src[key]]
         if key in key_to_src
-        else [
-            src["id"]
-            for src in legacy_sources
-            if key in src["path"] or key in src.get("title", "")
-        ]
+        else [src["id"] for src in legacy_sources if _legacy_key_matches(key, src)]
         for key in keys
         if key
     }
+
+
+def _wiki_org_files(wiki_dir: Path) -> list[Path]:
+    """Return the wiki's article files, sorted.
+
+    The generated wiki/index.org is not an article. Entries that are not
+    regular files are skipped, such as the dangling `.#name.org` lock
+    symlinks Emacs creates while a buffer has unsaved changes.
+
+    Errors are raised rather than suppressed, so an incomplete scan can never
+    be mistaken for deleted articles. That is why this walks with scandir:
+    rglob and os.walk skip entries whose type cannot be read.
+    """
+    index_path = wiki_dir / "index.org"
+    org_files = []
+    pending = [wiki_dir]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISDIR(mode):
+                    pending.append(path)
+                elif (
+                    entry.name.endswith(".org")
+                    and path != index_path
+                    and (stat.S_ISREG(mode) or path.is_file())
+                ):
+                    org_files.append(path)
+    return sorted(org_files)
 
 
 def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
@@ -609,26 +661,26 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
     if not stat.S_ISDIR(wiki_stat.st_mode):
         return stats
 
-    # rglob and os.walk can suppress entry errors, leaving an incomplete scan.
-    org_files = []
-    pending = [wiki_dir]
-    while pending:
-        with os.scandir(pending.pop()) as entries:
-            for entry in entries:
-                path = Path(entry.path)
-                if stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode):
-                    pending.append(path)
-                if path.match("*.org") and path != wiki_dir / "index.org":
-                    org_files.append(path)
-    org_files.sort()
+    org_files = _wiki_org_files(wiki_dir)
     stats["files"] = len(org_files)
 
-    file_mtimes = {p: p.stat().st_mtime for p in org_files}
+    # A file deleted after the scan is treated like any other removed article.
+    file_mtimes = {}
+    for p in org_files:
+        try:
+            file_mtimes[p] = p.stat().st_mtime
+        except FileNotFoundError:
+            continue
+    org_files = list(file_mtimes)
 
     with db.conn.transaction():
         parsed = {}
         for org_path in org_files:
-            if org_path.stat().st_mtime != file_mtimes[org_path]:
+            try:
+                changed = org_path.stat().st_mtime != file_mtimes[org_path]
+            except FileNotFoundError:
+                changed = True
+            if changed:
                 on_skip(org_path)
                 stats["skipped"] += 1
                 continue
@@ -681,6 +733,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                 db.delete_article(art["id"])
                 stats["removed"] += 1
 
+        source_index = _source_key_index(db.list_sources())
         for org_path, (article_id, meta) in parsed.items():
             for link_target in meta.file_links:
                 target_path = (org_path.parent / link_target).resolve()
@@ -695,7 +748,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
             if source_keys:
-                for source_ids in _resolve_source_keys(source_keys, db.list_sources()).values():
+                for source_ids in _resolve_source_keys(source_keys, source_index).values():
                     for sid in source_ids:
                         db.link_article_source(article_id, sid)
 
@@ -1798,10 +1851,7 @@ def merge(source, dry_run, yes):
     copied_files = []   # absolute paths of newly copied org files
 
     if source_wiki.exists():
-        for org_path in sorted(source_wiki.rglob("*.org")):
-            if org_path.name == "index.org":
-                continue
-
+        for org_path in _wiki_org_files(source_wiki):
             rel_within_wiki = org_path.relative_to(source_wiki)
             dest_path = target_wiki / rel_within_wiki
 
@@ -2212,7 +2262,7 @@ def lint(json_output):
         })
 
     # 5. Articles missing required properties or referencing unknown sources
-    sources = db.list_sources()
+    source_index = _source_key_index(db.list_sources())
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
@@ -2234,7 +2284,7 @@ def lint(json_output):
                 "path": article['path'],
             })
         else:
-            for key, source_ids in _resolve_source_keys(source_keys, sources).items():
+            for key, source_ids in _resolve_source_keys(source_keys, source_index).items():
                 if not source_ids:
                     issues.append({
                         "type": "unresolved_source_key",
@@ -2253,10 +2303,9 @@ def lint(json_output):
 
     # 6. Wiki files not in database
     wiki_dir = cdir(root) / "wiki"
-    for org_path in wiki_dir.rglob("*.org"):
+    wiki_files = _wiki_org_files(wiki_dir) if wiki_dir.is_dir() else []
+    for org_path in wiki_files:
         rel = str(org_path.relative_to(root))
-        if org_path == wiki_dir / "index.org":
-            continue
         if not db.get_article_by_path(rel):
             issues.append({
                 "type": "untracked",

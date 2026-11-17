@@ -40,3 +40,16 @@ def test_empty_property_does_not_take_the_next_line(tmp_path):
     assert props["SOURCE_KEYS"] == ""
     assert props["DERIVED_FROM"] == "../concepts/b.org"
     assert props["STATUS"] == "draft"
+
+
+def test_property_drawer_is_case_insensitive():
+    text = (
+        "#+title: A\n\n* A\n:properties:\n:article_type: summary\n"
+        ":Source_Keys: smith2024\n:end:\n"
+    )
+    meta = parse_org(text)
+    assert meta.properties["ARTICLE_TYPE"] == "summary"
+    assert meta.properties["SOURCE_KEYS"] == "smith2024"
+    _, body, _ = org_to_html(text)
+    assert "smith2024" in body
+    assert ":properties:" not in body

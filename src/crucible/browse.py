@@ -90,9 +90,9 @@ _TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _KEYWORD_RE = re.compile(r"^#\+\w+:.*$", re.MULTILINE)
 _DRAWER_RE = re.compile(
-    r"^\s*:PROPERTIES:\s*\n(.*?)\n\s*:END:\s*$", re.MULTILINE | re.DOTALL
+    r"^\s*:PROPERTIES:\s*\n(.*?)\n\s*:END:\s*$", re.MULTILINE | re.DOTALL | re.IGNORECASE
 )
-_PROP_LINE_RE = re.compile(r"^\s*:([A-Z_]+):\s+(.+?)\s*$", re.MULTILINE)
+_PROP_LINE_RE = re.compile(r"^\s*:([A-Za-z_]+):\s+(.+?)\s*$", re.MULTILINE)
 _SRC_BLOCK_RE = re.compile(
     r"^#\+BEGIN_SRC\s*(.*?)\s*\n(.*?)^#\+END_SRC\s*$",
     re.MULTILINE | re.DOTALL,

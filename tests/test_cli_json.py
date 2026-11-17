@@ -500,3 +500,39 @@ def test_init_acts_on_its_root_not_the_current_directory(project, tmp_path, monk
     assert (other / ".crucible" / "wiki" / "MANIFEST.md").exists()
     paths = [e["path"] for e in run_json("registry", "list")]
     assert str(other.resolve()) in paths
+
+
+def test_sync_skips_emacs_lock_files(project):
+    # Emacs marks a buffer with unsaved changes with a dangling symlink.
+    lock = project / ".crucible" / "wiki" / "concepts" / ".#activation-energy.org"
+    lock.symlink_to("user@host.1234:1700000000")
+
+    for command in (["sync"], ["lint", "--json"]):
+        result = CliRunner().invoke(cli, command)
+        assert result.exit_code == 0, result.output
+    assert run_json("stats")["articles"] == 2
+
+
+def test_legacy_source_keys_match_whole_tokens(project):
+    cdir = project / ".crucible"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/sources/external/web/page.html",
+            title="Some web page",
+            source_type="web",
+            metadata={},
+        )
+    finally:
+        db.close()
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: ml")
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    assert run_json("sources", CONCEPT_PATH) == []
+    assert any(
+        issue["type"] == "unresolved_source_key" and issue["key"] == "ml"
+        for issue in run_json("lint")
+    )
