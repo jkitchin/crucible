@@ -402,6 +402,15 @@ class CrucibleDB:
         self.conn.commit()
         return cur.lastrowid
 
+    def update_source_location(self, source_id: int, path: str, source_type: str,
+                               shareable: bool):
+        """Point an existing source row (and its article links) at a new path."""
+        self.conn.execute(
+            "UPDATE sources SET path = ?, source_type = ?, shareable = ? WHERE id = ?",
+            (path, source_type, int(shareable), source_id),
+        )
+        self.conn.commit()
+
     def get_source(self, source_id: int) -> dict | None:
         row = self.conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
         return dict(row) if row else None

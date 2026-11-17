@@ -746,7 +746,11 @@ def sync():
     from crucible.registry import register as registry_register
     registry_register(root.name, str(root))
 
-    sources_added = upsert_sources_from_bib(root, db)
+    sources_added = upsert_sources_from_bib(
+        root, db,
+        on_warning=lambda m: click.echo(f"Warning: {m}", err=True),
+        on_note=lambda m: click.echo(f"  {m}"),
+    )
     sources_added += upsert_sources_from_disk(root, db)
 
     stats = _sync_wiki_to_db(

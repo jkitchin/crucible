@@ -305,6 +305,56 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     return fields
 
 
+def add_bib_file_field(entry: str, rel_path: str) -> str:
+    """Return a BibTeX entry with a ``file`` field naming ``rel_path``.
+
+    The ``file`` field (the org-ref/BibTeX convention for a local copy) is
+    what lets `crucible sync` map a cite key back to its source file when
+    the database is rebuilt. An entry that already has one is returned
+    unchanged. The entry is closed with ``\\n}`` so parse_bib_file can read
+    it even when it arrived on a single line (as doi.org entries do).
+    """
+    text = entry.rstrip()
+    if not text.endswith("}"):
+        return entry
+    head = text[:-1].rstrip()
+    _, sep, body = head.partition(",")
+    if not sep or "file" in _parse_bib_fields(body):
+        return entry
+    if not head.endswith(","):
+        head += ","
+    return f"{head}\n  file = {{{_bib_value(rel_path)}}},\n}}"
+
+
+def record_bib_file_fields(root: Path, paths: dict[str, str]) -> list[str]:
+    """Add ``file`` fields to references.bib entries that lack one.
+
+    ``paths`` maps cite keys to project-relative source paths. Entries that
+    already have a ``file`` field are left alone. Returns the cite keys
+    that were updated.
+    """
+    bib_path = root / CRUCIBLE_DIR / "references.bib"
+    lock_path = bib_path.with_suffix(".bib.lock")
+    if not paths or not bib_path.exists():
+        return []
+
+    updated: list[str] = []
+
+    def add_field(m: re.Match) -> str:
+        key = m.group(2)
+        if key not in paths or "file" in _parse_bib_fields(m.group(3)):
+            return m.group(0)
+        updated.append(key)
+        return add_bib_file_field(m.group(0), paths[key])
+
+    with FileLock(lock_path, timeout=10):
+        text = bib_path.read_text(encoding="utf-8")
+        new_text = _BIB_ENTRY_RE.sub(add_field, text)
+        if updated:
+            atomic_write_text(bib_path, new_text)
+    return updated
+
+
 def parse_bib_file(bib_path: Path) -> list[dict]:
     """Parse a BibTeX file into a list of entries.
 
@@ -430,74 +480,116 @@ def upsert_sources_from_disk(root: Path, db) -> int:
     return inserted
 
 
-def upsert_sources_from_bib(root: Path, db) -> int:
+def _summarize_keys(keys: list[str], limit: int = 10) -> str:
+    """Join keys for a one-line message, truncating long lists."""
+    shown = ", ".join(keys[:limit])
+    if len(keys) > limit:
+        shown += f", ... ({len(keys) - limit} more)"
+    return shown
+
+
+def _bib_entry_rel_path(root: Path, file_field: str) -> tuple[str, Path]:
+    """Resolve a bib ``file`` field to (project-relative path, absolute path)."""
+    candidate = Path(file_field)
+    abs_path = candidate if candidate.is_absolute() else (root / candidate).resolve()
+    try:
+        return str(abs_path.relative_to(root.resolve())), abs_path
+    except ValueError:
+        return str(abs_path), abs_path
+
+
+def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> int:
     """Create source rows for bibliography entries with a file path.
 
     Safe to call repeatedly: entries whose cite_key already exists in
     sources.metadata are skipped. Used by auto-rebuild (no DB) and by
     `crucible sync` so bib edits are picked up without re-ingesting.
-    Unmapped entries and existing synthetic paths are reported.
+
+    A cite key maps to a source only through the entry's ``file`` field;
+    no path is invented for entries without one. To keep the database
+    regenerable, entries that lack a ``file`` field but whose cite key
+    already has a source row get the row's path written into
+    references.bib. Rows left by older versions at a synthetic
+    ``.crucible/bib/<key>`` path are moved to the entry's ``file`` path
+    once it has one, keeping their article links.
+
+    ``on_warning`` and ``on_note`` receive one aggregated message per kind
+    of problem or change (default: this module's logger).
 
     Returns the number of new sources inserted.
     """
-    import json as _json
+    warn = on_warning or logger.warning
+    note = on_note or logger.info
 
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     entries = parse_bib_file(bib_path)
 
-    existing_cite_keys: set[str] = set()
     sources = db.list_sources()
+    existing_paths: set[str] = {src["path"] for src in sources}
+    rows_by_key: dict[str, dict] = {}
+    invalid: list[str] = []
     for src in sources:
         raw = src.get("metadata") or "{}"
         try:
-            meta = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+            meta = json.loads(raw) if isinstance(raw, str) else (raw or {})
         except (ValueError, TypeError):
-            logger.warning("Source '%s' has invalid metadata.", src["path"])
-            continue
-        if not isinstance(meta, dict):
-            logger.warning("Source '%s' has invalid metadata.", src["path"])
-            continue
-        key = meta.get("cite_key")
-        if key is not None and not isinstance(key, str):
-            logger.warning("Source '%s' has an invalid citation key.", src["path"])
+            meta = None
+        key = meta.get("cite_key") if isinstance(meta, dict) else None
+        if not isinstance(meta, dict) or (key is not None and not isinstance(key, str)):
+            invalid.append(src["path"])
             continue
         if key:
-            existing_cite_keys.add(key)
-            if (
-                src["path"] == f"{CRUCIBLE_DIR}/bib/{key}"
-                and not (root / src["path"]).is_file()
-            ):
-                logger.warning(
-                    "Source '%s' has a nonexistent synthetic bibliography path; "
-                    "reconcile it manually.",
-                    key,
-                )
+            rows_by_key.setdefault(key, src)
 
-    existing_paths: set[str] = {src["path"] for src in sources}
+    def is_synthetic(src: dict, key: str) -> bool:
+        return src["path"] == f"{CRUCIBLE_DIR}/bib/{key}"
+
+    # Record known paths in references.bib so a rebuild can recover them.
+    backfill = {
+        entry["cite_key"]: rows_by_key[entry["cite_key"]]["path"]
+        for entry in entries
+        if not entry.get("file")
+        and entry["cite_key"] in rows_by_key
+        and not is_synthetic(rows_by_key[entry["cite_key"]], entry["cite_key"])
+    }
+    recorded = record_bib_file_fields(root, backfill)
+    for key in recorded:
+        entry = next(e for e in entries if e["cite_key"] == key)
+        entry["file"] = backfill[key]
 
     inserted = 0
+    unmapped: list[str] = []
+    synthetic: list[str] = []
+    relocated: list[str] = []
     for entry in entries:
         cite_key = entry["cite_key"]
-        if cite_key in existing_cite_keys:
-            continue
-
         file_field = entry.get("file")
-        if not file_field:
-            logger.warning(
-                "Skipping bibliography entry '%s': no file field establishes a source path.",
-                cite_key,
-            )
-            continue
-        candidate = Path(file_field)
-        if not candidate.is_absolute():
-            abs_path = (root / candidate).resolve()
-        else:
-            abs_path = candidate
-        try:
-            rel_path = str(abs_path.relative_to(root.resolve()))
-        except ValueError:
-            rel_path = str(abs_path)
+        existing = rows_by_key.get(cite_key)
 
+        if existing is not None:
+            if not is_synthetic(existing, cite_key):
+                continue
+            if not file_field:
+                synthetic.append(cite_key)
+                continue
+            rel_path, abs_path = _bib_entry_rel_path(root, file_field)
+            if rel_path in existing_paths:
+                synthetic.append(cite_key)
+                continue
+            db.update_source_location(
+                existing["id"],
+                rel_path,
+                _source_type_for_entry(entry["entry_type"], abs_path),
+                not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/"),
+            )
+            existing_paths.add(rel_path)
+            relocated.append(cite_key)
+            continue
+
+        if not file_field:
+            unmapped.append(cite_key)
+            continue
+        rel_path, abs_path = _bib_entry_rel_path(root, file_field)
         if rel_path in existing_paths:
             continue
 
@@ -521,11 +613,46 @@ def upsert_sources_from_bib(root: Path, db) -> int:
                 date=date,
                 metadata=metadata,
             )
-            existing_cite_keys.add(cite_key)
+            rows_by_key[cite_key] = {"path": rel_path}
             existing_paths.add(rel_path)
             inserted += 1
         except Exception:
             continue
+
+    # Synthetic rows whose key has no bib entry at all.
+    bib_keys = {entry["cite_key"] for entry in entries}
+    synthetic.extend(
+        key for key, src in rows_by_key.items()
+        if key not in bib_keys and is_synthetic(src, key)
+    )
+
+    if recorded:
+        note(
+            f"Recorded source file paths for {len(recorded)} bibliography "
+            f"entries in references.bib: {_summarize_keys(recorded)}"
+        )
+    if relocated:
+        note(
+            f"Moved {len(relocated)} sources from synthetic .crucible/bib/ paths "
+            f"to their bibliography file paths: {_summarize_keys(relocated)}"
+        )
+    if unmapped:
+        warn(
+            f"{len(unmapped)} bibliography entries have no file field, so no "
+            f"source was registered for them: {_summarize_keys(unmapped)}"
+        )
+    if synthetic:
+        warn(
+            f"{len(synthetic)} sources still point at nonexistent synthetic "
+            f".crucible/bib/ paths: {_summarize_keys(synthetic)}. Add a file "
+            "field naming each source's file to its references.bib entry and "
+            "run sync again."
+        )
+    if invalid:
+        warn(
+            f"{len(invalid)} sources have invalid metadata (not a JSON object, "
+            f"or a non-string cite_key): {_summarize_keys(invalid)}"
+        )
 
     return inserted
 
@@ -767,6 +894,9 @@ def ingest_source(
         bib_entry = generate_bib_entry(
             cite_key, title, authors, date, url, source_type, doi=doi,
         )
+    # The file field maps the cite key back to this file when the database
+    # is rebuilt (e.g. on a fresh clone).
+    bib_entry = add_bib_file_field(bib_entry, rel_path)
     append_bib_entry(root, bib_entry, cite_key)
 
     # Register in database (store cite_key and content hash in metadata)

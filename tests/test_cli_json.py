@@ -131,7 +131,7 @@ def test_lint_json_issues_name_their_file(project):
 
 
 @pytest.mark.parametrize("rebuild", [False, True])
-def test_sync_does_not_invent_a_source_for_an_unmapped_bib_entry(project, caplog, rebuild):
+def test_sync_does_not_invent_a_source_for_an_unmapped_bib_entry(project, rebuild):
     cdir = project / ".crucible"
     bib = cdir / "references.bib"
     original_bib = "@misc{widget2026,\n  title = {Widget Notes},\n}\n"
@@ -154,11 +154,11 @@ def test_sync_does_not_invent_a_source_for_an_unmapped_bib_entry(project, caplog
         db.close()
     assert run_json("sources", CONCEPT_PATH) == []
     assert bib.read_text() == original_bib
-    assert "widget2026" in caplog.text
-    assert "no file" in caplog.text.lower()
+    assert "widget2026" in result.stderr
+    assert "no file field" in result.stderr
 
 
-def test_sync_registers_an_explicit_bib_file(project, caplog):
+def test_sync_registers_an_explicit_bib_file(project):
     cdir = project / ".crucible"
     (cdir / "sources/data/evidence.md").write_text("Mapped source.\n")
     (cdir / "references.bib").write_text(
@@ -176,12 +176,12 @@ def test_sync_registers_an_explicit_bib_file(project, caplog):
     assert [row["path"] for row in run_json("sources", CONCEPT_PATH)] == [
         ".crucible/sources/data/evidence.md"
     ]
-    assert "widget2026" not in caplog.text
+    assert "widget2026" not in result.stderr
 
 
 @pytest.mark.parametrize("with_bib", [False, True])
 def test_sync_warns_about_an_existing_phantom_source_without_deleting_it(
-    project, caplog, with_bib
+    project, with_bib
 ):
     cdir = project / ".crucible"
     if with_bib:
@@ -204,12 +204,12 @@ def test_sync_warns_about_an_existing_phantom_source_without_deleting_it(
         assert any(row["path"] == ".crucible/bib/widget2026" for row in db.list_sources())
     finally:
         db.close()
-    assert "widget2026" in caplog.text
-    assert "synthetic" in caplog.text.lower()
+    assert "widget2026" in result.stderr
+    assert "synthetic" in result.stderr
 
 
 @pytest.mark.parametrize("metadata", ["[]", '{"cite_key": ["invalid"]}'])
-def test_sync_handles_invalid_source_metadata_with_no_bibliography(project, caplog, metadata):
+def test_sync_handles_invalid_source_metadata_with_no_bibliography(project, metadata):
     cdir = project / ".crucible"
     db = CrucibleDB(cdir / "crucible.db")
     try:
@@ -223,7 +223,134 @@ def test_sync_handles_invalid_source_metadata_with_no_bibliography(project, capl
 
     result = CliRunner().invoke(cli, ["sync"])
     assert result.exit_code == 0, result.output
-    assert "invalid" in caplog.text.lower()
+    assert "invalid metadata" in result.stderr
+    assert "legacy.md" in result.stderr
+
+
+def _bib_key_for(bib_text, title):
+    from crucible.ingest import _BIB_ENTRY_RE
+
+    return next(m.group(2) for m in _BIB_ENTRY_RE.finditer(bib_text) if title in m.group(3))
+
+
+@pytest.mark.parametrize("source_type", ["web", "notebook"])
+def test_ingested_source_keys_resolve_after_a_rebuild(project, tmp_path, source_type):
+    cdir = project / ".crucible"
+    original = tmp_path / "widget-notes.md"
+    original.write_text("Primary notes about widgets.\n")
+    result = CliRunner().invoke(
+        cli, ["ingest", str(original), "--title", "Widget Notes", "--type", source_type]
+    )
+    assert result.exit_code == 0, result.output
+    bib = (cdir / "references.bib").read_text()
+    key = _bib_key_for(bib, "Widget Notes")
+    assert "file = {.crucible/sources/" in bib
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", f":SOURCE_KEYS: {key}")
+    )
+
+    (cdir / "crucible.db").unlink()
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "Warning" not in result.stderr
+    [linked] = run_json("sources", CONCEPT_PATH)
+    assert linked["path"].endswith("widget-notes.md")
+    assert not [i for i in run_json("lint") if i["type"] == "unresolved_source_key"]
+
+
+def test_sync_records_known_paths_in_the_bibliography(project):
+    cdir = project / ".crucible"
+    (cdir / "sources/data/evidence.md").write_text("Mapped source.\n")
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/sources/data/evidence.md",
+            title="Widget Notes",
+            source_type="data",
+            metadata={"cite_key": "widget2026"},
+        )
+    finally:
+        db.close()
+    bib = cdir / "references.bib"
+    bib.write_text(
+        "@misc{other2025,\n  title = {Other},\n}\n\n"
+        "@misc{widget2026,\n  title = {Widget Notes}\n}\n"
+    )
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: widget2026")
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "Recorded source file paths for 1 bibliography entries" in result.stdout
+    assert "file = {.crucible/sources/data/evidence.md}" in bib.read_text()
+    assert "@misc{other2025,\n  title = {Other},\n}" in bib.read_text()
+
+    (cdir / "crucible.db").unlink()
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert [row["path"] for row in run_json("sources", CONCEPT_PATH)] == [
+        ".crucible/sources/data/evidence.md"
+    ]
+
+
+def test_sync_moves_a_synthetic_source_once_its_entry_names_a_file(project):
+    cdir = project / ".crucible"
+    (cdir / "sources/data/evidence.md").write_text("Mapped source.\n")
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: widget2026")
+    )
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/bib/widget2026",
+            title="Widget",
+            source_type="other",
+            metadata={"cite_key": "widget2026"},
+        )
+    finally:
+        db.close()
+    (cdir / "references.bib").write_text(
+        "@misc{widget2026,\n  title = {Widget},\n"
+        "  file = {.crucible/sources/data/evidence.md},\n}\n"
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "synthetic" not in result.stderr
+    paths = [row["path"] for row in run_json("sources", CONCEPT_PATH)]
+    assert paths == [".crucible/sources/data/evidence.md"]
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        assert [row["path"] for row in db.list_sources()] == paths
+    finally:
+        db.close()
+
+
+def test_unmapped_bib_entries_share_one_warning(project):
+    cdir = project / ".crucible"
+    (cdir / "references.bib").write_text(
+        "".join(f"@misc{{key{i},\n  title = {{T{i}}},\n}}\n\n" for i in range(15))
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert result.stderr.count("Warning:") == 1
+    assert "15 bibliography entries have no file field" in result.stderr
+    assert "(5 more)" in result.stderr
+
+
+def test_add_bib_file_field_handles_single_line_entries(tmp_path):
+    from crucible.ingest import add_bib_file_field, parse_bib_file
+
+    entry = add_bib_file_field(
+        "@article{k, title={A {B} c}, year={2024}}", ".crucible/sources/external/pdfs/a.pdf"
+    )
+    bib = tmp_path / "references.bib"
+    bib.write_text(entry + "\n")
+    [parsed] = parse_bib_file(bib)
+    assert parsed["cite_key"] == "k"
+    assert parsed["file"] == ".crucible/sources/external/pdfs/a.pdf"
+    assert add_bib_file_field(entry, "elsewhere.pdf") == entry
 
 
 def test_registry_list_json(project):
