@@ -145,6 +145,7 @@ def test_lint_resolves_source_keys_like_sync(project):
         ("badmetadata-file.pdf", "Old source", {}),
         ("nonobject-list.pdf", "List legacy source", {}),
         ("nonobject-null.pdf", "Null legacy source", {}),
+        ("invalid-key.pdf", "Invalid key source", {}),
         ("known2026-copy.pdf", "Lower priority", {}),
         ("falsepositive2026.pdf", "Different source", {"cite_key": "different2026"}),
     ]
@@ -152,6 +153,7 @@ def test_lint_resolves_source_keys_like_sync(project):
         "badmetadata-file.pdf": "{invalid",
         "nonobject-list.pdf": "[]",
         "nonobject-null.pdf": "null",
+        "invalid-key.pdf": '{"cite_key": ["not-a-key"]}',
     }
     db = CrucibleDB(cdir / "crucible.db")
     try:
@@ -174,7 +176,7 @@ def test_lint_resolves_source_keys_like_sync(project):
         db.close()
 
     keys = (
-        "known2026 legacy-path Vintage badmetadata nonobject-list nonobject-null "
+        "known2026 legacy-path Vintage badmetadata nonobject-list nonobject-null invalid-key "
         "missing2026 falsepositive2026"
     )
     (project / CONCEPT_PATH).write_text(
@@ -195,6 +197,7 @@ def test_lint_resolves_source_keys_like_sync(project):
         ".crucible/sources/external/pdfs/badmetadata-file.pdf",
         ".crucible/sources/external/pdfs/nonobject-list.pdf",
         ".crucible/sources/external/pdfs/nonobject-null.pdf",
+        ".crucible/sources/external/pdfs/invalid-key.pdf",
     }
 
     issues = run_json("lint")
@@ -373,7 +376,8 @@ def test_sync_preserves_articles_when_wiki_traversal_fails(project, monkeypatch,
         )
         db.link_article_source(article_id, source_id)
         article_links = {
-            tuple(row) for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
+            (row["from_id"], row["to_id"])
+            for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
         }
         assert article_links
         original_scandir = os.scandir
@@ -387,10 +391,9 @@ def test_sync_preserves_articles_when_wiki_traversal_fails(project, monkeypatch,
                         inaccessible = Mock()
                         inaccessible.name = entry.name
                         inaccessible.path = entry.path
-                        inaccessible.is_dir.side_effect = PermissionError(
+                        inaccessible.stat.side_effect = PermissionError(
                             errno.EACCES, "Synthetic traversal failure", str(blocked)
                         )
-                        inaccessible.stat.side_effect = inaccessible.is_dir.side_effect
                         wrapped.append(inaccessible)
                     else:
                         wrapped.append(entry)
@@ -407,15 +410,13 @@ def test_sync_preserves_articles_when_wiki_traversal_fails(project, monkeypatch,
             return original_scandir(path)
 
         monkeypatch.setattr(os, "scandir", fail_scandir)
-        error = None
-        try:
+        with pytest.raises(PermissionError) as error:
             _sync_wiki_to_db(project, db)
-        except PermissionError as exc:
-            error = exc
 
         assert {row["id"] for row in db.list_articles()} == article_ids
         assert {
-            tuple(row) for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
+            (row["from_id"], row["to_id"])
+            for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
         } == article_links
         assert db.conn.execute(
             "SELECT article_id FROM article_sources WHERE article_id = ? AND source_id = ?",
@@ -425,8 +426,7 @@ def test_sync_preserves_articles_when_wiki_traversal_fails(project, monkeypatch,
             assert db.conn.execute(
                 "SELECT rowid FROM article_fts WHERE rowid = ?", (article_id,)
             ).fetchone()
-        assert error is not None
-        assert str(blocked) in str(error)
+        assert error.value.filename == str(blocked)
     finally:
         db.close()
 

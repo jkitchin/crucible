@@ -562,8 +562,9 @@ def _resolve_source_keys(keys: list[str], sources: list[dict]) -> dict[str, list
         md = _source_metadata(src)
         if not isinstance(md, dict):
             md = {}
-        if md.get("cite_key"):
-            key_to_src[md["cite_key"]] = src["id"]
+        cite_key = md.get("cite_key")
+        if isinstance(cite_key, str) and cite_key:
+            key_to_src[cite_key] = src["id"]
         else:
             legacy_sources.append(src)
 
