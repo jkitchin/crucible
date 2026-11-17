@@ -24,7 +24,10 @@ the project by walking up from the current directory to the nearest
 =.crucible/wiki/=. The home directory cannot be a project, because
 =~/.crucible/= holds the global registry.
 
-Safe to re-run: creates only what is missing.
+Safe to re-run: creates only what is missing. In a fresh clone of an
+existing project (wiki articles committed, the gitignored database
+missing), the database is rebuilt from the wiki and =references.bib=
+rather than created empty.
 
 ** =crucible install=
 
@@ -38,6 +41,8 @@ Does three things:
 1. Copies =skills/crucible/SKILL.md= to =~/.claude/skills/crucible/=
 2. Generates =wiki/MANIFEST.md= (as =crucible manifest= does)
 3. Adds a directive to =~/.claude/CLAUDE.md= pointing agents at the manifest
+   (replacing an existing crucible directive; if there are several, the
+   first is replaced and the rest removed)
 
 Install records what it copied (with a checksum) in
 =~/.claude/skills/crucible/.crucible-installed.json=. If you have edited an
@@ -294,10 +299,12 @@ crucible source SOURCE_PATH [--json]
 #+END_SRC
 
 SOURCE_PATH is the source's path (in any of the forms article paths
-take), or else part of its path or title; an empty one is an error. Shows the
+take) or cite key, or else part of its path or title; an empty one is an
+error. A partial path or title must match exactly one source: if it
+matches several, the candidates are listed and nothing is shown. Shows the
 source's metadata and the articles distilled from it, which is useful
-before asking Claude to reread and resummarize it. Exits 1 if no source
-matches.
+before asking Claude to reread and resummarize it. Exits 1 if no single
+source matches.
 
 ** =crucible concepts=
 
@@ -467,9 +474,17 @@ this project, then runs =crucible sync=. Everything is planned and
 checked before anything is written: a source whose cite key is already
 here is reused only when the files are identical, distinct sources keep
 distinct paths (renamed with a numeric suffix when needed, and the bib
-=file= fields follow), conflicting article files are renamed and links to
-them rewritten, and existing sidecars are never overwritten. If any part
-cannot be merged safely, the merge stops and lists every problem.
+=file= fields follow), conflicting article files are renamed and links (and =:DERIVED_FROM:=
+entries) to them rewritten, and existing sidecars are never overwritten.
+If any part cannot be merged safely, the merge stops and lists every
+problem. Merging the same crucible again adds nothing new. Symlinks in the
+incoming wiki that point outside it are not copied.
+
+The incoming crucible need not have a database (a fresh clone has none):
+merge builds a temporary one from its wiki and =references.bib=, and
+writes nothing into the incoming crucible. If its database is older than
+source files it holds, merge warns that those cannot be merged until it
+is synced.
 
 Merge refuses an incoming crucible in which two sources, or two
 =references.bib= entries, share a cite key, because it cannot tell which
@@ -500,7 +515,11 @@ Deleting a source also removes the =file= field from its
 resolve); otherwise the next sync would recreate the row from the entry.
 A file in =sources/notebooks/= or =sources/data/= that is left on disk is
 picked up again by sync's disk scan, so delete warns about it; use
-=--file= to delete the file too.
+=--file= to delete the file too. =--file= only deletes files inside the
+project's =.crucible/= directory: a source whose bib =file= field names a
+file elsewhere (a Zotero library, say) loses its row and that field, but
+the file is kept. The database row is deleted first, so if that fails
+nothing else changes.
 
 * Registry Commands
 
