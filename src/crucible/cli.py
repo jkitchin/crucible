@@ -13,6 +13,7 @@ from typing import NoReturn
 
 import click
 
+from crucible import DISTRIBUTION, package_version
 from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
@@ -254,6 +255,7 @@ def _emit_json(data) -> None:
 
 
 @click.group()
+@click.version_option(package_name=DISTRIBUTION, prog_name="crucible")
 @click.pass_context
 def cli(ctx):
     """Crucible - LLM-compiled knowledge base."""
@@ -267,12 +269,7 @@ def about(json_output):
     from crucible.database import SCHEMA_VERSION
     from crucible.registry import list_instances
 
-    # Package version
-    try:
-        from importlib.metadata import version as pkg_version
-        version = pkg_version("crucible")
-    except Exception:
-        version = "dev"
+    version = package_version()
 
     if json_output:
         project = None
@@ -1224,6 +1221,38 @@ def search(query, limit, search_all, mode, model, fts_weight, semantic_weight, r
             click.echo(f"    {r['path']}")
 
 
+def _resolve_article_arg(root: Path, db: CrucibleDB, article_path: str) -> str:
+    """Return the database path of the article that ARTICLE_PATH names.
+
+    Database paths are relative to the project root
+    (``.crucible/wiki/concepts/foo.org``). The argument may also be relative
+    to the current directory (``./.crucible/...``, or ``foo.org`` from inside
+    the wiki), absolute, or relative to the wiki directory
+    (``concepts/foo.org``). Raises a ClickException (exit 1) if no article
+    has that path, so a typo is not mistaken for "no results".
+    """
+    if db.get_article_by_path(article_path):
+        return article_path
+    candidates = []
+    given = Path(os.path.expanduser(article_path))
+    absolute = given if given.is_absolute() else Path.cwd() / given
+    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
+        for base in (root, root.resolve()):
+            rel = _safe_relative_to(target, base)
+            if rel is not None:
+                candidates.append(Path(rel).as_posix())
+    if not given.is_absolute():
+        candidates.append((Path(CRUCIBLE_DIR) / "wiki" / given).as_posix())
+    for candidate in candidates:
+        if db.get_article_by_path(candidate):
+            return candidate
+    raise click.ClickException(
+        f"No article at {article_path} (paths are relative to the current "
+        "directory, the project root, or the wiki; run `crucible sync` if "
+        "the file is new)"
+    )
+
+
 @cli.command()
 @click.argument("article_path")
 @json_option
@@ -1233,9 +1262,17 @@ def history(article_path, json_output):
     Shows what articles this one was derived from (upstream)
     and what articles have been derived from it (downstream).
     Traces the evolution of knowledge over time.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
 
     upstream = db.derived_from(article_path)
     downstream = db.derivatives(article_path)
@@ -1265,9 +1302,18 @@ def history(article_path, json_output):
 @click.argument("article_path")
 @json_option
 def backlinks(article_path, json_output):
-    """Show articles that link to the given article."""
+    """Show articles that link to the given article.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
+    """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
     results = db.backlinks(article_path)
     db.close()
     if json_output:
@@ -1290,7 +1336,7 @@ def source_info(source_path, json_output):
 
     Displays the source metadata and all articles distilled from it.
     Useful for resummarization: see what's already been captured before
-    asking Claude to reread the source.
+    asking Claude to reread the source. Exits 1 if no source matches.
     """
     root = get_root()
     db = get_db(root)
@@ -1304,11 +1350,7 @@ def source_info(source_path, json_output):
                 break
     if not src:
         db.close()
-        if json_output:
-            _emit_json(None)
-            return
-        click.echo(f"Source not found: {source_path}")
-        return
+        raise click.ClickException(f"Source not found: {source_path}")
 
     if json_output:
         articles = db.source_articles(src["id"])
@@ -1340,9 +1382,18 @@ def source_info(source_path, json_output):
 @click.argument("article_path")
 @json_option
 def sources(article_path, json_output):
-    """Show primary sources for an article."""
+    """Show primary sources for an article.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
+    """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
     results = db.article_sources(article_path)
     db.close()
     if json_output:
@@ -1387,7 +1438,11 @@ def concepts(query_all, json_output):
 @click.argument("name")
 @json_option
 def concept(name, json_output):
-    """Show articles covering a concept."""
+    """Show articles covering a concept.
+
+    NAME is matched case-insensitively (sync lowercases FILETAGS).
+    """
+    name = name.lower()
     root = get_root()
     db = get_db(root)
     results = db.concept_articles(name)
@@ -1446,9 +1501,17 @@ def related(article_path, json_output):
 
     Computes relationships via shared concepts, shared sources,
     temporal proximity, and explicit links.
+
+    ARTICLE_PATH may be relative to the current directory, the project
+    root or the wiki, or absolute. Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
+    try:
+        article_path = _resolve_article_arg(root, db, article_path)
+    except click.ClickException:
+        db.close()
+        raise
     results = db.related(article_path)
     db.close()
     if json_output:
@@ -1480,20 +1543,9 @@ def graph(output):
         click.echo(dot)
 
 
-@cli.command()
-@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
-              help="Output file (default: .crucible/wiki/viz.html)")
-@click.option("--open", "open_browser", is_flag=True, help="Open in browser after generating")
-def viz(output, open_browser):
-    """Generate an interactive knowledge graph visualization.
-
-    Creates a self-contained HTML file with a force-directed graph.
-    Nodes are articles (colored by type) and concepts. Edges are
-    explicit links, shared concepts, and derivations.
-    """
-    root = get_root()
-    db = get_db(root)
-
+def _write_viz(root: Path, db: CrucibleDB,
+               output: Path | None = None) -> tuple[Path, int, int]:
+    """Write the knowledge-graph HTML; return (path, node count, edge count)."""
     # Build graph data
     nodes = []
     node_ids = {}  # path -> index
@@ -1552,8 +1604,6 @@ def viz(output, open_browser):
             if src is not None and tgt is not None:
                 edges.append({"source": src, "target": tgt, "type": "derivation"})
 
-    db.close()
-
     graph_json = json.dumps({"nodes": nodes, "edges": edges})
     root_path = json.dumps(str(root.resolve()))
 
@@ -1564,7 +1614,27 @@ def viz(output, open_browser):
         output = cdir(root) / "wiki" / "viz.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html, encoding="utf-8")
-    click.echo(f"Visualization: {output} ({len(nodes)} nodes, {len(edges)} edges)")
+    return output, len(nodes), len(edges)
+
+
+@cli.command()
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Output file (default: .crucible/wiki/viz.html)")
+@click.option("--open", "open_browser", is_flag=True, help="Open in browser after generating")
+def viz(output, open_browser):
+    """Generate an interactive knowledge graph visualization.
+
+    Creates a self-contained HTML file with a force-directed graph.
+    Nodes are articles (colored by type) and concepts. Edges are
+    explicit links, shared concepts, and derivations.
+    """
+    root = get_root()
+    db = get_db(root)
+    try:
+        output, n_nodes, n_edges = _write_viz(root, db, output)
+    finally:
+        db.close()
+    click.echo(f"Visualization: {output} ({n_nodes} nodes, {n_edges} edges)")
 
     if open_browser:
         import webbrowser
@@ -1805,7 +1875,11 @@ def vscode(file):
     viz_path = wiki_dir / "viz.html"
     if not viz_path.exists():
         click.echo("Generating knowledge graph...")
-        subprocess.run(["crucible", "viz"], cwd=str(root), capture_output=True)
+        db = get_db(root)
+        try:
+            _write_viz(root, db, viz_path)
+        finally:
+            db.close()
 
     # Open the project root in VS Code
     cmd = ["code", str(root)]
@@ -2895,13 +2969,18 @@ def index():
 
 
 @cli.command()
+@click.option("--strict", is_flag=True,
+              help="Also exit nonzero when there are warnings")
 @json_option
-def lint(json_output):
+def lint(strict, json_output):
     """Check wiki health and report issues.
 
     Finds broken links, orphan articles, missing concept articles,
     stale sources, unresolved or ambiguous source keys, and other
     consistency problems.
+
+    Exits 1 if any issue has severity "error" (or "warning", with
+    --strict), so scripts and CI can gate on it; info never fails.
     """
     root = get_root()
     db = get_db(root)
@@ -3161,8 +3240,13 @@ def lint(json_output):
 
     db.close()
 
+    failing = {"error", "warning"} if strict else {"error"}
+    failed = any(i["severity"] in failing for i in issues)
+
     if json_output:
         _emit_json(issues)
+        if failed:
+            raise SystemExit(1)
         return
 
     if not issues:
@@ -3183,6 +3267,8 @@ def lint(json_output):
                f"({sum(1 for i in issues if i['severity'] == 'error')} errors, "
                f"{sum(1 for i in issues if i['severity'] == 'warning')} warnings, "
                f"{sum(1 for i in issues if i['severity'] == 'info')} info)")
+    if failed:
+        raise SystemExit(1)
 
 
 @cli.command()
@@ -3497,6 +3583,11 @@ Structured queries:
   crucible orphans                     Articles with no incoming links
   crucible undigested                  Sources not yet distilled
 
+  Article paths may be relative to the project root (as shown), to the
+  current directory, or to the wiki (concepts/x.org), or absolute. A path
+  that names no article, or an unknown source, exits 1 with an error.
+  Concept names are case-insensitive.
+
 Graph export:
   crucible graph                       DOT format to stdout
   crucible graph -o wiki.dot           DOT format to file
@@ -3562,6 +3653,9 @@ Lint (health checks):
                                  references.bib (maybe the ingest day)
                                - Wiki files not in database
   crucible lint -j             JSON output (for agent consumption)
+  crucible lint --strict       Also fail on warnings
+                               Exit status: 1 if any error (or, with
+                               --strict, any warning); info never fails.
 
 Suggest (improvement recommendations):
   crucible suggest             Analyze the wiki graph and suggest:
@@ -3668,8 +3762,10 @@ a numeric suffix (e.g., my-project-2).
     elif topic in topics:
         click.echo(topics[topic])
     else:
-        click.echo(f"Unknown topic: {topic}")
-        click.echo(f"Available topics: {', '.join(topics.keys())}, all")
+        raise click.ClickException(
+            f"Unknown topic: {topic}\n"
+            f"Available topics: {', '.join(topics.keys())}, all"
+        )
 
 
 @cli.command()
@@ -3682,14 +3778,17 @@ def publish(output, init_only):
     Generates an .org-publish.json config in wiki/ and runs
     `scimax publish` to export all org articles as linked HTML pages.
     """
-    import shutil
     import subprocess
 
     root = get_root()
     wiki_dir = cdir(root) / "wiki"
 
     # Ensure index is up to date
-    subprocess.run(["crucible", "index"], cwd=str(root), capture_output=True)
+    db = get_db(root)
+    try:
+        _write_index(root, db)
+    finally:
+        db.close()
 
     out_dir = str(output.resolve()) if output else str(wiki_dir / "_build" / "html")
 
@@ -3723,11 +3822,17 @@ def publish(output, init_only):
         return
 
     # Run scimax publish
-    result = subprocess.run(
-        ["scimax", "publish"],
-        cwd=str(wiki_dir),
-        capture_output=True, text=True, timeout=300,
-    )
+    try:
+        result = subprocess.run(
+            ["scimax", "publish"],
+            cwd=str(wiki_dir),
+            capture_output=True, text=True, timeout=300,
+        )
+    except FileNotFoundError:
+        raise click.ClickException(
+            "'scimax' command not found. Install scimax, or use --init-only "
+            "to write the publish config without publishing."
+        )
     if result.returncode != 0:
         click.echo(result.stderr, err=True)
         raise click.ClickException("scimax publish failed")
@@ -3748,6 +3853,54 @@ def install():
     _install(root=None, directive=True)
 
 
+_SKILL_RECORD = ".crucible-installed.json"
+
+
+def _skill_source() -> Path:
+    """The packaged skill directory.
+
+    Wheel installs bundle skills/crucible into the package; editable
+    installs read it from the repository root.
+    """
+    pkg_dir = Path(__file__).parent
+    skill_src = pkg_dir / "skills" / "crucible"
+    if not skill_src.exists():
+        skill_src = pkg_dir.parent.parent / "skills" / "crucible"
+    return skill_src
+
+
+def _skill_dest() -> Path:
+    return Path.home() / ".claude" / "skills" / "crucible"
+
+
+def _file_sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _read_skill_record(skill_dest: Path) -> dict[str, str]:
+    """Files crucible installed into skill_dest, mapped to their sha256.
+
+    Lets install tell a user-edited file from an older crucible copy, and
+    lets uninstall remove only what crucible put there.
+    """
+    try:
+        data = json.loads((skill_dest / _SKILL_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return {}
+    return {str(k): str(v) for k, v in files.items()}
+
+
+def _write_skill_record(skill_dest: Path, record: dict[str, str]) -> None:
+    (skill_dest / _SKILL_RECORD).write_text(
+        json.dumps({"files": record}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _install(root: Path | None, directive: bool) -> None:
     """Install the skill; for a project, also its manifest and registry entry.
 
@@ -3755,27 +3908,31 @@ def _install(root: Path | None, directive: bool) -> None:
     Only `crucible install` passes directive=True: init and update must not
     repoint the global ~/.claude/CLAUDE.md at the project they act on.
     """
-    import shutil
-    import subprocess
-
     # 1. Install skill files (works from anywhere)
-    # Wheel installs bundle skills/crucible into the package; editable
-    # installs read it from the repository root.
-    pkg_dir = Path(__file__).parent
-    skill_src = pkg_dir / "skills" / "crucible"
-    if not skill_src.exists():
-        skill_src = pkg_dir.parent.parent / "skills" / "crucible"
+    skill_src = _skill_source()
     if not skill_src.exists():
         raise click.ClickException(f"Skill source not found at {skill_src}")
 
-    skill_dest = Path.home() / ".claude" / "skills" / "crucible"
+    skill_dest = _skill_dest()
     skill_dest.mkdir(parents=True, exist_ok=True)
+    record = _read_skill_record(skill_dest)
 
-    for src_file in skill_src.iterdir():
+    for src_file in sorted(skill_src.iterdir()):
         if src_file.is_file():
             dest_file = skill_dest / src_file.name
+            new_hash = _file_sha256(src_file)
+            if dest_file.is_file():
+                current = _file_sha256(dest_file)
+                if current != new_hash and current != record.get(src_file.name):
+                    # Not what crucible last installed: keep the local edits.
+                    backup = dest_file.with_name(dest_file.name + ".bak")
+                    shutil.copy2(str(dest_file), str(backup))
+                    click.echo(f"  Skill: {dest_file} had local changes; "
+                               f"saved a copy to {backup}")
             shutil.copy2(str(src_file), str(dest_file))
+            record[src_file.name] = new_hash
             click.echo(f"  Skill: {src_file.name} -> {dest_file}")
+    _write_skill_record(skill_dest, record)
 
     # 2. If inside a project, generate manifest and add CLAUDE.md directive
     if root is None:
@@ -3787,9 +3944,11 @@ def _install(root: Path | None, directive: bool) -> None:
             click.echo("Run `crucible install` from inside a project to complete setup.")
             return
 
-    subprocess.run(["crucible", "manifest"], cwd=str(root),
-                   capture_output=True, text=True)
-    manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
+    db = get_db(root)
+    try:
+        manifest_path = _write_manifest(root, db)
+    finally:
+        db.close()
     click.echo(f"  Manifest: {manifest_path}")
 
     # Auto-register in global registry
@@ -3828,7 +3987,10 @@ def _install(root: Path | None, directive: bool) -> None:
                 _re.escape(marker) + r".*?" + _re.escape(marker),
                 _re.DOTALL,
             )
-            updated = pattern.sub(directive_text.strip(), existing)
+            # A function, not a string: the directive holds the project
+            # path, and a string replacement would read its backslashes
+            # (every Windows path) as regex escapes.
+            updated = pattern.sub(lambda _m: directive_text.strip(), existing)
             claude_md.write_text(updated, encoding="utf-8")
             click.echo(f"  CLAUDE.md: updated existing directive")
         else:
@@ -3847,16 +4009,39 @@ def uninstall():
     """Remove the Crucible skill and CLAUDE.md directive.
 
     Reverses what `crucible install` did:
-    1. Removes ~/.claude/skills/crucible/
+    1. Removes the skill files crucible installed in ~/.claude/skills/crucible/
+       (files you added or edited there are left in place)
     2. Removes the crucible directive from ~/.claude/CLAUDE.md
     """
-    import shutil
-
-    # 1. Remove skill directory
-    skill_dest = Path.home() / ".claude" / "skills" / "crucible"
-    if skill_dest.exists():
-        shutil.rmtree(str(skill_dest))
-        click.echo(f"  Removed skill: {skill_dest}")
+    # 1. Remove the skill files crucible installed
+    skill_dest = _skill_dest()
+    if skill_dest.is_dir():
+        record = _read_skill_record(skill_dest)
+        if record:
+            installed = set(record)
+        else:
+            # Installed by a version that kept no record: only the files
+            # the package ships are crucible's.
+            skill_src = _skill_source()
+            installed = ({p.name for p in skill_src.iterdir() if p.is_file()}
+                         if skill_src.is_dir() else set())
+        for name in sorted(installed):
+            path = skill_dest / name
+            if not path.is_file() or path.is_symlink():
+                continue
+            if name in record and _file_sha256(path) != record[name]:
+                click.echo(f"  Kept {path}: it has local changes")
+                continue
+            path.unlink()
+            click.echo(f"  Removed skill file: {path}")
+        (skill_dest / _SKILL_RECORD).unlink(missing_ok=True)
+        leftover = sorted(p.name for p in skill_dest.iterdir())
+        if leftover:
+            click.echo(f"  Left {skill_dest} in place; it still holds: "
+                       f"{', '.join(leftover)}")
+        else:
+            skill_dest.rmdir()
+            click.echo(f"  Removed skill: {skill_dest}")
     else:
         click.echo(f"  Skill not found at {skill_dest}")
 
@@ -3891,8 +4076,6 @@ def update():
     Use this after upgrading the crucible package to apply schema
     changes and pick up new skill definitions.
     """
-    import subprocess
-
     root = get_root()
     click.echo("Updating crucible...")
 
