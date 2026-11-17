@@ -973,11 +973,8 @@ def _build_about_html(wiki_dir: Path, db_path: Path, articles: list[dict],
     from crucible.registry import list_instances
 
     # Package version
-    try:
-        from importlib.metadata import version as pkg_version
-        version = pkg_version("crucible")
-    except Exception:
-        version = "dev"
+    from crucible import package_version
+    version = package_version()
 
     # Stats from database
     db = CrucibleDB(db_path)

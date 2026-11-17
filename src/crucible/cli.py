@@ -2060,7 +2060,7 @@ def browse(port, no_open):
         # In-process: a `crucible` subprocess depends on PATH and its
         # failure went unnoticed.
         try:
-            click.get_current_context().invoke(viz, output=None, open_browser=False)
+            _write_viz(root, db, viz_path)
         except Exception as e:
             click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
 
