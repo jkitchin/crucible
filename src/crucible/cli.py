@@ -1721,49 +1721,52 @@ def merge(source, dry_run, yes):
     target_cdir = cdir(root)
     target_wiki = target_cdir / "wiki"
     source_wiki = source_cdir / "wiki"
+    source_bib = source_cdir / "references.bib"
+    target_bib = target_cdir / "references.bib"
+
+    from crucible.ingest import (
+        _BIB_ENTRY_RE, _BIB_FIELD_RE, _parse_bib_fields, _resolve_bib_file,
+        append_bib_entry,
+    )
+
+    try:
+        source_entries = (
+            _parse_bib_entries(source_bib.read_text(encoding="utf-8"))
+            if source_bib.exists() else {}
+        )
+    except click.ClickException:
+        source_db.close()
+        target_db.close()
+        raise
 
     # --- Phase 1: Sources ---
     sources_skipped = 0
     source_files = []
+    sidecar_files = []
     target_sources = target_db.list_sources()
     reserved_files = {os.path.realpath(root / src["path"]) for src in target_sources}
     target_sources_by_key = {}
     for existing in target_sources:
-        target_metadata = existing.get("metadata", "{}")
-        if isinstance(target_metadata, str):
-            target_metadata = json.loads(target_metadata)
-        target_key = (
-            target_metadata.get("cite_key") if isinstance(target_metadata, dict) else None
-        )
-        if isinstance(target_key, str) and target_key:
+        try:
+            _, target_key = _merge_source_metadata(existing)
+        except click.ClickException:
+            source_db.close()
+            target_db.close()
+            raise
+        if target_key:
             target_sources_by_key.setdefault(target_key, []).append(existing)
     copied_source_paths = {}
     resolved_source_paths = {}
     incoming_keys = set()
+    mapped_keys = set()
 
     for src in source_db.list_sources():
-        src_file = source_root / src["path"]
         try:
-            rel_within = Path(src["path"]).relative_to(CRUCIBLE_DIR)
-        except ValueError:
-            sources_skipped += 1
-            continue
-        if not src_file.is_file():
+            metadata, cite_key = _merge_source_metadata(src)
+        except click.ClickException:
             source_db.close()
             target_db.close()
-            raise click.ClickException(
-                f"Cannot safely merge '{src['path']}': the source file is missing "
-                "or not a regular file. No files were copied."
-            )
-
-        dest_file = target_cdir / rel_within
-        new_rel = str(Path(CRUCIBLE_DIR) / rel_within)
-        metadata = src.get("metadata", "{}")
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata)
-        cite_key = metadata.get("cite_key") if isinstance(metadata, dict) else None
-        if not isinstance(cite_key, str):
-            cite_key = None
+            raise
         if cite_key:
             if cite_key in incoming_keys:
                 source_db.close()
@@ -1774,6 +1777,36 @@ def merge(source, dry_run, yes):
                 )
             incoming_keys.add(cite_key)
 
+        src_file = source_root / src["path"]
+        try:
+            rel_within = Path(src["path"]).relative_to(CRUCIBLE_DIR)
+        except ValueError:
+            sources_skipped += 1
+            continue
+        if not src_file.is_file():
+            entry = source_entries.get(cite_key) if cite_key else None
+            if (
+                entry is not None
+                and src["path"] == f"{CRUCIBLE_DIR}/bib/{cite_key}"
+                and not _parse_bib_fields(entry).get("file")
+            ):
+                continue
+            source_db.close()
+            target_db.close()
+            raise click.ClickException(
+                f"Cannot safely merge '{src['path']}': the source file is missing "
+                "or not a regular file. No files were copied."
+            )
+        if not src_file.resolve().is_relative_to(source_root.resolve() / CRUCIBLE_DIR):
+            source_db.close()
+            target_db.close()
+            raise click.ClickException(
+                f"Cannot safely merge '{src['path']}': the source resolves outside "
+                "the source crucible. No files were copied."
+            )
+
+        dest_file = target_cdir / rel_within
+        new_rel = str(Path(CRUCIBLE_DIR) / rel_within)
         skip_existing = False
         existing_sources = target_sources_by_key.get(cite_key, [])
         if existing_sources:
@@ -1820,56 +1853,122 @@ def merge(source, dry_run, yes):
                 reserved_files.add(os.path.realpath(dest_text))
 
         mapping = (new_rel, cite_key)
+        if cite_key:
+            mapped_keys.add(cite_key)
         copied_source_paths.setdefault(os.path.abspath(src_file), []).append(mapping)
         resolved_source_paths.setdefault(os.path.realpath(src_file), []).append(mapping)
         if skip_existing:
             sources_skipped += 1
+            src_text = src_file.with_suffix(".txt")
+            if src_text != src_file and src_text.exists():
+                dest_text = (root / new_rel).with_suffix(".txt")
+                try:
+                    _check_merge_copy(
+                        src_text, dest_text, source_root, root,
+                        private=not bool(src["shareable"]),
+                    )
+                    if dest_text.is_symlink():
+                        raise click.ClickException(
+                            f"Cannot safely merge text sidecar for '{cite_key}'. "
+                            "No files were copied."
+                        )
+                    if dest_text.exists():
+                        if (
+                            not dest_text.is_file()
+                            or file_sha256(src_text) != file_sha256(dest_text)
+                        ):
+                            raise click.ClickException(
+                                f"Cannot safely merge text sidecar for '{cite_key}': "
+                                "the existing sidecar differs. No files were copied."
+                            )
+                    elif os.path.realpath(dest_text) in reserved_files:
+                        raise click.ClickException(
+                            f"Cannot safely merge text sidecar for '{cite_key}': "
+                            "the destination is reserved. No files were copied."
+                        )
+                    else:
+                        sidecar_files.append((src_text, dest_text))
+                        reserved_files.add(os.path.realpath(dest_text))
+                except click.ClickException:
+                    source_db.close()
+                    target_db.close()
+                    raise
         else:
             source_files.append((
                 src, src_file, dest_file, new_rel, metadata,
                 src_text if has_sidecar else None,
             ))
+        if src_text != src_file and src_text.exists():
+            text_mapping = (str(Path(new_rel).with_suffix(".txt")), cite_key)
+            copied_source_paths.setdefault(os.path.abspath(src_text), []).append(text_mapping)
+            resolved_source_paths.setdefault(os.path.realpath(src_text), []).append(text_mapping)
 
     # Check bibliography mappings before copying any files.
-    source_bib = source_cdir / "references.bib"
-    target_bib = target_cdir / "references.bib"
     bib_entries = []
 
-    if source_bib.exists():
-        from crucible.ingest import _BIB_FIELD_RE, append_bib_entry
-
-        source_entries = _parse_bib_entries(
-            source_bib.read_text(encoding="utf-8")
-        )
+    if source_entries:
         target_text = (
             target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
         )
+        target_keys = {match.group(2) for match in _BIB_ENTRY_RE.finditer(target_text)}
         for cite_key, entry_text in source_entries.items():
-            if f"{{{cite_key}," in target_text:
+            if not _parse_bib_fields(entry_text).get("file"):
+                if cite_key in mapped_keys:
+                    warning = f"bibliography entry '{cite_key}' has no durable file mapping"
+                else:
+                    warning = f"bibliography-only source '{cite_key}' has no source file"
+                click.echo(f"Warning: {warning}.", err=True)
+            if cite_key in target_keys or f"{{{cite_key}," in target_text:
                 continue
             for field in reversed(list(_BIB_FIELD_RE.finditer(entry_text))):
                 if field.group(1).lower() != "file":
                     continue
                 group = 2 if field.group(2) is not None else 3
-                file_path = Path(field.group(group).strip())
-                if not file_path.is_absolute():
-                    file_path = source_root / file_path
-                matches = copied_source_paths.get(os.path.abspath(file_path), [])
-                if not matches:
-                    matches = resolved_source_paths.get(os.path.realpath(file_path), [])
+                file_path = _resolve_bib_file(source_root, field.group(group).strip())
+                direct = copied_source_paths.get(os.path.abspath(file_path), [])
+                resolved = resolved_source_paths.get(os.path.realpath(file_path), [])
+                direct_key = [match for match in direct if match[1] == cite_key]
+                resolved_key = [match for match in resolved if match[1] == cite_key]
+                matches = direct_key or resolved_key or direct or resolved
                 if len(matches) > 1:
-                    matches = [match for match in matches if match[1] == cite_key]
-                    if len(matches) != 1:
-                        source_db.close()
-                        target_db.close()
-                        raise click.ClickException(
-                            f"Cannot safely map bibliography entry '{cite_key}' "
-                            "to a source. No files were copied."
-                        )
+                    source_db.close()
+                    target_db.close()
+                    raise click.ClickException(
+                        f"Cannot safely map bibliography entry '{cite_key}' "
+                        "to a source. No files were copied."
+                    )
                 if matches:
                     start, end = field.span(group)
                     entry_text = entry_text[:start] + matches[0][0] + entry_text[end:]
+                elif (
+                    Path(os.path.abspath(file_path)).is_relative_to(
+                        source_root / CRUCIBLE_DIR / "sources"
+                    )
+                    or Path(os.path.realpath(file_path)).is_relative_to(
+                        (source_root / CRUCIBLE_DIR / "sources").resolve()
+                    )
+                ):
+                    source_db.close()
+                    target_db.close()
+                    raise click.ClickException(
+                        f"Cannot safely map bibliography entry '{cite_key}' to an "
+                        "indexed source. Sync or correct its file path. No files were copied."
+                    )
             bib_entries.append((cite_key, entry_text))
+
+    try:
+        for src, src_file, dest_file, _, _, src_text in source_files:
+            private = not bool(src["shareable"])
+            _check_merge_copy(src_file, dest_file, source_root, root, private=private)
+            if src_text is not None:
+                _check_merge_copy(
+                    src_text, dest_file.with_suffix(".txt"), source_root, root,
+                    private=private,
+                )
+    except click.ClickException:
+        source_db.close()
+        target_db.close()
+        raise
 
     for src, src_file, dest_file, new_rel, metadata, src_text in source_files:
         if dry_run:
@@ -1891,6 +1990,12 @@ def merge(source, dry_run, yes):
                 url=src.get("url"), authors=authors,
                 date=src.get("date"), metadata=metadata,
             )
+    for src_text, dest_text in sidecar_files:
+        if dry_run:
+            click.echo(f"  sidecar: {os.path.relpath(dest_text, root)}")
+        else:
+            dest_text.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src_text), str(dest_text))
     sources_copied = len(source_files)
 
     # --- Phase 2: Wiki articles ---
@@ -1960,9 +2065,68 @@ def merge(source, dry_run, yes):
     )
     if sources_skipped:
         click.echo(f"  Skipped {sources_skipped} existing sources")
+    if sidecar_files:
+        action = "Would copy" if dry_run else "Copied"
+        click.echo(f"  {action} {len(sidecar_files)} missing text sidecar(s)")
     if wiki_renames:
         click.echo(
             f"  Renamed {len(wiki_renames)} article(s) to avoid conflicts"
+        )
+
+
+def _merge_source_metadata(source: dict) -> tuple[dict, str | None]:
+    raw = source.get("metadata") or "{}"
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        metadata = None
+    if not isinstance(metadata, dict):
+        raise click.ClickException(
+            f"Cannot safely merge source '{source['path']}': invalid metadata. "
+            "No files were copied."
+        )
+    cite_key = metadata.get("cite_key")
+    if cite_key is not None and not isinstance(cite_key, str):
+        raise click.ClickException(
+            f"Cannot safely merge source '{source['path']}': invalid metadata citation key. "
+            "No files were copied."
+        )
+    return metadata, cite_key
+
+
+def _check_merge_copy(
+    source: Path, destination: Path, source_root: Path, target_root: Path, *, private: bool
+) -> None:
+    import os
+
+    if not source.is_file():
+        raise click.ClickException(
+            f"Cannot safely merge '{source}': not a regular file. No files were copied."
+        )
+    source_root = source_root.resolve()
+    target_root = target_root.resolve()
+    source_path = source.resolve()
+    destination_path = destination.resolve()
+    if not source_path.is_relative_to(source_root / CRUCIBLE_DIR):
+        raise click.ClickException(
+            f"Cannot safely merge '{source}': it resolves outside the source crucible. "
+            "No files were copied."
+        )
+    if not destination_path.is_relative_to(target_root / CRUCIBLE_DIR):
+        raise click.ClickException(
+            f"Cannot safely merge '{destination}': it resolves outside the target crucible. "
+            "No files were copied."
+        )
+    source_private = source_root / CRUCIBLE_DIR / "sources/external"
+    target_private = target_root / CRUCIBLE_DIR / "sources/external"
+    if (
+        (private or source_path.is_relative_to(source_private)
+         or Path(os.path.abspath(source)).is_relative_to(source_private))
+        and not destination_path.is_relative_to(target_private)
+    ):
+        raise click.ClickException(
+            f"Cannot safely merge '{source}': a private file would be copied to "
+            "a shareable path. No files were copied."
         )
 
 
@@ -2030,9 +2194,17 @@ def _rewrite_article_links(
 
 def _parse_bib_entries(text: str) -> dict[str, str]:
     """Parse BibTeX text into a dict of cite_key -> full entry text."""
+    from crucible.ingest import _BIB_ENTRY_RE
+
     entries = {}
-    for match in re.finditer(r"(@\w+\{(\w+),.*?\n\})", text, re.DOTALL):
-        entries[match.group(2)] = match.group(1)
+    for match in _BIB_ENTRY_RE.finditer(text):
+        cite_key = match.group(2)
+        if cite_key in entries:
+            raise click.ClickException(
+                f"Cannot safely merge: duplicate bibliography key '{cite_key}'. "
+                "No files were copied."
+            )
+        entries[cite_key] = match.group(0)
     return entries
 
 

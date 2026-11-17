@@ -301,6 +301,21 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     return fields
 
 
+def _resolve_bib_file(root: Path, value: str) -> Path:
+    """Prefer a literal file path, then try folding wrapped lines."""
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    if candidate.exists() or not re.search(r"[\r\n]", value):
+        return candidate
+
+    unfolded = re.sub(r"[ \t]*(?:\r\n|\r|\n)[ \t]*", " ", value)
+    alternative = Path(unfolded)
+    if not alternative.is_absolute():
+        alternative = root / alternative
+    return alternative if alternative.exists() else candidate
+
+
 def parse_bib_file(bib_path: Path) -> list[dict]:
     """Parse a BibTeX file into a list of entries.
 
@@ -465,9 +480,9 @@ def upsert_sources_from_bib(root: Path, db) -> int:
         rel_path: str | None = None
         abs_path: Path | None = None
         if file_field:
-            candidate = Path(file_field)
-            if not candidate.is_absolute():
-                abs_path = (root / candidate).resolve()
+            candidate = _resolve_bib_file(root, file_field)
+            if not Path(file_field).is_absolute():
+                abs_path = candidate.resolve()
             else:
                 abs_path = candidate
             try:
