@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
@@ -168,17 +169,49 @@ def _auto_rebuild_db(root: Path):
     DB file is absent. Creates the schema, populates sources from the
     bib file, runs the sync logic, and regenerates MANIFEST.md and
     wiki/index.org.
+
+    The rebuild is staged in a temporary file next to crucible.db and only
+    published once it has completed, so a failed or interrupted rebuild
+    never leaves a crucible.db that later commands would trust. Publishing
+    uses a hard link, which fails rather than overwrites if a concurrent
+    process published its own database first; that database is kept.
     """
     click.echo(
         "crucible: database missing, rebuilding from wiki...",
         err=True,
     )
-    db = get_db(root)
-    db.initialize()
+    db_path = cdir(root) / "crucible.db"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".crucible.db.rebuild-", suffix=".tmp", dir=cdir(root)
+    )
+    os.close(fd)
+    staged = Path(tmp_name)
     try:
-        _rebuild_db_from_wiki(root, db)
+        db = CrucibleDB(staged)
+        try:
+            db.initialize()
+            _rebuild_db_from_wiki(root, db)
+            # Leave WAL mode so everything is in the main file and no
+            # -wal/-shm companions are needed when it is renamed.
+            db.conn.execute("PRAGMA journal_mode = DELETE")
+        finally:
+            db.close()
+        try:
+            os.link(staged, db_path)
+        except FileExistsError:
+            pass  # A concurrent process published a database first.
+        except OSError:
+            # Filesystem without hard links: fall back to a rename, still
+            # declining to replace a database that appeared meanwhile.
+            if not db_path.exists():
+                os.replace(staged, db_path)
     finally:
-        db.close()
+        for path in (staged, Path(f"{staged}-wal"), Path(f"{staged}-shm"),
+                     Path(f"{staged}-journal")):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def json_option(f):
