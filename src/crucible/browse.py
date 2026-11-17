@@ -11,6 +11,7 @@ import re
 import urllib.parse
 from pathlib import Path, PurePosixPath
 
+from crucible.ingest import BIB_ENTRY_CLOSE, BIB_ENTRY_HEAD
 from crucible.orgparse import CITATION_RE, citation_keys, citation_type
 
 
@@ -19,7 +20,7 @@ from crucible.orgparse import CITATION_RE, citation_keys, citation_type
 # ---------------------------------------------------------------------------
 
 _BIB_ENTRY_RE = re.compile(
-    r"@(\w+)\s*\{\s*([^,\s]+)\s*,\s*(.*?)\n\s*\}",
+    BIB_ENTRY_HEAD + r"\s*(?P<body>.*?)\n\s*" + BIB_ENTRY_CLOSE,
     re.DOTALL,
 )
 _BIB_FIELD_RE = re.compile(
@@ -35,9 +36,9 @@ def parse_bibtex(text: str) -> dict[str, dict[str, str]]:
     """
     entries: dict[str, dict[str, str]] = {}
     for m in _BIB_ENTRY_RE.finditer(text):
-        entry_type = m.group(1).lower()
-        key = m.group(2).strip()
-        body = m.group(3)
+        entry_type = m["type"].lower()
+        key = m["key"].strip()
+        body = m["body"]
         fields: dict[str, str] = {"_type": entry_type}
         for fm in _BIB_FIELD_RE.finditer(body):
             fields[fm.group(1).lower()] = fm.group(2).strip()

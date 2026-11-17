@@ -2197,7 +2197,7 @@ def _plan_source_merge(
 
     # Bibliography entries, with `file` fields pointing at the planned paths.
     target_text = target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
-    target_keys = {m.group(2) for m in _BIB_ENTRY_RE.finditer(target_text)}
+    target_keys = {m["key"] for m in _BIB_ENTRY_RE.finditer(target_text)}
     source_sources = (source_cdir / "sources").resolve()
     for cite_key, entry_text in source_entries.items():
         if not _parse_bib_fields(entry_text).get("file"):
@@ -2391,7 +2391,7 @@ def _parse_bib_entries(text: str) -> dict[str, str]:
 
     entries = {}
     for match in _BIB_ENTRY_RE.finditer(text):
-        cite_key = match.group(2)
+        cite_key = match["key"]
         if cite_key in entries:
             raise _MergeConflict(
                 f"Cannot safely merge: duplicate bibliography key '{cite_key}'."
@@ -2761,8 +2761,9 @@ def lint(json_output):
     bib_keys = set()
     if bib_path.exists():
         import re as _re
-        for m in _re.finditer(r"@\w+\{([^,\s]+),", bib_path.read_text(encoding="utf-8")):
-            bib_keys.add(m.group(1))
+        from crucible.ingest import BIB_ENTRY_HEAD
+        for m in _re.finditer(BIB_ENTRY_HEAD, bib_path.read_text(encoding="utf-8")):
+            bib_keys.add(m["key"])
 
     for article in db.list_articles():
         org_path = root / article["path"]

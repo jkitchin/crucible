@@ -284,7 +284,13 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
     return "\n".join(lines)
 
 
-_CITE_KEY_RE = re.compile(r"(@\w+\s*\{\s*)([^,\s]+)")
+# BibTeX delimits an entry with braces, @type{key, ...}, or parentheses,
+# @type(key, ...). Every entry pattern accepts both; the full-entry pattern
+# requires the closer that matches the opener.
+BIB_ENTRY_HEAD = r"@(?P<type>\w+)\s*(?:(?P<paren>\()|\{)\s*(?P<key>[^,\s]+)\s*,"
+BIB_ENTRY_CLOSE = r"(?(paren)\)|\})"
+
+_CITE_KEY_RE = re.compile(r"(@\w+\s*[{(]\s*)([^,\s]+)")
 
 
 def replace_cite_key(bibtex: str, new_key: str) -> str:
@@ -292,7 +298,7 @@ def replace_cite_key(bibtex: str, new_key: str) -> str:
     return _CITE_KEY_RE.sub(lambda m: m.group(1) + new_key, bibtex, count=1)
 
 
-_ENTRY_HEAD_RE = re.compile(r"@\w+\s*\{\s*[^,\s]+\s*,")
+_ENTRY_HEAD_RE = re.compile(BIB_ENTRY_HEAD)
 
 
 def set_bib_field(bibtex: str, name: str, value: str) -> str:
@@ -316,7 +322,9 @@ def set_bib_field(bibtex: str, name: str, value: str) -> str:
     return bibtex[:head.end()] + line + body
 
 
-_BIB_ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,(.*?)\n\}", re.DOTALL)
+_BIB_ENTRY_RE = re.compile(
+    BIB_ENTRY_HEAD + r"(?P<body>.*?)\n" + BIB_ENTRY_CLOSE, re.DOTALL
+)
 _BIB_FIELD_RE = re.compile(
     r"(\w+)\s*=\s*(?:\{((?:[^{}]|\{[^{}]*\})*)\}|\"([^\"]*)\")",
     re.DOTALL,
@@ -360,10 +368,10 @@ def parse_bib_file(bib_path: Path) -> list[dict]:
     entries = []
     for m in _BIB_ENTRY_RE.finditer(text):
         entry = {
-            "entry_type": m.group(1).lower(),
-            "cite_key": m.group(2),
+            "entry_type": m["type"].lower(),
+            "cite_key": m["key"],
         }
-        entry.update(_parse_bib_fields(m.group(3)))
+        entry.update(_parse_bib_fields(m["body"]))
         entries.append(entry)
     return entries
 
@@ -712,12 +720,12 @@ def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | Non
 def bib_has_key(text: str, cite_key: str) -> bool:
     """Return True if BibTeX text has an entry whose key is cite_key.
 
-    Matches the entry header ``@type{key,`` rather than ``{key,`` anywhere,
-    so field text such as ``author = {Smith, J}`` is not taken for the key
-    ``Smith``.
+    Matches the entry header ``@type{key,`` (or ``@type(key,``) rather than
+    ``{key,`` anywhere, so field text such as ``author = {Smith, J}`` is not
+    taken for the key ``Smith``.
     """
     return re.search(
-        rf"@\w+\s*\{{\s*{re.escape(cite_key)}\s*,", text
+        rf"@\w+\s*[{{(]\s*{re.escape(cite_key)}\s*,", text
     ) is not None
 
 
@@ -753,7 +761,7 @@ def set_bib_file_fields(root: Path, paths: dict[str, str]) -> None:
         text = bib_path.read_text(encoding="utf-8")
 
         def repl(m: re.Match) -> str:
-            path = paths.get(m.group(2))
+            path = paths.get(m["key"])
             return set_bib_field(m.group(0), "file", path) if path else m.group(0)
 
         new_text = _BIB_ENTRY_RE.sub(repl, text)
