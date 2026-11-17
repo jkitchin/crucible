@@ -705,6 +705,9 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     existing["id"], rel_path, meta.title, meta.content
                 )
                 article_id = existing["id"]
+                # Rebuild tags, links, sources and derivations from the file
+                # so ones removed from it don't linger in the DB.
+                db.clear_article_relations(article_id)
                 stats["updated"] += 1
             else:
                 article_id = db.add_article(
@@ -774,6 +777,10 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                 source_article = db.get_article_by_path(ref_rel)
                 if source_article:
                     db.add_derivation(article_id, source_article["id"])
+
+        # Tags dropped from files, or deleted articles, can leave concepts
+        # that no article uses any more.
+        db.prune_unused_concepts()
 
     return stats
 
