@@ -651,6 +651,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
     stats = {
         "added": 0,
         "updated": 0,
+        "unchanged": 0,
         "removed": 0,
         "article_links": 0,
         "concept_links": 0,
@@ -696,19 +697,36 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
 
             existing = db.get_article_by_path(rel_path)
             if existing:
-                db.update_article(
-                    existing["id"], title=meta.title, article_type=article_type, status=status,
-                    distill_model=meta.properties.get("DISTILL_MODEL"),
-                    abstract=meta.properties.get("ABSTRACT", ""),
-                )
-                db.update_article_fts(
-                    existing["id"], rel_path, meta.title, meta.content
-                )
                 article_id = existing["id"]
-                # Rebuild tags, links, sources and derivations from the file
-                # so ones removed from it don't linger in the DB.
+                fields = {
+                    "title": meta.title,
+                    "article_type": article_type,
+                    "status": status,
+                    "distill_model": meta.properties.get("DISTILL_MODEL"),
+                    "abstract": meta.properties.get("ABSTRACT", ""),
+                }
+                indexed = db.get_article_fts(article_id)
+                changed = (
+                    any(existing[k] != v for k, v in fields.items())
+                    or indexed != {"path": rel_path, "title": meta.title,
+                                   "content": meta.content}
+                )
+                # Only rewrite articles whose file changed, so updated_at
+                # records real edits and unchanged articles keep their
+                # embeddings. A changed article's embedding is stale, so
+                # drop it for `crucible embed` to regenerate.
+                if changed:
+                    db.update_article(article_id, **fields)
+                    db.update_article_fts(article_id, rel_path, meta.title, meta.content)
+                    db.delete_embedding(article_id)
+                    stats["updated"] += 1
+                else:
+                    stats["unchanged"] += 1
+                # Relations are rebuilt even for unchanged files: a link or
+                # SOURCE_KEYS entry can start (or stop) resolving when other
+                # articles or sources change. Clear them so ones removed from
+                # the file don't linger in the DB.
                 db.clear_article_relations(article_id)
-                stats["updated"] += 1
             else:
                 article_id = db.add_article(
                     path=rel_path,
@@ -846,7 +864,7 @@ def sync():
 
     msg = (
         f"Sync complete: {stats['added']} added, {stats['updated']} updated, "
-        f"{stats['removed']} removed, "
+        f"{stats['unchanged']} unchanged, {stats['removed']} removed, "
         f"{stats['concept_links']} concept links, "
         f"{stats['article_links']} article links"
     )
@@ -864,7 +882,9 @@ def embed(model, url):
     """Generate embeddings for all wiki articles.
 
     Uses ollama to create vector embeddings for semantic search.
-    Only embeds articles that don't already have embeddings.
+    Only embeds articles that don't already have embeddings. `crucible sync`
+    drops the embedding of any article whose file changed, so edited
+    articles are re-embedded here.
     Requires ollama running with an embedding model pulled.
     """
     root = get_root()
