@@ -379,5 +379,7 @@ crucible merge other-project --yes         # skip confirmation
 ```
 
 ### Generating an index
-After syncing, read all articles and generate wiki/index.org with
-categorized links to all articles, organized by type and concept.
+After syncing, run `crucible index` to regenerate wiki/index.org with
+categorized links to all articles, organized by type and concept. The index
+is generated output: do not edit it by hand, since `crucible sync` does not
+treat it as an article and the next `crucible index` overwrites it.

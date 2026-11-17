@@ -182,3 +182,42 @@ def test_init_acts_on_its_root_not_the_current_directory(project, tmp_path, monk
     assert (other / ".crucible" / "wiki" / "MANIFEST.md").exists()
     paths = [e["path"] for e in run_json("registry", "list")]
     assert str(other.resolve()) in paths
+
+
+INDEX_PATH = ".crucible/wiki/index.org"
+
+
+def test_sync_ignores_generated_index(project):
+    runner = CliRunner()
+    assert runner.invoke(cli, ["index"]).exit_code == 0
+    assert (project / INDEX_PATH).exists()
+    result = runner.invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert run_json("stats")["articles"] == 2
+    paths = {r["path"] for r in run_json("concept", "kinetics")}
+    assert INDEX_PATH not in paths
+    assert not [i for i in run_json("lint") if i.get("path") == INDEX_PATH]
+
+
+def test_sync_quietly_prunes_index_registered_by_older_versions(project):
+    from crucible.cli import get_db
+    runner = CliRunner()
+    assert runner.invoke(cli, ["index"]).exit_code == 0
+    db = get_db(project)
+    db.add_article(path=INDEX_PATH, title="Crucible Wiki Index", article_type="concept")
+    db.close()
+    result = runner.invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "0 removed" in result.output
+    assert run_json("stats")["articles"] == 2
+
+
+def test_nested_index_org_is_an_ordinary_article(project):
+    nested = ".crucible/wiki/concepts/index.org"
+    (project / nested).write_text(CONCEPT.replace("Activation energy", "Miller index"))
+    issues = run_json("lint")
+    assert any(i["type"] == "untracked" and i["path"] == nested for i in issues)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert run_json("stats")["articles"] == 3
+    assert nested in {r["path"] for r in run_json("concept", "kinetics")}
