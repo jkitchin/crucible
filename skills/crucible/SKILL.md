@@ -63,6 +63,14 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Merge another crucible | `crucible merge SOURCE [-n] [-y]` |
 | Delete an article or source | `crucible delete PATH [--file] [-y]` |
 | Full help | `crucible help all` |
+| Installed version | `crucible --version` |
+
+Article paths given to `backlinks`, `sources`, `related` and `history` may be
+relative to the project root (as above and in `--json` output), to the
+current directory, or to the wiki (`concepts/x.org`), or absolute. A path
+that names no article, an unknown `source`, or an unknown `help` topic is an
+error (exit 1), not an empty result; run `crucible sync` first if the article
+is new. Concept names are matched case-insensitively.
 
 ## Working Directory
 
@@ -377,6 +385,14 @@ crucible suggest       # find opportunities (new articles, missing links, compar
 
 Fix a duplicate key by giving each entry or file its own key and updating
 the `SOURCE_KEYS` and citations that meant the other one.
+
+A concept's dedicated article is a concept article whose file name or title
+names it (`concepts/activation-energy.org` covers the tag
+`activation_energy`); carrying the tag alone does not count.
+
+`crucible lint` exits 1 when there are errors, and with `--strict` when there
+are warnings too; info never fails it. A nonzero exit therefore means "issues
+found", not that lint itself failed: read the report either way.
 
 Use `crucible lint -j` for JSON output when processing programmatically.
 
