@@ -378,6 +378,16 @@ crucible merge other-project --dry-run     # preview first
 crucible merge other-project --yes         # skip confirmation
 ```
 
+Merge plans every source copy before writing anything. Renamed sources keep
+their extracted-text sidecars beside them, and BibTeX `file` fields are
+rewritten to the new paths. A citation key already in the target is reused
+only when the file bytes are identical. If any source cannot be merged safely
+(a key clash with different content, a missing file, a private file headed for
+a shareable path), merge stops before copying and lists every problem. Resolve
+them in either crucible and run the merge again.
+
 ### Generating an index
-After syncing, read all articles and generate wiki/index.org with
-categorized links to all articles, organized by type and concept.
+After syncing, run `crucible index` to regenerate wiki/index.org with
+categorized links to all articles, organized by type and concept. The index
+is generated output: do not edit it by hand, since `crucible sync` does not
+treat it as an article and the next `crucible index` overwrites it.

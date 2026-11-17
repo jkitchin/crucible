@@ -11,6 +11,8 @@ import re
 import urllib.parse
 from pathlib import Path, PurePosixPath
 
+from crucible.orgparse import CITATION_RE, citation_keys, citation_type
+
 
 # ---------------------------------------------------------------------------
 # BibTeX parser (lightweight, no external deps)
@@ -86,24 +88,27 @@ def format_citation(entry: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 # Block patterns
-_TITLE_RE = re.compile(r"^#\+TITLE:\s*(.+)$", re.MULTILINE)
-_FILETAGS_RE = re.compile(r"^#\+FILETAGS:\s*(.+)$", re.MULTILINE)
+_TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
+_FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _KEYWORD_RE = re.compile(r"^#\+\w+:.*$", re.MULTILINE)
 _DRAWER_RE = re.compile(
-    r"^\s*:PROPERTIES:\s*\n(.*?)\n\s*:END:\s*$", re.MULTILINE | re.DOTALL
+    r"^\s*:PROPERTIES:\s*\n(.*?)\n\s*:END:\s*$", re.MULTILINE | re.DOTALL | re.IGNORECASE
 )
-_PROP_LINE_RE = re.compile(r"^\s*:([A-Z_]+):\s+(.+?)\s*$", re.MULTILINE)
+_PROP_LINE_RE = re.compile(r"^\s*:([A-Za-z_]+):\s+(.+?)\s*$", re.MULTILINE)
+# Org block names are case-insensitive and blocks may be indented. The
+# language is matched with [ \t] so a src block with none does not take its
+# first code line as the language.
 _SRC_BLOCK_RE = re.compile(
-    r"^#\+BEGIN_SRC\s*(.*?)\s*\n(.*?)^#\+END_SRC\s*$",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*#\+BEGIN_SRC[ \t]*([^\n]*?)[ \t]*\n(.*?)^[ \t]*#\+END_SRC[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _EXAMPLE_BLOCK_RE = re.compile(
-    r"^#\+BEGIN_EXAMPLE\s*\n(.*?)^#\+END_EXAMPLE\s*$",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*#\+BEGIN_EXAMPLE[^\n]*\n(.*?)^[ \t]*#\+END_EXAMPLE[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _QUOTE_BLOCK_RE = re.compile(
-    r"^#\+BEGIN_QUOTE\s*\n(.*?)^#\+END_QUOTE\s*$",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*#\+BEGIN_QUOTE[^\n]*\n(.*?)^[ \t]*#\+END_QUOTE[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _HEADING_RE = re.compile(r"^(\*{1,4})\s+(.+)$", re.MULTILINE)
 _TABLE_BLOCK_RE = re.compile(r"((?:^\|.*$\n?)+)", re.MULTILINE)
@@ -115,9 +120,19 @@ _FILE_LINK_RE = re.compile(
 _PLAIN_LINK_RE = re.compile(
     r"\[\[([^\]]+)\]\[([^\]]*)\]\]"
 )
-_CITE_RE = re.compile(r"(cite[pt]?):([a-zA-Z0-9_:,-]+)")
-_BOLD_RE = re.compile(r"(?<![a-zA-Z0-9])\*([^\s*](?:.*?[^\s*])?)\*(?![a-zA-Z0-9])")
-_ITALIC_RE = re.compile(r"(?<![a-zA-Z0-9])/([^\s/](?:.*?[^\s/])?)/(?![a-zA-Z0-9])")
+# An external link with no description: [[https://example.com]].
+_BARE_LINK_RE = re.compile(r"\[\[(https?://[^\]]+)\]\]")
+# A bare URL in prose. Trailing sentence punctuation is not part of it; a
+# trailing ')' is, only when it closes a '(' in the URL (see _bare_url).
+_URL_RE = re.compile(r"(?<![\w\"'=/])https?://[^\s<>\[\]\"']*[^\s<>\[\]\"'.,;:!?]")
+# Org emphasis boundaries: a marker opens after whitespace or one of -('"{
+# and closes before whitespace or one of -.,:!?;'")}[ (the \x00/\x01
+# placeholder delimiters count as boundaries too). Without these, the
+# slashes in "</tag> ... /word/" were read as italics.
+_EMPH_PRE = r"(?<![^\s\-('\"{\x00\x01])"
+_EMPH_POST = r"(?![^\s\-.,:!?;'\")}\[\x00\x01])"
+_BOLD_RE = re.compile(_EMPH_PRE + r"\*([^\s*](?:.*?[^\s*])?)\*" + _EMPH_POST)
+_ITALIC_RE = re.compile(_EMPH_PRE + r"/([^\s/](?:.*?[^\s/])?)/" + _EMPH_POST)
 _CODE_RE = re.compile(r"(?<![a-zA-Z0-9])~([^\s~](?:.*?[^\s~])?)~(?![a-zA-Z0-9])")
 _VERBATIM_RE = re.compile(r"(?<![a-zA-Z0-9])=([^\s=](?:.*?[^\s=])?)=(?![a-zA-Z0-9])")
 _LATEX_DISPLAY_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
@@ -144,26 +159,28 @@ def _rewrite_file_link(match: re.Match, current_path: str) -> str:
     return f'<a href="{html.escape(url)}">{display}</a>'
 
 
+def _external_link(url: str, display: str | None = None) -> str:
+    """An HTML link to an external URL; display is already-escaped HTML."""
+    if display is None:
+        display = html.escape(url)
+    return f'<a href="{html.escape(url)}" target="_blank">{display}</a>'
+
+
+def _bare_url(url: str, hold) -> str:
+    """Link a bare URL, leaving unbalanced closing parentheses outside it."""
+    trailing = ""
+    while url.endswith(")") and url.count(")") > url.count("("):
+        url, trailing = url[:-1], ")" + trailing
+    return hold(_external_link(url)) + trailing
+
+
 def _rewrite_plain_link(match: re.Match) -> str:
     """Rewrite [[target][text]] non-file links."""
     target = match.group(1).strip()
     display = html.escape(match.group(2) or target)
     if target.startswith(("http://", "https://")):
-        return f'<a href="{html.escape(target)}" target="_blank">{display}</a>'
+        return _external_link(target, display)
     return f'<span class="link-unknown" title="{html.escape(target)}">{display}</span>'
-
-
-def _inline_markup(text: str, current_path: str) -> str:
-    """Apply inline markup transformations to a text chunk."""
-    # Escape HTML first, but preserve our placeholders
-    text = html.escape(text)
-
-    # We need to un-escape the org syntax characters that html.escape touched
-    # since our regexes need to match the original patterns. Work on raw text
-    # instead: re-do this properly by processing raw text.
-    # Actually, let's process raw text and escape only the non-markup parts.
-    # Simpler approach: process before escaping, use safe HTML generation.
-    return text  # placeholder, replaced below
 
 
 def _process_inline(text: str, current_path: str,
@@ -183,13 +200,11 @@ def _process_inline(text: str, current_path: str,
     # File links
     text = _FILE_LINK_RE.sub(lambda m: _hold(_rewrite_file_link(m, current_path)), text)
 
-    # Plain links
-    text = _PLAIN_LINK_RE.sub(lambda m: _hold(_rewrite_plain_link(m)), text)
-
-    # Citations (with bib tooltips, linked to references page)
+    # Citations (with bib tooltips, linked to references page). Before plain
+    # links, so [[cite:&key][description]] renders as a citation.
     def _cite_repl(m: re.Match) -> str:
-        cite_type = m.group(1)
-        keys = [k.strip() for k in m.group(2).split(",") if k.strip()]
+        cite_type = citation_type(m)
+        keys = citation_keys(m)
         spans = []
         for key in keys:
             entry = bib.get(key) if bib else None
@@ -205,19 +220,38 @@ def _process_inline(text: str, current_path: str,
                 )
         return _hold("".join(spans))
 
-    text = _CITE_RE.sub(_cite_repl, text)
+    text = CITATION_RE.sub(_cite_repl, text)
+
+    # Plain links
+    text = _PLAIN_LINK_RE.sub(lambda m: _hold(_rewrite_plain_link(m)), text)
+
+    # External links without a description, then bare URLs. Held as
+    # placeholders so the italic pattern cannot match the slashes in them.
+    text = _BARE_LINK_RE.sub(lambda m: _hold(_external_link(m.group(1))), text)
+    text = _URL_RE.sub(lambda m: _bare_url(m.group(0), _hold), text)
 
     # LaTeX (before other inline markup to avoid conflicts)
     text = _LATEX_DISPLAY_RE.sub(
-        lambda m: _hold(f'<div class="math-display">\\[{m.group(1)}\\]</div>'), text)
+        lambda m: _hold(
+            f'<div class="math-display">\\[{html.escape(m.group(1), quote=False)}\\]</div>'
+        ),
+        text,
+    )
     text = _LATEX_INLINE_RE.sub(
-        lambda m: _hold(f'<span class="math-inline">\\({m.group(1) or m.group(2)}\\)</span>'),
+        lambda m: _hold(
+            f'<span class="math-inline">\\('
+            f'{html.escape(m.group(1) or m.group(2), quote=False)}\\)</span>'
+        ),
         text,
     )
 
     # Code/verbatim (before bold/italic so * inside code is safe)
     text = _CODE_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
     text = _VERBATIM_RE.sub(lambda m: _hold(f"<code>{html.escape(m.group(1))}</code>"), text)
+
+    # Everything turned into HTML above is now a placeholder, so what remains
+    # is article text: escape it before adding the bold and italic tags.
+    text = html.escape(text, quote=False)
 
     # Bold and italic (safe now, all HTML-containing elements are placeholders)
     text = _BOLD_RE.sub(r"<strong>\1</strong>", text)

@@ -1,12 +1,15 @@
 """Tests for --json output and project discovery in the CLI."""
 
+import errno
 import json
+import os
+from contextlib import contextmanager
+from unittest.mock import Mock
 
 import pytest
 from click.testing import CliRunner
 
-from crucible import registry as registry_module
-from crucible.cli import cli
+from crucible.cli import _sync_wiki_to_db, cli
 from crucible.database import CrucibleDB
 
 CONCEPT = """#+TITLE: Activation energy
@@ -38,22 +41,6 @@ SUMMARY = """#+TITLE: Smith 2024 results
 Measured activation energies on platinum. See
 [[file:../concepts/activation-energy.org][activation energy]] and [[file:missing.org][a missing article]].
 """
-
-
-@pytest.fixture
-def registry(tmp_path, monkeypatch):
-    """A temporary home directory and global registry.
-
-    `crucible init` installs the skill into ~/.claude/, so HOME must be
-    temporary too.
-    """
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    reg = home / ".crucible"
-    monkeypatch.setattr(registry_module, "REGISTRY_DIR", reg)
-    monkeypatch.setattr(registry_module, "REGISTRY_PATH", reg / "registry.json")
-    return reg
 
 
 @pytest.fixture
@@ -226,6 +213,113 @@ def test_sync_handles_invalid_source_metadata_with_no_bibliography(project, capl
     assert "invalid" in caplog.text.lower()
 
 
+def test_lint_resolves_source_keys_like_sync(project):
+    cdir = project / ".crucible"
+    external = cdir / "sources" / "external" / "pdfs"
+    external.mkdir(parents=True, exist_ok=True)
+    records = [
+        ("paper.pdf", "Canonical source", {"cite_key": "known2026"}),
+        ("legacy-path-file.pdf", "Legacy source", {}),
+        ("other.pdf", "Vintage source", {}),
+        ("badmetadata-file.pdf", "Old source", {}),
+        ("nonobject-list.pdf", "List legacy source", {}),
+        ("nonobject-null.pdf", "Null legacy source", {}),
+        ("invalid-key.pdf", "Invalid key source", {}),
+        ("known2026-copy.pdf", "Lower priority", {}),
+        ("falsepositive2026.pdf", "Different source", {"cite_key": "different2026"}),
+    ]
+    malformed_metadata = {
+        "badmetadata-file.pdf": "{invalid",
+        "nonobject-list.pdf": "[]",
+        "nonobject-null.pdf": "null",
+        "invalid-key.pdf": '{"cite_key": ["not-a-key"]}',
+    }
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        for filename, title, metadata in records:
+            path = external / filename
+            path.write_text("Synthetic source.")
+            source_id = db.add_source(
+                path=str(path.relative_to(project)),
+                title=title,
+                source_type="pdf",
+                metadata=metadata,
+            )
+            if filename in malformed_metadata:
+                db.conn.execute(
+                    "UPDATE sources SET metadata = ? WHERE id = ?",
+                    (malformed_metadata[filename], source_id),
+                )
+                db.conn.commit()
+    finally:
+        db.close()
+
+    keys = (
+        "known2026 legacy-path Vintage badmetadata nonobject-list nonobject-null invalid-key "
+        "missing2026 falsepositive2026"
+    )
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", f":SOURCE_KEYS: {keys}")
+    )
+    issues_before_sync = run_json("lint")
+    assert any(
+        issue["type"] == "unresolved_source_key" and issue["key"] == "missing2026"
+        for issue in issues_before_sync
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    sources = run_json("sources", CONCEPT_PATH)
+    assert {source["path"] for source in sources} == {
+        ".crucible/sources/external/pdfs/paper.pdf",
+        ".crucible/sources/external/pdfs/legacy-path-file.pdf",
+        ".crucible/sources/external/pdfs/other.pdf",
+        ".crucible/sources/external/pdfs/badmetadata-file.pdf",
+        ".crucible/sources/external/pdfs/nonobject-list.pdf",
+        ".crucible/sources/external/pdfs/nonobject-null.pdf",
+        ".crucible/sources/external/pdfs/invalid-key.pdf",
+    }
+
+    issues = run_json("lint")
+    unresolved = {
+        issue["key"]: issue
+        for issue in issues
+        if issue["type"] == "unresolved_source_key" and issue["path"] == CONCEPT_PATH
+    }
+    assert set(unresolved) == {"missing2026", "falsepositive2026"}
+    for key, issue in unresolved.items():
+        assert issue["severity"] == "warning"
+        assert key in issue["message"]
+    result = CliRunner().invoke(cli, ["lint", "-j"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == issues
+
+
+def test_rebuild_does_not_assign_title_only_bib_to_disk_source(project):
+    cdir = project / ".crucible"
+    csv = cdir / "sources" / "data" / "experiment.csv"
+    csv.parent.mkdir(parents=True, exist_ok=True)
+    csv.write_text("Synthetic unrelated data.")
+    (cdir / "references.bib").write_text(
+        "@misc{smith2024,\n  title = {Experiment}\n}\n"
+    )
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: smith2024")
+    )
+    for db_file in cdir.glob("crucible.db*"):
+        db_file.unlink()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        rows = db.list_sources()
+    finally:
+        db.close()
+    assert str(csv.relative_to(project)) in {source["path"] for source in rows}
+    sources = run_json("sources", CONCEPT_PATH)
+    assert str(csv.relative_to(project)) not in {source["path"] for source in sources}
+
+
 def test_registry_list_json(project):
     entries = run_json("registry", "list")
     entry = next(e for e in entries if e["path"] == str(project.resolve()))
@@ -263,6 +357,212 @@ def test_sync_stores_and_updates_article_metadata(project):
     assert results[0]["title"] == "Smith 2024 measurements"
 
 
+def test_sync_preserves_lowercase_org_keywords(project):
+    concept = project / CONCEPT_PATH
+    concept.write_text(
+        CONCEPT.replace("#+TITLE: Activation energy", "#+title: Lowercase title")
+        .replace("#+FILETAGS: :concept:kinetics:", "#+filetags: :concept:lowercase-tag:")
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    results = run_json("search", "barrier", "--mode", "fts")
+    assert results[0]["title"] == "Lowercase title"
+    concepts = {c["name"] for c in run_json("concepts")}
+    assert "lowercase-tag" in concepts
+
+
+def test_sync_ignores_generated_index(project):
+    result = CliRunner().invoke(cli, ["index"])
+    assert result.exit_code == 0, result.output
+    assert (project / ".crucible" / "wiki" / "index.org").exists()
+
+    nested_index = ".crucible/wiki/concepts/index.org"
+    (project / nested_index).write_text(CONCEPT)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    assert run_json("stats")["articles"] == 3
+    issues = run_json("lint")
+    assert not any(
+        issue.get("path") == ".crucible/wiki/index.org"
+        and issue["type"] == "missing_property"
+        for issue in issues
+    )
+    assert any(
+        issue.get("path") == nested_index and issue["type"] == "missing_property"
+        for issue in issues
+    )
+
+
+def test_sync_prunes_last_article_after_index_generation(project):
+    (project / SUMMARY_PATH).unlink()
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    cdir = project / ".crucible"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        article_id = db.get_article_by_path(CONCEPT_PATH)["id"]
+        source_id = db.add_source(
+            path=".crucible/sources/external/pdfs/registered.pdf",
+            title="Registered source", source_type="pdf",
+            metadata={"cite_key": "registered2026"},
+        )
+        db.link_article_source(article_id, source_id)
+        assert db.conn.execute(
+            "SELECT rowid FROM article_fts WHERE rowid = ?", (article_id,)
+        ).fetchone()
+    finally:
+        db.close()
+
+    result = CliRunner().invoke(cli, ["index"])
+    assert result.exit_code == 0, result.output
+    assert (cdir / "wiki" / "index.org").exists()
+    (project / CONCEPT_PATH).unlink()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "1 removed" in result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        assert db.get_article_by_path(CONCEPT_PATH) is None
+        assert not db.conn.execute(
+            "SELECT rowid FROM article_fts WHERE rowid = ?", (article_id,)
+        ).fetchone()
+        assert not db.conn.execute(
+            "SELECT article_id FROM article_sources WHERE article_id = ?", (article_id,)
+        ).fetchone()
+        assert db.get_source(source_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("blocked_subdir", ["wiki", "concepts", "entry"])
+def test_sync_preserves_articles_when_wiki_traversal_fails(project, monkeypatch, blocked_subdir):
+    cdir = project / ".crucible"
+    wiki = cdir / "wiki"
+    blocked = wiki if blocked_subdir == "wiki" else wiki / "concepts"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        article_ids = {row["id"] for row in db.list_articles()}
+        article_id = db.get_article_by_path(CONCEPT_PATH)["id"]
+        source_id = db.add_source(
+            path=".crucible/sources/external/pdfs/registered.pdf",
+            title="Registered source", source_type="pdf",
+            metadata={"cite_key": "registered2026"},
+        )
+        db.link_article_source(article_id, source_id)
+        article_links = {
+            (row["from_id"], row["to_id"])
+            for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
+        }
+        assert article_links
+        original_scandir = os.scandir
+
+        @contextmanager
+        def scandir_with_blocked_entry(path):
+            with original_scandir(path) as entries:
+                wrapped = []
+                for entry in entries:
+                    if os.path.normpath(entry.path) == str(blocked):
+                        inaccessible = Mock()
+                        inaccessible.name = entry.name
+                        inaccessible.path = entry.path
+                        inaccessible.stat.side_effect = PermissionError(
+                            errno.EACCES, "Synthetic traversal failure", str(blocked)
+                        )
+                        wrapped.append(inaccessible)
+                    else:
+                        wrapped.append(entry)
+                yield iter(wrapped)
+
+        def fail_scandir(path):
+            if not isinstance(path, (str, bytes, os.PathLike)):
+                return original_scandir(path)
+            scanned = os.path.normpath(os.fsdecode(path))
+            if blocked_subdir == "entry" and scanned == str(wiki):
+                return scandir_with_blocked_entry(path)
+            if blocked_subdir != "entry" and scanned == str(blocked):
+                raise PermissionError(errno.EACCES, "Synthetic traversal failure", str(blocked))
+            return original_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", fail_scandir)
+        with pytest.raises(PermissionError) as error:
+            _sync_wiki_to_db(project, db)
+
+        assert {row["id"] for row in db.list_articles()} == article_ids
+        assert {
+            (row["from_id"], row["to_id"])
+            for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
+        } == article_links
+        assert db.conn.execute(
+            "SELECT article_id FROM article_sources WHERE article_id = ? AND source_id = ?",
+            (article_id, source_id),
+        ).fetchone()
+        for article_id in article_ids:
+            assert db.conn.execute(
+                "SELECT rowid FROM article_fts WHERE rowid = ?", (article_id,)
+            ).fetchone()
+        assert error.value.filename == str(blocked)
+    finally:
+        db.close()
+
+
+def test_sync_closes_database_when_wiki_traversal_fails(project, monkeypatch):
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    close = Mock(wraps=db.close)
+    monkeypatch.setattr(db, "close", close)
+    monkeypatch.setattr("crucible.cli.get_db", lambda _root: db)
+    scandir = os.scandir
+    wiki = project / ".crucible" / "wiki"
+
+    def fail_scandir(path):
+        if os.fsdecode(path) == str(wiki):
+            raise PermissionError(errno.EACCES, "Synthetic traversal failure", str(wiki))
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fail_scandir)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert isinstance(result.exception, PermissionError)
+    close.assert_called_once_with()
+
+
+def test_sync_does_not_prune_when_wiki_directory_is_missing(project):
+    cdir = project / ".crucible"
+    wiki = cdir / "wiki"
+    moved_wiki = cdir / "wiki-unavailable"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        article_ids = {row["id"] for row in db.list_articles()}
+        assert article_ids
+        article_id = min(article_ids)
+        source_id = db.add_source(
+            path=".crucible/sources/external/pdfs/registered.pdf",
+            title="Registered source", source_type="pdf",
+            metadata={"cite_key": "registered2026"},
+        )
+        db.link_article_source(article_id, source_id)
+        wiki.rename(moved_wiki)
+        try:
+            stats = _sync_wiki_to_db(project, db)
+            assert stats["removed"] == 0
+            assert {row["id"] for row in db.list_articles()} == article_ids
+            assert db.conn.execute(
+                "SELECT article_id FROM article_sources WHERE article_id = ? AND source_id = ?",
+                (article_id, source_id),
+            ).fetchone()
+            for article_id in article_ids:
+                assert db.conn.execute(
+                    "SELECT rowid FROM article_fts WHERE rowid = ?", (article_id,)
+                ).fetchone()
+        finally:
+            moved_wiki.rename(wiki)
+    finally:
+        db.close()
+
+
 def test_install_points_the_global_directive_at_this_crucible(project, registry):
     result = CliRunner().invoke(cli, ["install"])
     assert result.exit_code == 0, result.output
@@ -279,3 +579,190 @@ def test_init_acts_on_its_root_not_the_current_directory(project, tmp_path, monk
     assert (other / ".crucible" / "wiki" / "MANIFEST.md").exists()
     paths = [e["path"] for e in run_json("registry", "list")]
     assert str(other.resolve()) in paths
+
+
+def test_sync_skips_emacs_lock_files(project):
+    # Emacs marks a buffer with unsaved changes with a dangling symlink.
+    lock = project / ".crucible" / "wiki" / "concepts" / ".#activation-energy.org"
+    lock.symlink_to("user@host.1234:1700000000")
+
+    for command in (["sync"], ["lint", "--json"]):
+        result = CliRunner().invoke(cli, command)
+        assert result.exit_code == 0, result.output
+    assert run_json("stats")["articles"] == 2
+
+
+def test_legacy_source_keys_match_whole_tokens(project):
+    cdir = project / ".crucible"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/sources/external/web/page.html",
+            title="Some web page",
+            source_type="web",
+            metadata={},
+        )
+    finally:
+        db.close()
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: ml")
+    )
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+    assert run_json("sources", CONCEPT_PATH) == []
+    assert any(
+        issue["type"] == "unresolved_source_key" and issue["key"] == "ml"
+        for issue in run_json("lint")
+    )
+
+
+INDEX_PATH = ".crucible/wiki/index.org"
+
+
+def test_sync_ignores_generated_index_in_stats_concepts_and_lint(project):
+    runner = CliRunner()
+    assert runner.invoke(cli, ["index"]).exit_code == 0
+    assert (project / INDEX_PATH).exists()
+    result = runner.invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert run_json("stats")["articles"] == 2
+    paths = {r["path"] for r in run_json("concept", "kinetics")}
+    assert INDEX_PATH not in paths
+    assert not [i for i in run_json("lint") if i.get("path") == INDEX_PATH]
+
+
+def test_sync_quietly_prunes_index_registered_by_older_versions(project):
+    from crucible.cli import get_db
+    runner = CliRunner()
+    assert runner.invoke(cli, ["index"]).exit_code == 0
+    db = get_db(project)
+    db.add_article(path=INDEX_PATH, title="Crucible Wiki Index", article_type="concept")
+    db.close()
+    result = runner.invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "0 removed" in result.output
+    assert run_json("stats")["articles"] == 2
+
+
+def test_nested_index_org_is_an_ordinary_article(project):
+    nested = ".crucible/wiki/concepts/index.org"
+    (project / nested).write_text(CONCEPT.replace("Activation energy", "Miller index"))
+    issues = run_json("lint")
+    assert any(i["type"] == "untracked" and i["path"] == nested for i in issues)
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert run_json("stats")["articles"] == 3
+    assert nested in {r["path"] for r in run_json("concept", "kinetics")}
+
+
+def _sync():
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+
+def test_sync_drops_tags_removed_from_a_file(project):
+    path = project / CONCEPT_PATH
+    path.write_text(path.read_text().replace(":kinetics:", ":thermo:"))
+    _sync()
+    assert [r["path"] for r in run_json("concept", "kinetics")] == [SUMMARY_PATH]
+    assert [r["path"] for r in run_json("concept", "thermo")] == [CONCEPT_PATH]
+
+
+def test_sync_drops_links_and_derivations_removed_from_a_file(project):
+    path = project / SUMMARY_PATH
+    text = path.read_text()
+    text = text.replace(":DERIVED_FROM: ../concepts/activation-energy.org\n", "")
+    text = text.replace("[[file:../concepts/activation-energy.org][activation energy]]",
+                        "activation energy")
+    path.write_text(text)
+    _sync()
+    assert run_json("backlinks", CONCEPT_PATH) == []
+    assert run_json("history", SUMMARY_PATH)["derived_from"] == []
+
+
+def test_sync_drops_source_keys_removed_from_a_file(project):
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/sources/external/pdfs/paper.pdf",
+            title="A paper", source_type="pdf",
+            metadata={"cite_key": "paper2026"},
+        )
+    finally:
+        db.close()
+    path = project / CONCEPT_PATH
+    original = path.read_text()
+    path.write_text(original.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: paper2026"))
+    _sync()
+    assert [s["title"] for s in run_json("sources", CONCEPT_PATH)] == ["A paper"]
+    path.write_text(original)
+    _sync()
+    assert run_json("sources", CONCEPT_PATH) == []
+
+
+def test_sync_prunes_concepts_no_article_uses(project):
+    path = project / CONCEPT_PATH
+    path.write_text(path.read_text().replace(":kinetics:", ":kinetics:solo:"))
+    _sync()
+    assert "solo" in {c["name"] for c in run_json("concepts")}
+    path.unlink()
+    _sync()
+    names = {c["name"]: c["article_count"] for c in run_json("concepts")}
+    assert names == {"kinetics": 1}
+
+
+def test_incremental_sync_matches_a_fresh_rebuild(project, tmp_path):
+    """The DB must stay regenerable from the wiki: after edits, an
+    incrementally synced DB holds the same relations as a fresh one."""
+
+    concept = project / CONCEPT_PATH
+    concept.write_text(concept.read_text().replace(":kinetics:", ":catalysis:")
+                       .replace("See [[file:../summaries/smith.org][Smith]].", ""))
+    summary = project / SUMMARY_PATH
+    summary.write_text(summary.read_text().replace(":kinetics:", ":kinetics:platinum:"))
+    _sync()
+
+    def relations(db):
+        q = lambda sql: sorted(tuple(r.values()) for r in db.conn.execute(sql))  # noqa: E731
+        return {
+            "tags": q("SELECT a.path, c.name FROM article_concepts ac "
+                      "JOIN articles a ON a.id = ac.article_id "
+                      "JOIN concepts c ON c.id = ac.concept_id"),
+            "concepts": q("SELECT name FROM concepts"),
+            "links": q("SELECT f.path, t.path FROM article_links l "
+                       "JOIN articles f ON f.id = l.from_id "
+                       "JOIN articles t ON t.id = l.to_id"),
+            "derivations": q("SELECT d.path, s.path FROM article_derivations x "
+                             "JOIN articles d ON d.id = x.derived_id "
+                             "JOIN articles s ON s.id = x.source_id"),
+        }
+
+    synced = CrucibleDB(project / ".crucible" / "crucible.db")
+    fresh = CrucibleDB(tmp_path / "fresh.db")
+    fresh.initialize()
+    try:
+        _sync_wiki_to_db(project, fresh)
+        assert relations(synced) == relations(fresh)
+    finally:
+        synced.close()
+        fresh.close()
+
+
+def test_concept_prune_survives_a_null_concept_id(project):
+    """A NULL concept_id must not stop unused concepts being pruned
+    (`id NOT IN (... NULL ...)` matches no rows)."""
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        article_id = db.get_article_by_path(CONCEPT_PATH)["id"]
+        db.conn.execute(
+            "INSERT INTO article_concepts (article_id, concept_id) VALUES (?, NULL)",
+            (article_id,),
+        )
+        db.add_concept("unused")
+        db.prune_unused_concepts()
+        names = {c["name"] for c in db.list_concepts()}
+    finally:
+        db.close()
+    assert "unused" not in names
+    assert "kinetics" in names

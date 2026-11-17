@@ -301,8 +301,23 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     for m in _BIB_FIELD_RE.finditer(body):
         name = m.group(1).lower()
         value = m.group(2) if m.group(2) is not None else m.group(3) or ""
-        fields[name] = " ".join(value.split())
+        fields[name] = value.strip() if name == "file" else " ".join(value.split())
     return fields
+
+
+def _resolve_bib_file(root: Path, value: str) -> Path:
+    """Prefer a literal file path, then try folding wrapped lines."""
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    if candidate.exists() or not re.search(r"[\r\n]", value):
+        return candidate
+
+    unfolded = re.sub(r"[ \t]*(?:\r\n|\r|\n)[ \t]*", " ", value)
+    alternative = Path(unfolded)
+    if not alternative.is_absolute():
+        alternative = root / alternative
+    return alternative if alternative.exists() else candidate
 
 
 def parse_bib_file(bib_path: Path) -> list[dict]:
@@ -488,9 +503,9 @@ def upsert_sources_from_bib(root: Path, db) -> int:
                 cite_key,
             )
             continue
-        candidate = Path(file_field)
-        if not candidate.is_absolute():
-            abs_path = (root / candidate).resolve()
+        candidate = _resolve_bib_file(root, file_field)
+        if not Path(file_field).is_absolute():
+            abs_path = candidate.resolve()
         else:
             abs_path = candidate
         try:
@@ -578,6 +593,18 @@ def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | Non
     return doi or None
 
 
+def bib_has_key(text: str, cite_key: str) -> bool:
+    """Return True if BibTeX text has an entry whose key is cite_key.
+
+    Matches the entry header ``@type{key,`` rather than ``{key,`` anywhere,
+    so field text such as ``author = {Smith, J}`` is not taken for the key
+    ``Smith``.
+    """
+    return re.search(
+        rf"@\w+\s*\{{\s*{re.escape(cite_key)}\s*,", text
+    ) is not None
+
+
 def append_bib_entry(root: Path, entry: str, cite_key: str):
     """Append a BibTeX entry to .crucible/references.bib if not already present.
 
@@ -590,7 +617,7 @@ def append_bib_entry(root: Path, entry: str, cite_key: str):
     with FileLock(lock_path, timeout=10):
         if bib_path.exists():
             existing = bib_path.read_text(encoding="utf-8")
-            if f"{{{cite_key}," in existing:
+            if bib_has_key(existing, cite_key):
                 return
             new_content = existing.rstrip() + "\n\n" + entry + "\n"
         else:
