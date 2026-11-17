@@ -73,10 +73,14 @@ def format_citation(entry: dict[str, str]) -> str:
 _TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _KEYWORD_RE = re.compile(r"^#\+\w+:.*$", re.MULTILINE)
-# Any drawer (:PROPERTIES:, :LOGBOOK:, ...) up to its :END: line.
+# Any drawer (:PROPERTIES:, :LOGBOOK:, ...) up to its :END: line. Like org,
+# a drawer cannot span a heading, so a stray ":note:" line followed later by
+# some other drawer's :END: does not swallow the prose between them.
 _DRAWER_RE = re.compile(
-    r"^[ \t]*:(?!END:)([A-Za-z][\w-]*):[ \t]*\n(.*?)^[ \t]*:END:[ \t]*$",
-    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    r"^[ \t]*:(?!END:)([A-Za-z][\w-]*):[ \t]*\n"
+    r"((?:(?![ \t]*:END:[ \t]*$)(?!\*+[ \t]).*\n)*?)"
+    r"[ \t]*:END:[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 _PROP_LINE_RE = re.compile(r"^\s*:([A-Za-z_]+):\s+(.+?)\s*$", re.MULTILINE)
 # Org block names are case-insensitive and blocks may be indented. The

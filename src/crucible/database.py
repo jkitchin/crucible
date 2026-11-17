@@ -6,7 +6,6 @@ search support (F32_BLOB, vector_distance_cos, libsql_vector_idx).
 """
 
 import json
-import re
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
@@ -18,8 +17,10 @@ def _concept_key(name: str) -> str:
 
     Case and punctuation are ignored, so the tag ``activation_energy``, the
     slug ``activation-energy`` and the title "Activation Energy" agree.
+    Letters and digits of any script are kept, so a non-ASCII concept such
+    as ``触媒`` has a key of its own rather than an empty one.
     """
-    return re.sub(r"[^0-9a-z]", "", name.lower())
+    return "".join(ch for ch in name.casefold() if ch.isalnum())
 
 
 class DictCursor:
@@ -874,7 +875,9 @@ class CrucibleDB:
         ):
             names.add(_concept_key(PurePosixPath(row["path"]).stem))
             names.add(_concept_key(row["title"] or ""))
-        return sorted(c for c in all_concepts if _concept_key(c) not in names)
+        names.discard("")  # an untitled article names no concept
+        return sorted(c for c in all_concepts
+                      if not _concept_key(c) or _concept_key(c) not in names)
 
     def single_concept_articles(self) -> list[dict]:
         """Articles that cover only one concept (potential merge candidates)."""

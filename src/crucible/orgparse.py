@@ -92,6 +92,20 @@ def citation_keys(m: re.Match) -> list[str]:
     return [k.strip() for k in re.split(r"[,;]", body) if k.strip()]
 
 
+_HEADING_RE = re.compile(r"^\*+[ \t]", re.MULTILINE)
+
+
+def _article_property_sections(prose: str) -> list[str]:
+    """The text before the first heading, and the first heading's section."""
+    starts = [m.start() for m in _HEADING_RE.finditer(prose)]
+    if not starts:
+        return [prose]
+    sections = [prose[:starts[0]]]
+    end = starts[1] if len(starts) > 1 else len(prose)
+    sections.append(prose[starts[0]:end])
+    return sections
+
+
 def parse_org(text: str) -> OrgMetadata:
     """Parse org-mode text and extract metadata."""
     meta = OrgMetadata(content=text)
@@ -111,11 +125,14 @@ def parse_org(text: str) -> OrgMetadata:
         raw = m.group(1).strip()
         meta.filetags = [t for t in raw.strip(":").split(":") if t]
 
-    # Properties come from the first drawer only: the file-level drawer or
-    # the article's top heading. Drawers on later headings describe those
+    # Properties come from the file-level drawer (before the first heading,
+    # where org-id and org-roam put :ID:) and the first heading's drawer,
+    # first value winning. Drawers on later headings describe those
     # sections, not the article.
-    drawer = PROP_DRAWER_RE.search(prose)
-    if drawer:
+    for section in _article_property_sections(prose):
+        drawer = PROP_DRAWER_RE.search(section)
+        if not drawer:
+            continue
         for m in PROP_LINE_RE.finditer(drawer.group(1)):
             key = m.group(1).upper()
             if key not in meta.properties:

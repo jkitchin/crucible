@@ -1069,6 +1069,17 @@ def _dest_taken(dest_path: Path) -> bool:
     return False
 
 
+def _claim(path: Path, created: list[Path]) -> bool:
+    """Create path exclusively; record it in created and return True if we got it."""
+    try:
+        with open(path, "xb"):
+            pass
+    except FileExistsError:
+        return False
+    created.append(path)
+    return True
+
+
 def ingest_source(
     root: Path,
     db: CrucibleDB,
@@ -1190,33 +1201,42 @@ def ingest_source(
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / source_path.name
     in_place = dest_path.exists() and dest_path.samefile(source_path)
-    if not in_place:
+
+    # Claim the names by exclusive create: a free name that another ingest
+    # takes first raises FileExistsError, and we move on to the next one.
+    # A file is never replaced. A .txt source is its own text; any other
+    # file gets a sidecar.
+    created: list[Path] = []
+    write_sidecar = False
+    if in_place:
+        text_path = dest_path.with_suffix(".txt")
+        if text and text_path != dest_path:
+            write_sidecar = _claim(text_path, created)
+    else:
         stem, suffix = source_path.stem, source_path.suffix
         counter = 1
-        while _dest_taken(dest_path):
+        while True:
+            if not _dest_taken(dest_path) and _claim(dest_path, created):
+                text_path = dest_path.with_suffix(".txt")
+                if not text or text_path == dest_path:
+                    break
+                if _claim(text_path, created):
+                    write_sidecar = True
+                    break
+                created.pop().unlink(missing_ok=True)
             dest_path = dest_dir / f"{stem}_{counter}{suffix}"
             counter += 1
 
     rel_path = str(dest_path.relative_to(root))
     bib_entry = set_bib_field(bib_entry, "file", rel_path)
 
-    # A .txt source is its own text; any other file gets a sidecar, unless
-    # that name is already taken (only possible for a file ingested in place).
-    text_path = dest_path.with_suffix(".txt")
-    write_sidecar = bool(text) and text_path != dest_path and not text_path.exists()
-
-    created: list[Path] = []
     cite_key = None
     try:
         if not in_place:
-            # Exclusive create: a file that appeared meanwhile is never replaced.
-            with open(source_path, "rb") as src, open(dest_path, "xb") as dst:
-                created.append(dest_path)
+            with open(source_path, "rb") as src, open(dest_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             shutil.copystat(source_path, dest_path)
         if write_sidecar:
-            with open(text_path, "x", encoding="utf-8"):
-                created.append(text_path)
             atomic_write_text(text_path, text)
 
         cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
@@ -1234,6 +1254,9 @@ def ingest_source(
 
         # Register in database (store cite_key and content hash in metadata)
         metadata = {"cite_key": cite_key, "content_hash": content_hash}
+        if write_sidecar:
+            # Lets delete tell this sidecar from a user's own <stem>.txt.
+            metadata["text_hash"] = file_sha256(text_path)
         if doi:
             metadata["doi"] = doi
         source_id = db.add_source(

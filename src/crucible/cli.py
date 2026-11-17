@@ -19,7 +19,7 @@ from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source
-from crucible.orgparse import parse_org_file
+from crucible.orgparse import FILE_LINK_RE, parse_org_file
 
 
 CRUCIBLE_DIR = ".crucible"
@@ -1399,9 +1399,18 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
         peers = []
 
     try:
-        idx = EmbeddingIndex(db.conn, model=model, url=url)
-        idx.initialize()
-        embedded = idx.stats()["embedded_with_model"]
+        # Keyword search never touches the embeddings table: initialize()
+        # creates or migrates it, which a plain search must not do. Nor
+        # does auto mode in a crucible that has never been embedded.
+        idx = None
+        embedded = 0
+        has_embeddings = db.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embeddings'"
+        ).fetchone() is not None
+        if mode in ("semantic", "hybrid") or (mode == "auto" and has_embeddings):
+            idx = EmbeddingIndex(db.conn, model=model, url=url)
+            idx.initialize()
+            embedded = idx.stats()["embedded_with_model"]
 
         effective_mode = mode
         if mode == "auto":
@@ -1689,7 +1698,6 @@ def concept(name, json_output):
 
     NAME is matched case-insensitively (sync lowercases FILETAGS).
     """
-    name = name.lower()
     root = get_root()
     db = get_db(root)
     results = db.concept_articles(name)
@@ -2160,6 +2168,35 @@ def vscode(file):
         )
 
 
+def _is_own_sidecar(root: Path, db, src: dict, disk_path: Path, sidecar: Path) -> bool:
+    """Whether sidecar is the extracted text ingest wrote for this source.
+
+    A .txt that is itself a source is never a sidecar. Otherwise it must
+    match the text hash ingest recorded or, for sources ingested before
+    that was recorded (or rebuilt from the bibliography), the text
+    extracted from the source now. A user's own <stem>.txt matches neither.
+    """
+    from crucible.ingest import extract_text, file_sha256
+
+    if sidecar == disk_path or not sidecar.is_file():
+        return False
+    sidecar_rel = _safe_relative_to(sidecar, root)
+    if sidecar_rel is not None and db.get_source_by_path(sidecar_rel) is not None:
+        return False
+    meta = src.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = {}
+    if isinstance(meta, dict) and meta.get("text_hash"):
+        return file_sha256(sidecar) == meta["text_hash"]
+    try:
+        return sidecar.read_text(encoding="utf-8") == extract_text(disk_path)
+    except Exception:
+        return False
+
+
 @cli.command()
 @click.argument("path")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
@@ -2218,16 +2255,18 @@ def delete(path, yes, delete_file):
             click.confirm("Delete this source?", abort=True)
         disk_path = root / src["path"]
         if delete_file and disk_path.exists():
+            # Its extracted-text sidecar too, which sync would otherwise
+            # index as a new source, but only a .txt that is provably the
+            # sidecar: decided before the source file is gone.
+            sidecar = disk_path.with_suffix(".txt")
+            own_sidecar = _is_own_sidecar(root, db, src, disk_path, sidecar)
             disk_path.unlink()
             click.echo(f"  Deleted file: {disk_path}")
-            # Its extracted-text sidecar too, which sync would otherwise
-            # index as a new source. A .txt that is itself a source stays.
-            sidecar = disk_path.with_suffix(".txt")
-            sidecar_rel = _safe_relative_to(sidecar, root)
-            if (sidecar != disk_path and sidecar.is_file()
-                    and (sidecar_rel is None or db.get_source_by_path(sidecar_rel) is None)):
+            if own_sidecar:
                 sidecar.unlink()
                 click.echo(f"  Deleted text sidecar: {sidecar}")
+            elif sidecar != disk_path and sidecar.is_file():
+                click.echo(f"  Kept {sidecar}: it is not this source's extracted text.")
         # The bibliography is what sync rebuilds sources from, so the entry
         # must stop naming the file or the next sync restores the row.
         from crucible.ingest import drop_bib_file_fields
@@ -3026,10 +3065,13 @@ def _rewrite_article_links(
         content = org_file.read_text(encoding="utf-8", errors="surrogateescape")
 
         def repl(match: re.Match) -> str:
-            # An org search option (file:foo.org::*Heading) is not part of
-            # the path: resolve without it and keep it on the new link.
-            link_path, sep, search = match.group(1).partition("::")
-            resolved = (final_path.parent / link_path).resolve()
+            # FILE_LINK_RE is the pattern sync reads links with, so every
+            # form it counts ([[file:x]], [[./x.org]], [[x.org]]) is
+            # rewritten. Group 1 is the path alone: an org search option
+            # (::*Heading) and the description stay as they were.
+            link_path = match.group(1)
+            target = Path(os.path.expanduser(link_path))
+            resolved = (final_path.parent / target).resolve()
             try:
                 wiki_rel = str(resolved.relative_to(target_wiki_resolved))
             except ValueError:
@@ -3037,11 +3079,20 @@ def _rewrite_article_links(
             if wiki_rel not in wiki_renames:
                 return match.group(0)
             new_target = target_wiki / wiki_renames[wiki_rel]
-            new_link = os.path.relpath(new_target, final_path.parent)
-            return f"[[file:{new_link}{sep}{search}]"
+            if target.is_absolute():
+                new_link = str(new_target.resolve())
+            else:
+                new_link = os.path.relpath(new_target, final_path.parent)
+                prefixed = not match.group(0).startswith("[[file:")
+                if prefixed and not new_link.startswith(("./", "../")):
+                    new_link = "./" + new_link  # keep it a link org reads
+            start = match.start(1) - match.start(0)
+            end = match.end(1) - match.start(0)
+            whole = match.group(0)
+            return whole[:start] + new_link + whole[end:]
 
         # One pass, so a link already rewritten is not rewritten again.
-        new_content = re.sub(r"\[\[file:(.*?)\]", repl, content)
+        new_content = FILE_LINK_RE.sub(repl, content)
         if new_content != content:
             org_file.write_text(new_content, encoding="utf-8",
                                 errors="surrogateescape")
@@ -4197,6 +4248,27 @@ def install():
 
 _SKILL_RECORD = ".crucible-installed.json"
 
+# sha256 of every skill file crucible shipped before installs recorded what
+# they wrote (_SKILL_RECORD). On the first install after upgrading there is
+# no record, so a file matching one of these is an unedited older copy, not
+# a local change. The record makes this list complete: it never grows.
+_PRE_RECORD_SKILL_HASHES = {
+    "SKILL.md": frozenset({
+        "108cf60820b1b4c43656d6732a151859615106c590935ba08a564a60841a4e3e",
+        "3a74c4559c9219f6d4885af4a4171228793b8b269b6ead81d18d652c67462bad",
+        "45e343e711965d4b64362c3fcffa3790aa622f804404742abdd81fd01b6d0c6b",
+        "58830c6d1c4f4606d3c0a44abf98b8ddfe72a2ca4e4a04ee371258abf30800fc",
+        "6700fbdd5491b608eeb6e019df3bc56989961aa498df08163c46b5db4b2cfeca",
+        "aa6a6d4a58d0231f6877a8e38390ca9774f4072e2cf3067508cfcfdb91688b49",
+        "c2a41534ecf0f7fd29ff25187aa63f475cd821396bc84c543dfc0827c512a937",
+        "d2461c5d0a49e0c555eeb7383bd389d4fc506bcdab2a6e5fb8934091845a7cc9",
+        "dd80d5f7ac844c224e26ae4eabf67243f31af6f4612d5fbf9a19c7104963b6f0",
+        "e986a207cfb3f66db9958d781927d39c22d527a97a54c3f34ef7eecf3e577b8e",
+        "f37dd608de0522523200c94c0e2627ee61c96d06148ec417861676b137180e7f",
+        "f7fa4428132bf1d54eb1f4ee4b5e7183ef21d07f864c9e18d469b04f7ee2b078",
+    }),
+}
+
 
 def _skill_source() -> Path:
     """The packaged skill directory.
@@ -4265,9 +4337,18 @@ def _install(root: Path | None, directive: bool) -> None:
             new_hash = _file_sha256(src_file)
             if dest_file.is_file():
                 current = _file_sha256(dest_file)
-                if current != new_hash and current != record.get(src_file.name):
-                    # Not what crucible last installed: keep the local edits.
+                shipped = (
+                    {record[src_file.name]} if src_file.name in record
+                    else _PRE_RECORD_SKILL_HASHES.get(src_file.name, frozenset())
+                )
+                if current != new_hash and current not in shipped:
+                    # Not a copy crucible installed: keep the local edits,
+                    # in a backup no later install overwrites.
                     backup = dest_file.with_name(dest_file.name + ".bak")
+                    n = 1
+                    while backup.exists():
+                        n += 1
+                        backup = dest_file.with_name(f"{dest_file.name}.bak{n}")
                     shutil.copy2(str(dest_file), str(backup))
                     click.echo(f"  Skill: {dest_file} had local changes; "
                                f"saved a copy to {backup}")
