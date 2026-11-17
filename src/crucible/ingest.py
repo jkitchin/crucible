@@ -284,7 +284,13 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
     return "\n".join(lines)
 
 
-_CITE_KEY_RE = re.compile(r"(@\w+\s*\{\s*)([^,\s]+)")
+# BibTeX delimits an entry with braces, @type{key, ...}, or parentheses,
+# @type(key, ...). Every entry pattern accepts both; the full-entry pattern
+# requires the closer that matches the opener.
+BIB_ENTRY_HEAD = r"@(?P<type>\w+)\s*(?:(?P<paren>\()|\{)\s*(?P<key>[^,\s]+)\s*,"
+BIB_ENTRY_CLOSE = r"(?(paren)\)|\})"
+
+_CITE_KEY_RE = re.compile(r"(@\w+\s*[{(]\s*)([^,\s]+)")
 
 
 def replace_cite_key(bibtex: str, new_key: str) -> str:
@@ -292,7 +298,7 @@ def replace_cite_key(bibtex: str, new_key: str) -> str:
     return _CITE_KEY_RE.sub(lambda m: m.group(1) + new_key, bibtex, count=1)
 
 
-_ENTRY_HEAD_RE = re.compile(r"@\w+\s*\{\s*[^,\s]+\s*,")
+_ENTRY_HEAD_RE = re.compile(BIB_ENTRY_HEAD)
 
 
 def set_bib_field(bibtex: str, name: str, value: str) -> str:
@@ -316,7 +322,9 @@ def set_bib_field(bibtex: str, name: str, value: str) -> str:
     return bibtex[:head.end()] + line + body
 
 
-_BIB_ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,(.*?)\n\}", re.DOTALL)
+_BIB_ENTRY_RE = re.compile(
+    BIB_ENTRY_HEAD + r"(?P<body>.*?)\n" + BIB_ENTRY_CLOSE, re.DOTALL
+)
 _BIB_FIELD_RE = re.compile(
     r"(\w+)\s*=\s*(?:\{((?:[^{}]|\{[^{}]*\})*)\}|\"([^\"]*)\")",
     re.DOTALL,
@@ -360,10 +368,10 @@ def parse_bib_file(bib_path: Path) -> list[dict]:
     entries = []
     for m in _BIB_ENTRY_RE.finditer(text):
         entry = {
-            "entry_type": m.group(1).lower(),
-            "cite_key": m.group(2),
+            "entry_type": m["type"].lower(),
+            "cite_key": m["key"],
         }
-        entry.update(_parse_bib_fields(m.group(3)))
+        entry.update(_parse_bib_fields(m["body"]))
         entries.append(entry)
     return entries
 
@@ -412,84 +420,136 @@ def source_type_for_path(rel_path: str, entry_type: str | None = None) -> str:
     }.get(entry_type or "", "other")
 
 
-def upsert_sources_from_disk(root: Path, db) -> int:
-    """Create sources rows for files in sources/notebooks/ and sources/data/.
+def _disk_scan_files(root: Path) -> list[Path]:
+    """The committed source files the disk scan indexes, in a stable order.
 
-    These directories are committed to git (unlike sources/external/), so a
-    fresh clone has the files but no sources table. Scans both directories
-    and creates a source row for each file, using the filename stem as the
-    cite_key in metadata. Skips hidden files, extracted text sidecars
-    (*.txt next to a non-txt source), and entries whose path already exists
-    in the sources table.
-
-    Returns the number of new sources inserted.
+    Files in sources/notebooks/ and sources/data/, skipping hidden files and
+    extracted-text sidecars (a *.txt beside a non-txt file with its stem).
     """
-    existing_paths: set[str] = {src["path"] for src in db.list_sources()}
-    inserted = 0
-
-    subdirs = [
+    files = []
+    for subdir in (
         root / CRUCIBLE_DIR / "sources" / "notebooks",
         root / CRUCIBLE_DIR / "sources" / "data",
-    ]
-
-    for subdir in subdirs:
+    ):
         if not subdir.is_dir():
             continue
         for path in sorted(subdir.rglob("*")):
             if not path.is_file() or path.name.startswith("."):
                 continue
-            # Skip *.txt sidecars from text extraction if a non-txt source
-            # with the same stem exists
             if path.suffix.lower() == ".txt":
                 siblings = [p for p in path.parent.glob(path.stem + ".*")
                             if p != path and p.is_file()]
                 if siblings:
                     continue
+            files.append(path)
+    return files
 
+
+def _disk_scan_key(path: Path, taken: set[str]) -> str:
+    """A cite key for a disk-scanned file: its stem, unless that is taken.
+
+    A stem that names a bib entry or a source not from the scan would
+    capture that key's article links, so fall back to stem-ext, then
+    stem-ext-2, ...
+    """
+    if path.stem not in taken:
+        return path.stem
+    base = f"{path.stem}-{path.suffix.lstrip('.').lower() or 'file'}"
+    key, n = base, 2
+    while key in taken:
+        key, n = f"{base}-{n}", n + 1
+    return key
+
+
+def upsert_sources_from_disk(root: Path, db) -> int:
+    """Create and key source rows for files in sources/notebooks/ and sources/data/.
+
+    These directories are committed to git (unlike sources/external/), so a
+    fresh clone has the files but no sources table. Each file that no other
+    row (from ingest or a bib entry) claims gets a row keyed by its filename
+    stem, marked ``disk_scan`` in its metadata.
+
+    A stem is not used as the key when a bib entry or a row that is not from
+    the scan already has that key: the file would capture that key's
+    article links (#29). Such a file gets a key that collides with none of
+    those (see _disk_scan_key). Keys are assigned over every scanned file,
+    existing rows included, so an existing database is repaired to the keys
+    a fresh rebuild gives. Two scanned files with the same stem still share
+    it; sync links both and lint reports the duplicate (#11).
+
+    Returns the number of new sources inserted.
+    """
+    files = _disk_scan_files(root)
+    rows = db.list_sources()
+    by_path = {src["path"]: src for src in rows}
+    entries = parse_bib_file(root / CRUCIBLE_DIR / "references.bib")
+    # A file a bib entry names belongs to that entry, even when its row
+    # looks like a scanned one (an entry keyed by its file's stem does).
+    entry_files = {_bib_file_path(root, e["file"]) for e in entries if e.get("file")}
+    scanned_rows = {
+        src["path"] for src in rows
+        if _from_disk_scan(src) and src["path"] not in entry_files
+    }
+
+    taken = {entry["cite_key"] for entry in entries}
+    for src in rows:
+        key = _source_metadata(src).get("cite_key")
+        if isinstance(key, str) and src["path"] not in scanned_rows:
+            taken.add(key)
+
+    inserted = 0
+    for path in files:
+        try:
+            rel_path = str(path.relative_to(root.resolve()))
+        except ValueError:
+            rel_path = str(path)
+
+        existing = by_path.get(rel_path)
+        if rel_path in entry_files or (
+            existing is not None and rel_path not in scanned_rows
+        ):
+            continue  # ingest or a bib entry owns this file
+
+        cite_key = _disk_scan_key(path, taken)
+
+        if existing is not None:
+            metadata = _source_metadata(existing)
+            if metadata.get("cite_key") != cite_key or not metadata.get("disk_scan"):
+                metadata.update(cite_key=cite_key, disk_scan=True)
+                db.update_source(existing["id"], metadata=metadata)
+            continue
+
+        title = path.stem.replace("-", " ").replace("_", " ").title()
+        if path.suffix.lower() == ".org":
             try:
-                rel_path = str(path.relative_to(root.resolve()))
-            except ValueError:
-                rel_path = str(path)
-
-            if rel_path in existing_paths:
-                continue
-
-            cite_key = path.stem
-            title = path.stem.replace("-", " ").replace("_", " ").title()
-            if path.suffix.lower() == ".org":
-                try:
-                    meta = parse_org_file(path)
-                    if meta.title:
-                        title = meta.title
-                except Exception:
-                    pass
-
-            source_type = source_type_for_path(rel_path)
-
-            metadata = {"cite_key": cite_key}
-
-            try:
-                mtime_iso = datetime.fromtimestamp(
-                    path.stat().st_mtime
-                ).strftime("%Y-%m-%d")
-            except OSError:
-                mtime_iso = None
-
-            try:
-                db.add_source(
-                    path=rel_path,
-                    title=title,
-                    source_type=source_type,
-                    shareable=True,
-                    url=None,
-                    authors=None,
-                    date=mtime_iso,
-                    metadata=metadata,
-                )
-                existing_paths.add(rel_path)
-                inserted += 1
+                meta = parse_org_file(path)
+                if meta.title:
+                    title = meta.title
             except Exception:
-                continue
+                pass
+
+        try:
+            mtime_iso = datetime.fromtimestamp(
+                path.stat().st_mtime
+            ).strftime("%Y-%m-%d")
+        except OSError:
+            mtime_iso = None
+
+        try:
+            db.add_source(
+                path=rel_path,
+                title=title,
+                source_type=source_type_for_path(rel_path),
+                shareable=True,
+                url=None,
+                authors=None,
+                date=mtime_iso,
+                metadata={"cite_key": cite_key, "disk_scan": True},
+            )
+            by_path[rel_path] = None
+            inserted += 1
+        except Exception:
+            continue
 
     return inserted
 
@@ -537,10 +597,15 @@ def _knows_its_file(root: Path, src: dict, bib_keys: set[str]) -> bool:
 
 
 def _from_disk_scan(src: dict) -> bool:
-    """Whether a source row came from upsert_sources_from_disk (keyed by file stem)."""
+    """Whether a source row came from upsert_sources_from_disk.
+
+    Such rows are marked ``disk_scan``; rows from versions before the mark
+    are recognised by a cite key equal to the file stem.
+    """
+    md = _source_metadata(src)
     return (
         not _from_ingest(src)
-        and _source_metadata(src).get("cite_key") == Path(src["path"]).stem
+        and (md.get("disk_scan") is True or md.get("cite_key") == Path(src["path"]).stem)
         and src["path"].startswith((
             f"{CRUCIBLE_DIR}/sources/notebooks/", f"{CRUCIBLE_DIR}/sources/data/",
         ))
@@ -712,12 +777,12 @@ def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | Non
 def bib_has_key(text: str, cite_key: str) -> bool:
     """Return True if BibTeX text has an entry whose key is cite_key.
 
-    Matches the entry header ``@type{key,`` rather than ``{key,`` anywhere,
-    so field text such as ``author = {Smith, J}`` is not taken for the key
-    ``Smith``.
+    Matches the entry header ``@type{key,`` (or ``@type(key,``) rather than
+    ``{key,`` anywhere, so field text such as ``author = {Smith, J}`` is not
+    taken for the key ``Smith``.
     """
     return re.search(
-        rf"@\w+\s*\{{\s*{re.escape(cite_key)}\s*,", text
+        rf"@\w+\s*[{{(]\s*{re.escape(cite_key)}\s*,", text
     ) is not None
 
 
@@ -753,7 +818,7 @@ def set_bib_file_fields(root: Path, paths: dict[str, str]) -> None:
         text = bib_path.read_text(encoding="utf-8")
 
         def repl(m: re.Match) -> str:
-            path = paths.get(m.group(2))
+            path = paths.get(m["key"])
             return set_bib_field(m.group(0), "file", path) if path else m.group(0)
 
         new_text = _BIB_ENTRY_RE.sub(repl, text)

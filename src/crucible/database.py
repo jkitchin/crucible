@@ -78,7 +78,7 @@ class DictConnection:
         try:
             yield
             self._conn.commit()
-        except Exception:
+        except BaseException:
             self._conn.execute("ROLLBACK")
             raise
         finally:

@@ -382,7 +382,10 @@ def init(root):
             ".crucible/crucible.db-shm\n"
             "\n"
             "# Crucible: publish output\n"
-            ".crucible/wiki/_build/\n",
+            ".crucible/wiki/_build/\n"
+            "\n"
+            "# Crucible: left behind only if a merge is killed\n"
+            ".crucible/.merge-staging-*/\n",
             encoding="utf-8",
         )
         created.append(".gitignore")
@@ -1909,6 +1912,13 @@ def merge(source, dry_run, yes):
     target_wiki = cdir(root) / "wiki"
     source_wiki = source_cdir / "wiki"
 
+    for stale in sorted(cdir(root).glob(_MERGE_STAGING_PREFIX + "*")):
+        click.echo(
+            f"Warning: {stale} is left over from an interrupted merge; "
+            "nothing in it was merged, and it can be deleted.",
+            err=True,
+        )
+
     source_db = CrucibleDB(source_cdir / "crucible.db")
     target_db = get_db(root)
     try:
@@ -1921,6 +1931,7 @@ def merge(source, dry_run, yes):
         # Plan before asking for confirmation, so a merge that cannot be done
         # safely is refused up front and --dry-run shows the real outcome.
         plan = _plan_source_merge(source_root, root, source_db, target_db)
+        _plan_article_merge(plan, source_wiki, target_wiki)
         for warning in plan.warnings:
             click.echo(f"Warning: {warning}", err=True)
 
@@ -1930,99 +1941,57 @@ def merge(source, dry_run, yes):
             click.confirm("\nProceed with merge?", abort=True)
         click.echo()
 
-        # --- Phase 1: Sources ---
-        for copy in plan.sources:
-            if dry_run:
+        if dry_run:
+            for copy in plan.sources:
                 click.echo(f"  source: {copy.src['title']} -> {copy.new_rel}")
-                continue
-            copy.dest_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(copy.src_file, copy.dest_file)
-            if copy.src_text is not None:
-                shutil.copy2(copy.src_text, copy.dest_file.with_suffix(".txt"))
-
-            authors = copy.src.get("authors") or "[]"
-            if isinstance(authors, str):
-                authors = json.loads(authors)
-            target_db.add_source(
-                path=copy.new_rel, title=copy.src["title"],
-                source_type=copy.src["source_type"],
-                shareable=bool(copy.src["shareable"]),
-                url=copy.src.get("url"), authors=authors,
-                date=copy.src.get("date"), metadata=copy.metadata,
-            )
-        for src_text, dest_text in plan.sidecars:
-            if dry_run:
+            for _, dest_text in plan.sidecars:
                 click.echo(f"  sidecar: {os.path.relpath(dest_text, root)}")
-            else:
-                dest_text.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_text, dest_text)
-
-        # --- Phase 2: Wiki articles ---
-        articles_copied = 0
-        wiki_renames = {}   # wiki-relative old -> new (only for renamed files)
-        copied_files = []   # absolute paths of newly copied org files
-
-        if source_wiki.exists():
-            for org_path in sorted(source_wiki.rglob("*.org")):
-                if org_path.name == "index.org":
-                    continue
-
-                rel_within_wiki = org_path.relative_to(source_wiki)
-                dest_path = target_wiki / rel_within_wiki
-
-                if dest_path.exists():
-                    stem, suffix = dest_path.stem, dest_path.suffix
-                    counter = 1
-                    while dest_path.exists():
-                        dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
-                        counter += 1
-                    new_rel = str(dest_path.relative_to(target_wiki))
-                    wiki_renames[str(rel_within_wiki)] = new_rel
-
-                if dry_run:
-                    label = str(dest_path.relative_to(target_wiki))
-                    if str(rel_within_wiki) in wiki_renames:
-                        click.echo(f"  article: {rel_within_wiki} -> {label} (renamed)")
-                    else:
-                        click.echo(f"  article: {rel_within_wiki}")
+            for org_path, dest_path in plan.articles:
+                rel_within_wiki = str(org_path.relative_to(source_wiki))
+                if rel_within_wiki in plan.wiki_renames:
+                    label = plan.wiki_renames[rel_within_wiki]
+                    click.echo(f"  article: {rel_within_wiki} -> {label} (renamed)")
                 else:
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(org_path), str(dest_path))
-                    copied_files.append(dest_path)
-
-                articles_copied += 1
-
-        # Rewrite file links in copied articles for any renames
-        if wiki_renames and not dry_run:
-            rewrites = _rewrite_article_links(copied_files, target_wiki, wiki_renames)
+                    click.echo(f"  article: {rel_within_wiki}")
+            for cite_key, _ in plan.bib_entries:
+                click.echo(f"  bib: {cite_key}")
+            for cite_key, path in plan.bib_file_fields.items():
+                click.echo(f"  bib: {cite_key} (existing entry gets file = {path})")
+        else:
+            rewrites = _apply_merge(root, plan, target_db)
             if rewrites:
                 click.echo(f"  Rewrote links in {rewrites} file(s)")
-
-        # --- Phase 3: References ---
-        if not dry_run:
-            from crucible.ingest import append_bib_entry
-        for cite_key, entry_text in plan.bib_entries:
-            if dry_run:
-                click.echo(f"  bib: {cite_key}")
-            else:
-                append_bib_entry(root, entry_text, cite_key)
     finally:
         source_db.close()
         target_db.close()
 
-    # --- Phase 4: Sync ---
-    if not dry_run and (articles_copied or plan.sources or plan.bib_entries):
+    # Sync. Everything above is already in place, so a failure here leaves
+    # a complete merge whose database the next sync brings up to date.
+    if not dry_run and (plan.articles or plan.sources or plan.bib_entries):
         click.echo()
         ctx = click.get_current_context()
-        ctx.invoke(sync)
+        try:
+            ctx.invoke(sync)
+        except Exception as exc:
+            reason = exc.format_message() if isinstance(exc, click.ClickException) else exc
+            raise click.ClickException(
+                f"Merged all files, but the sync afterwards failed: {reason}\n"
+                "Run `crucible sync` to bring the database up to date."
+            ) from exc
 
     # --- Summary ---
     click.echo()
     verb = "Would merge" if dry_run else "Merged"
     click.echo(
-        f"{verb}: {len(plan.sources)} sources, {articles_copied} articles, "
+        f"{verb}: {len(plan.sources)} sources, {len(plan.articles)} articles, "
         f"{len(plan.bib_entries)} bib entries"
     )
+    if plan.bib_file_fields:
+        action = "Would attach" if dry_run else "Attached"
+        click.echo(
+            f"  {action} {len(plan.bib_file_fields)} source file(s) to existing "
+            "bibliography entries"
+        )
     if plan.skipped:
         click.echo(f"  Skipped {plan.skipped} existing sources")
     if plan.outside:
@@ -2032,10 +2001,203 @@ def merge(source, dry_run, yes):
     if plan.sidecars:
         action = "Would copy" if dry_run else "Copied"
         click.echo(f"  {action} {len(plan.sidecars)} missing text sidecar(s)")
-    if wiki_renames:
+    if plan.wiki_renames:
         click.echo(
-            f"  Renamed {len(wiki_renames)} article(s) to avoid conflicts"
+            f"  Renamed {len(plan.wiki_renames)} article(s) to avoid conflicts"
         )
+
+
+# Merge copies files into a directory with this prefix inside .crucible/
+# before moving them into place, so a failed merge leaves nothing behind.
+_MERGE_STAGING_PREFIX = ".merge-staging-"
+
+
+def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path) -> None:
+    """Add the incoming wiki articles to plan, renaming any that collide."""
+    if not source_wiki.exists():
+        return
+    planned: set[Path] = set()
+    for org_path in sorted(source_wiki.rglob("*.org")):
+        if org_path.name == "index.org":
+            continue
+        rel_within_wiki = org_path.relative_to(source_wiki)
+        dest_path = target_wiki / rel_within_wiki
+        if dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
+            stem, suffix = dest_path.stem, dest_path.suffix
+            counter = 1
+            while dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
+                dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
+                counter += 1
+            plan.wiki_renames[str(rel_within_wiki)] = str(
+                dest_path.relative_to(target_wiki)
+            )
+        planned.add(dest_path)
+        plan.articles.append((org_path, dest_path))
+
+
+def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
+    """Write a merge plan into the target, all or nothing.
+
+    Every file is first copied into a staging directory inside .crucible/
+    (so the moves below are renames on one filesystem) and article links
+    are rewritten there. Only then are the files moved into place, the
+    bibliography rewritten in one atomic write, and the source rows
+    inserted in one transaction. If any step fails or is interrupted, what
+    was already done is undone and the target is left as it was.
+
+    Returns the number of articles whose links were rewritten.
+    """
+    import tempfile
+
+    from filelock import FileLock
+
+    from crucible.ingest import atomic_write_text
+
+    target_cdir = cdir(root)
+    target_wiki = target_cdir / "wiki"
+    bib_path = target_cdir / "references.bib"
+    staging = Path(tempfile.mkdtemp(prefix=_MERGE_STAGING_PREFIX, dir=target_cdir))
+
+    copies: list[tuple[Path, Path]] = []
+    for copy in plan.sources:
+        copies.append((copy.src_file, copy.dest_file))
+        if copy.src_text is not None:
+            copies.append((copy.src_text, copy.dest_file.with_suffix(".txt")))
+    copies.extend(plan.sidecars)
+    copies.extend(plan.articles)
+
+    placed: list[tuple[Path, Path]] = []   # (staged, dest) moved into place
+    made_dirs: list[Path] = []             # directories created for them
+    old_bib: str | None = None
+    bib_written = False
+    try:
+        # 1. Stage every file.
+        staged_files = []
+        for i, (src, dest) in enumerate(copies):
+            staged = staging / f"{i}{dest.suffix}"
+            shutil.copy2(src, staged)
+            staged_files.append((staged, dest))
+        article_files = staged_files[len(copies) - len(plan.articles):]
+        rewrites = (
+            _rewrite_article_links(article_files, target_wiki, plan.wiki_renames)
+            if plan.wiki_renames else 0
+        )
+
+        with FileLock(bib_path.with_suffix(".bib.lock"), timeout=10):
+            # 2. Move the staged files into place.
+            for staged, dest in staged_files:
+                missing = []
+                parent = dest.parent
+                while not parent.exists():
+                    missing.append(parent)
+                    parent = parent.parent
+                for directory in reversed(missing):
+                    directory.mkdir()
+                    made_dirs.append(directory)
+                if dest.exists() or dest.is_symlink():
+                    raise click.ClickException(
+                        f"{os.path.relpath(dest, root)} appeared while merging."
+                    )
+                os.rename(staged, dest)
+                placed.append((staged, dest))
+
+            # 3. The bibliography, in one atomic write.
+            if plan.bib_entries or plan.bib_file_fields:
+                old_bib = bib_path.read_text(encoding="utf-8") if bib_path.exists() else None
+                new_bib = _merged_bib_text(old_bib or "", plan)
+                if new_bib != (old_bib or ""):
+                    atomic_write_text(bib_path, new_bib)
+                    bib_written = True
+
+            # 4. The source rows, in one transaction.
+            with target_db.conn.transaction():
+                for copy in plan.sources:
+                    authors = copy.src.get("authors") or "[]"
+                    if isinstance(authors, str):
+                        authors = json.loads(authors)
+                    target_db.add_source(
+                        path=copy.new_rel, title=copy.src["title"],
+                        source_type=copy.src["source_type"],
+                        shareable=bool(copy.src["shareable"]),
+                        url=copy.src.get("url"), authors=authors,
+                        date=copy.src.get("date"), metadata=copy.metadata,
+                    )
+    except BaseException as exc:
+        leftovers = _undo_merge(root, bib_path, old_bib, bib_written, placed, made_dirs)
+        if not isinstance(exc, Exception):
+            raise   # Ctrl-C: undone, re-raised for click to report.
+        reason = exc.format_message() if isinstance(exc, click.ClickException) else exc
+        if leftovers:
+            listed = "\n".join(f"  - {item}" for item in leftovers)
+            raise click.ClickException(
+                f"Merge failed: {reason}\nUndoing it also failed, so these "
+                f"changes to the target remain:\n{listed}"
+            ) from exc
+        raise click.ClickException(
+            f"Merge failed: {reason}\nNothing was merged; the target is unchanged."
+        ) from exc
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return rewrites
+
+
+def _undo_merge(
+    root: Path, bib_path: Path, old_bib: str | None, bib_written: bool,
+    placed: list[tuple[Path, Path]], made_dirs: list[Path],
+) -> list[str]:
+    """Undo the writes _apply_merge made; return what could not be undone."""
+    from crucible.ingest import atomic_write_text
+
+    leftovers = []
+    if bib_written:
+        try:
+            if old_bib is None:
+                bib_path.unlink()
+            else:
+                atomic_write_text(bib_path, old_bib)
+        except OSError as exc:
+            leftovers.append(f"{os.path.relpath(bib_path, root)} (could not restore: {exc})")
+    for staged, dest in reversed(placed):
+        try:
+            os.rename(dest, staged)
+        except OSError as exc:
+            leftovers.append(f"{os.path.relpath(dest, root)} (could not remove: {exc})")
+    for directory in reversed(made_dirs):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass   # an empty directory left behind changes nothing
+    return leftovers
+
+
+def _merged_bib_text(text: str, plan: "_MergePlan") -> str:
+    """The target bibliography with the plan's file fields and new entries."""
+    from crucible.ingest import _BIB_ENTRY_RE, _parse_bib_fields, bib_has_key, set_bib_field
+
+    attached: list[str] = []
+
+    def attach(m: re.Match) -> str:
+        path = plan.bib_file_fields.get(m["key"])
+        if path is None:
+            return m.group(0)
+        if _parse_bib_fields(m["body"]).get("file") or m["key"] in attached:
+            raise click.ClickException(
+                f"the bibliography entry '{m['key']}' changed while merging."
+            )
+        attached.append(m["key"])
+        return set_bib_field(m.group(0), "file", path)
+
+    text = _BIB_ENTRY_RE.sub(attach, text)
+    missing = set(plan.bib_file_fields) - set(attached)
+    if missing:
+        raise click.ClickException(
+            f"the bibliography entry '{sorted(missing)[0]}' changed while merging."
+        )
+    for cite_key, entry_text in plan.bib_entries:
+        if bib_has_key(text, cite_key):
+            continue
+        text = (text.rstrip() + "\n\n" + entry_text + "\n") if text.strip() else entry_text + "\n"
+    return text
 
 
 @dataclass
@@ -2052,12 +2214,19 @@ class _SourceCopy:
 
 @dataclass
 class _MergePlan:
-    """Everything a merge will write for sources and references."""
+    """Everything a merge will write."""
 
     sources: list[_SourceCopy] = dataclass_field(default_factory=list)
     # Sidecars missing beside sources the target already has.
     sidecars: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
     bib_entries: list[tuple[str, str]] = dataclass_field(default_factory=list)
+    # Target entries with no `file` field that get one naming an incoming
+    # source copied for them (cite key -> path relative to the target root).
+    bib_file_fields: dict[str, str] = dataclass_field(default_factory=dict)
+    # Incoming wiki articles (source path, destination path), and the
+    # wiki-relative renames of those that collide with existing articles.
+    articles: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
+    wiki_renames: dict[str, str] = dataclass_field(default_factory=dict)
     skipped: int = 0   # identical sources the target already has
     outside: int = 0   # indexed sources stored outside .crucible/, not copied
     warnings: list[str] = dataclass_field(default_factory=list)
@@ -2132,7 +2301,7 @@ def _plan_source_merge(
 
     incoming_keys: set[str] = set()
     mapped_keys: set[str] = set()   # keys whose source file is accounted for
-    copied_keys: set[str] = set()   # keys whose source is copied as new
+    copied_keys: dict[str, str] = {}   # key -> new path, for sources copied as new
 
     for src in source_db.list_sources():
         try:
@@ -2234,7 +2403,7 @@ def _plan_source_merge(
                     src, src_file, dest_file, new_rel, metadata, src_text,
                 ))
                 if cite_key:
-                    copied_keys.add(cite_key)
+                    copied_keys[cite_key] = new_rel
         except _MergeConflict as exc:
             problems.append(str(exc))
             continue
@@ -2247,7 +2416,9 @@ def _plan_source_merge(
 
     # Bibliography entries, with `file` fields pointing at the planned paths.
     target_text = target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
-    target_keys = {m.group(2) for m in _BIB_ENTRY_RE.finditer(target_text)}
+    target_entries: dict[str, list[str]] = {}
+    for m in _BIB_ENTRY_RE.finditer(target_text):
+        target_entries.setdefault(m["key"], []).append(m.group(0))
     source_sources = (source_cdir / "sources").resolve()
     for cite_key, entry_text in source_entries.items():
         if not _parse_bib_fields(entry_text).get("file"):
@@ -2261,17 +2432,19 @@ def _plan_source_merge(
                 )
         # bib_has_key also catches entries _BIB_ENTRY_RE misses (a closing
         # brace not on its own line) without matching field text.
-        if cite_key in target_keys or bib_has_key(target_text, cite_key):
+        if cite_key in target_entries or bib_has_key(target_text, cite_key):
             if cite_key in copied_keys:
-                # The target's entry would win on the next rebuild and point
-                # this key at something other than the source being copied.
-                problems.append(
-                    f"Cannot safely merge source with citation key '{cite_key}': "
-                    "the target bibliography already has an entry with this key "
-                    "but no matching indexed source. Give the target's entry a "
-                    "file field naming its source file and run `crucible sync` "
-                    "there, or rename one of the keys."
+                # The target has the reference but no source for it. Attach
+                # the incoming file to the target's entry when it is plainly
+                # the same reference; otherwise the target's entry would win
+                # on the next rebuild and point this key elsewhere.
+                problem = _bib_attach_problem(
+                    cite_key, target_entries.get(cite_key, []), entry_text
                 )
+                if problem:
+                    problems.append(problem)
+                else:
+                    plan.bib_file_fields[cite_key] = copied_keys[cite_key]
             continue
 
         try:
@@ -2312,6 +2485,52 @@ def _plan_source_merge(
     if problems:
         _raise_merge_problems(problems)
     return plan
+
+
+def _bib_attach_problem(
+    cite_key: str, target_entries: list[str], incoming_entry: str
+) -> str | None:
+    """Why an incoming source cannot be attached to the target's entry, if it cannot.
+
+    The target's entry must be the only one with the key, must not already
+    name a file, and must not disagree with the incoming entry on DOI or
+    title, which would mean the two keys name different references.
+    """
+    from crucible.ingest import _parse_bib_fields
+
+    prefix = (
+        f"Cannot safely merge source with citation key '{cite_key}': "
+        "the target bibliography already has an entry with this key"
+    )
+    if len(target_entries) != 1:
+        return (
+            f"{prefix}, but it cannot be read or is not the only one. Fix the "
+            "target's references.bib, or rename one of the keys."
+        )
+    target_fields = _parse_bib_fields(target_entries[0])
+    if target_fields.get("file"):
+        return (
+            f"{prefix}, and it names the file '{target_fields['file']}', but no "
+            "indexed source in the target matches it. Run `crucible sync` in the "
+            "target (correcting the file field if the file has moved), or rename "
+            "one of the keys."
+        )
+    incoming_fields = _parse_bib_fields(incoming_entry)
+    identifying = [
+        ("doi", "DOIs", lambda v: re.sub(
+            r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "", v.strip().lower())),
+        # Braces only protect case: {E}vidence is Evidence.
+        ("title", "titles", lambda v: re.sub(
+            r"[\W_]+", " ", v.replace("{", "").replace("}", "").lower()).strip()),
+    ]
+    for name, label, norm in identifying:
+        ours, theirs = target_fields.get(name), incoming_fields.get(name)
+        if ours and theirs and norm(ours) != norm(theirs):
+            return (
+                f"{prefix}, and the two entries have different {label}, so they "
+                "may not be the same reference. Rename one of the keys."
+            )
+    return None
 
 
 def _raise_merge_problems(problems: list[str]) -> NoReturn:
@@ -2400,34 +2619,34 @@ def _resolve_merge_source(source: str) -> Path:
 
 
 def _rewrite_article_links(
-    copied_files: list[Path], target_wiki: Path, wiki_renames: dict[str, str]
+    files: list[tuple[Path, Path]], target_wiki: Path, wiki_renames: dict[str, str]
 ) -> int:
     """Rewrite [[file:...]] links in copied articles for renamed files.
 
-    Returns the number of files modified.
+    Each item is (file to edit, the path that file will have in the target
+    wiki); links are resolved relative to the latter. Returns the number of
+    files modified.
     """
     target_wiki_resolved = target_wiki.resolve()
     count = 0
 
-    for org_file in copied_files:
+    for org_file, final_path in files:
         content = org_file.read_text(encoding="utf-8")
-        new_content = content
 
-        for match in re.finditer(r"\[\[file:(.*?)\]", content):
+        def repl(match: re.Match) -> str:
             link_path = match.group(1)
-            resolved = (org_file.parent / link_path).resolve()
+            resolved = (final_path.parent / link_path).resolve()
             try:
                 wiki_rel = str(resolved.relative_to(target_wiki_resolved))
             except ValueError:
-                continue
+                return match.group(0)
+            if wiki_rel not in wiki_renames:
+                return match.group(0)
+            new_target = target_wiki / wiki_renames[wiki_rel]
+            return f"[[file:{os.path.relpath(new_target, final_path.parent)}]"
 
-            if wiki_rel in wiki_renames:
-                new_target = target_wiki / wiki_renames[wiki_rel]
-                new_link = os.path.relpath(new_target, org_file.parent)
-                new_content = new_content.replace(
-                    f"[[file:{link_path}]", f"[[file:{new_link}]"
-                )
-
+        # One pass, so a link already rewritten is not rewritten again.
+        new_content = re.sub(r"\[\[file:(.*?)\]", repl, content)
         if new_content != content:
             org_file.write_text(new_content, encoding="utf-8")
             count += 1
@@ -2441,7 +2660,7 @@ def _parse_bib_entries(text: str) -> dict[str, str]:
 
     entries = {}
     for match in _BIB_ENTRY_RE.finditer(text):
-        cite_key = match.group(2)
+        cite_key = match["key"]
         if cite_key in entries:
             raise _MergeConflict(
                 f"Cannot safely merge: duplicate bibliography key '{cite_key}'."
@@ -2811,8 +3030,9 @@ def lint(json_output):
     bib_keys = set()
     if bib_path.exists():
         import re as _re
-        for m in _re.finditer(r"@\w+\{([^,\s]+),", bib_path.read_text(encoding="utf-8")):
-            bib_keys.add(m.group(1))
+        from crucible.ingest import BIB_ENTRY_HEAD
+        for m in _re.finditer(BIB_ENTRY_HEAD, bib_path.read_text(encoding="utf-8")):
+            bib_keys.add(m["key"])
 
     for article in db.list_articles():
         org_path = root / article["path"]
