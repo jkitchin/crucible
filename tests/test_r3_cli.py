@@ -1,6 +1,5 @@
 """Round-3 review fixes: init/update/install/uninstall, path arguments, help."""
 
-import hashlib
 import subprocess
 from pathlib import Path
 

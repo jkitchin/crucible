@@ -5,11 +5,9 @@ import sqlite3
 from contextlib import contextmanager
 
 import pytest
-from click.testing import CliRunner
 
 from crucible import ingest as ingest_module
 from crucible import registry as registry_module
-from crucible.cli import cli
 from crucible.database import CrucibleDB
 
 from test_data_loss_ingest import bib_keys, cite_key, kb, run  # noqa: F401

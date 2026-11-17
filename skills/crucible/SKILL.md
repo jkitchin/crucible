@@ -263,8 +263,8 @@ bibliography:../../references.bib
 `sources/data/` with no bib entry is keyed by its file name without the
 extension (`results.csv` is `results`), or by `<stem>-<ext>` (`results-csv`,
 then `results-csv-2`, ...) when that stem is already a bib key or another
-source's key. Read the key from `crucible source <file> --json` (the
-`cite_key` in its metadata) rather than guessing. Titles are not keys.
+source's key. Read the key from the `Key:` line of `crucible source <file>`
+rather than guessing. Titles are not keys.
 `crucible lint` reports a key that resolves to no source, or to several.
 
 ### Bibliography Requirement

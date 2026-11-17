@@ -49,7 +49,7 @@ All wiki articles use org-mode format with scimax conventions:
   - `:SOURCE_KEYS:` - space-separated cite keys of primary sources (the keys
     in `references.bib`; a file with no bib entry is keyed by its `<stem>`,
     or `<stem>-<ext>` (then `-2`, `-3`, ...) when the stem is already a key;
-    check it with `crucible source <file> --json`)
+    `crucible source <file>` prints it)
   - `:STATUS:` - draft, reviewed, or verified
   - `:CREATED:` - ISO date
   - `:MODIFIED:` - ISO date of the last substantive edit; update it on every edit

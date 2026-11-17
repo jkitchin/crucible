@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from crucible.cli import _sync_wiki_to_db, cli
+from crucible.cli import _source_cite_key, _sync_wiki_to_db, cli
 from crucible.database import CrucibleDB
 from crucible.orgparse import parse_org
 
@@ -324,3 +324,24 @@ def test_removed_created_is_cleared(kb):
     run("sync")
     created = query(kb, "SELECT created_at FROM articles")[0]["created_at"]
     assert created > "2026-01-01 00:00:00"
+
+
+
+def test_source_and_sources_print_the_cite_key(kb, tmp_path):
+    (tmp_path / "results.csv").write_text("a,b\n1,2\n")
+    r = CliRunner()
+    assert r.invoke(cli, ["ingest", str(tmp_path / "results.csv")]).exit_code == 0
+    db = CrucibleDB(kb / ".crucible/crucible.db")
+    try:
+        key = _source_cite_key(db.list_sources()[0])
+    finally:
+        db.close()
+    (kb / ".crucible/wiki/concepts/res.org").write_text(
+        "#+TITLE: Res\n#+FILETAGS: :concept:\n\n* Res\n:PROPERTIES:\n"
+        ":ARTICLE_TYPE: concept\n:SOURCE_KEYS: " + key + "\n:END:\n\nBody.\n")
+    assert r.invoke(cli, ["sync"]).exit_code == 0
+    out = r.invoke(cli, ["source", "results.csv"])
+    assert out.exit_code == 0, out.output
+    assert f"Key: {key}\n" in out.output
+    out = r.invoke(cli, ["sources", "wiki/concepts/res.org"])
+    assert f"({key})" in out.output, out.output

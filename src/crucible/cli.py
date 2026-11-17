@@ -1737,6 +1737,18 @@ def backlinks(article_path, json_output):
             click.echo(f"    ...{r['context']}...")
 
 
+def _source_cite_key(src: dict) -> str | None:
+    """The cite key stored in a source row's metadata, if any."""
+    meta = src.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            return None
+    key = meta.get("cite_key") if isinstance(meta, dict) else None
+    return str(key) if key else None
+
+
 @cli.command("source")
 @click.argument("source_path")
 @json_option
@@ -1776,6 +1788,8 @@ def source_info(source_path, json_output):
 
     click.echo(f"Source: {src['title']}")
     click.echo(f"  Path: {src['path']}")
+    if _source_cite_key(src):
+        click.echo(f"  Key: {_source_cite_key(src)}")
     click.echo(f"  Type: {src['source_type']} ({'shareable' if src.get('shareable') else 'external'})")
     click.echo(f"  Date: {src.get('date', 'unknown')}")
     click.echo(f"  Ingested: {src['ingested_at']}")
@@ -1820,7 +1834,8 @@ def sources(article_path, json_output):
         click.echo("No sources linked.")
         return
     for r in results:
-        click.echo(f"  [{r['source_type']}] {r['title']}")
+        key = _source_cite_key(r)
+        click.echo(f"  [{r['source_type']}] {r['title']}" + (f" ({key})" if key else ""))
         if r.get("url"):
             click.echo(f"    {r['url']}")
 
@@ -2790,7 +2805,6 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
     from crucible.ingest import atomic_write_text
 
     target_cdir = cdir(root)
-    target_wiki = target_cdir / "wiki"
     bib_path = target_cdir / "references.bib"
     staging = Path(tempfile.mkdtemp(prefix=_MERGE_STAGING_PREFIX, dir=target_cdir))
 
@@ -4464,8 +4478,8 @@ LINKING TO SOURCES:
   `crucible ingest` printed. A file in sources/notebooks/ or sources/data/
   that no bib entry claims is keyed <stem> (results.csv -> results), or
   <stem>-<ext> (results-csv, then -2, -3...) when the stem is already a
-  bib key or another source's key; `crucible source <file> --json`
-  shows it. Sync uses these keys to link articles to their sources;
+  bib key or another source's key; `crucible source <file>` shows
+  it on its Key: line. Sync uses these keys to link articles to their sources;
   `crucible lint` reports keys that resolve to no source or to several.
 
 UPDATING EXISTING ARTICLES:
@@ -4638,7 +4652,7 @@ SOURCE_KEYS: space-separated cite keys from references.bib (the key
 `crucible ingest` printed). A file in sources/notebooks/ or sources/data/
 with no bib entry is keyed <stem>, or <stem>-<ext> (then -2, -3...) when
 the stem is already a bib key or another source's key; `crucible
-source <file> --json` shows it. These create article-to-source links
+source <file>` shows it. These create article-to-source links
 during sync.
 
 CREATED / MODIFIED: the article's dates; update MODIFIED on every edit.
