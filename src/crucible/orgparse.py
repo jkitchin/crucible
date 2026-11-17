@@ -22,8 +22,8 @@ class OrgMetadata:
 
 
 # Patterns
-TITLE_RE = re.compile(r"^#\+TITLE:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
-FILETAGS_RE = re.compile(r"^#\+FILETAGS:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
+TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
+FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 PROP_DRAWER_RE = re.compile(
     r":PROPERTIES:\s*\n(.*?)\n\s*:END:", re.DOTALL
 )

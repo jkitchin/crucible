@@ -86,8 +86,8 @@ def format_citation(entry: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 # Block patterns
-_TITLE_RE = re.compile(r"^#\+TITLE:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
-_FILETAGS_RE = re.compile(r"^#\+FILETAGS:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
+_TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
+_FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _KEYWORD_RE = re.compile(r"^#\+\w+:.*$", re.MULTILINE)
 _DRAWER_RE = re.compile(
     r"^\s*:PROPERTIES:\s*\n(.*?)\n\s*:END:\s*$", re.MULTILINE | re.DOTALL

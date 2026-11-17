@@ -16,6 +16,20 @@ def test_org_keywords_are_case_insensitive():
     assert filetags == ["concept", "kinetics"]
 
 
+def test_empty_keywords_do_not_take_the_next_line():
+    text = "#+title:\n#+filetags: :concept:\n* Heading\n"
+    meta = parse_org(text)
+    title, _, filetags = org_to_html(text)
+    assert meta.title == title == ""
+    assert meta.filetags == filetags == ["concept"]
+
+    text = "#+title: Article\n#+filetags:\n* Heading\n"
+    meta = parse_org(text)
+    title, _, filetags = org_to_html(text)
+    assert meta.title == title == "Article"
+    assert meta.filetags == filetags == []
+
+
 def test_empty_property_does_not_take_the_next_line(tmp_path):
     f = tmp_path / "a.org"
     f.write_text(
