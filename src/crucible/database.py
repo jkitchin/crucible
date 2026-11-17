@@ -487,7 +487,7 @@ class CrucibleDB:
         """Update an article's metadata from its file's front matter and properties."""
         self.conn.execute(
             """UPDATE articles SET title = ?, article_type = ?, status = ?,
-                      distill_model = ?, abstract = ?
+                      distill_model = ?, abstract = ?, updated_at = datetime('now')
                WHERE id = ?""",
             (title, article_type, status, distill_model, abstract, article_id),
         )
@@ -502,15 +502,28 @@ class CrucibleDB:
         )
         self.conn.commit()
 
-    def delete_article(self, article_id: int):
-        """Delete an article and all its relationships."""
-        self.conn.execute("DELETE FROM article_fts WHERE rowid = ?", (article_id,))
+    def get_article_fts(self, article_id: int) -> dict | None:
+        """Return the indexed path, title and content of an article."""
+        row = self.conn.execute(
+            "SELECT path, title, content FROM article_fts WHERE rowid = ?",
+            (article_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_embedding(self, article_id: int):
+        """Drop an article's embedding so `crucible embed` regenerates it."""
         # The embeddings table is created lazily by the first `crucible embed`,
         # so it may not exist yet on a knowledge base that was never embedded.
         if self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'"
         ).fetchone():
             self.conn.execute("DELETE FROM embeddings WHERE article_id = ?", (article_id,))
+            self.conn.commit()
+
+    def delete_article(self, article_id: int):
+        """Delete an article and all its relationships."""
+        self.conn.execute("DELETE FROM article_fts WHERE rowid = ?", (article_id,))
+        self.delete_embedding(article_id)
         self.conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
         self.conn.commit()
 

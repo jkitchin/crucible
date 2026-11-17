@@ -670,3 +670,84 @@ def test_concept_prune_survives_a_null_concept_id(project):
         db.close()
     assert "unused" not in names
     assert "kinetics" in names
+
+
+def _sync_output():
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def _with_embeddings(project, fn):
+    """Run fn(db, ids) with an embeddings table holding a row per article."""
+    from crucible.embeddings import EmbeddingIndex
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        EmbeddingIndex(db.conn).initialize()
+        ids = {p: db.get_article_by_path(p)["id"] for p in (CONCEPT_PATH, SUMMARY_PATH)}
+        return fn(db, ids)
+    finally:
+        db.close()
+
+
+def _embedded_paths(project):
+    def read(db, ids):
+        rows = db.conn.execute("SELECT article_id FROM embeddings").fetchall()
+        present = {r["article_id"] for r in rows}
+        return {p for p, i in ids.items() if i in present}
+    return _with_embeddings(project, read)
+
+
+def _seed(project):
+    """Give every article an embedding and an old updated_at."""
+    def seed(db, ids):
+        for i in ids.values():
+            db.conn.execute(
+                "INSERT INTO embeddings (article_id, model, dimensions) VALUES (?, 'm', 768)",
+                (i,),
+            )
+        db.conn.execute("UPDATE articles SET updated_at = '2000-01-01 00:00:00'")
+        db.conn.commit()
+    _with_embeddings(project, seed)
+
+
+def _updated_at(project, path):
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        return db.get_article_by_path(path)["updated_at"]
+    finally:
+        db.close()
+
+
+def test_sync_leaves_unchanged_articles_alone(project):
+    _seed(project)
+    assert "0 added, 0 updated, 2 unchanged" in _sync_output()
+    assert _updated_at(project, CONCEPT_PATH) == "2000-01-01 00:00:00"
+    assert _embedded_paths(project) == {CONCEPT_PATH, SUMMARY_PATH}
+
+
+def test_sync_rewrites_only_changed_articles(project):
+    _seed(project)
+    path = project / CONCEPT_PATH
+    path.write_text(path.read_text().replace("energy barrier", "zeolite barrier"))
+    assert "0 added, 1 updated, 1 unchanged" in _sync_output()
+    assert _updated_at(project, CONCEPT_PATH) != "2000-01-01 00:00:00"
+    assert _updated_at(project, SUMMARY_PATH) == "2000-01-01 00:00:00"
+    # The edited article's embedding is stale, so it is dropped for re-embedding.
+    assert _embedded_paths(project) == {SUMMARY_PATH}
+    assert [r["path"] for r in run_json("search", "zeolite", "--mode", "fts")] == [CONCEPT_PATH]
+
+
+def test_sync_counts_a_metadata_only_edit_as_a_change(project):
+    path = project / CONCEPT_PATH
+    path.write_text(path.read_text().replace(":STATUS: draft", ":STATUS: reviewed"))
+    assert "1 updated, 1 unchanged" in _sync_output()
+
+
+def test_unchanged_article_links_resolve_when_their_target_appears(project):
+    """Relations are rebuilt even for unchanged files: smith.org links to
+    missing.org, which only exists after the first sync."""
+    missing = ".crucible/wiki/summaries/missing.org"
+    (project / missing).write_text(SUMMARY.replace("Smith 2024 results", "Missing"))
+    assert "1 added, 0 updated, 2 unchanged" in _sync_output()
+    assert SUMMARY_PATH in [r["path"] for r in run_json("backlinks", missing)]
