@@ -269,3 +269,29 @@ def test_restore_by_name_extracts_the_text_once(kb, tmp_path, monkeypatch):  # n
     again = ingest(kb, old)
     assert again.get("restored")
     assert len(calls) == 1
+
+
+# -- merge from a source without a database writes nothing into it ---------
+
+
+def test_merge_from_a_read_only_source_without_a_database(kb, tmp_path):  # noqa: F811
+    import os
+
+    from test_merge import make_crucible
+
+    peer = make_crucible(tmp_path / "peer")
+    (peer / ".crucible/wiki/concepts/z.org").write_text(
+        "#+TITLE: Z\n* Z\n:PROPERTIES:\n:ARTICLE_TYPE: concept\n:END:\nbody\n")
+    for db_file in peer.glob(".crucible/crucible.db*"):
+        db_file.unlink()
+    before = sorted(p.name for p in (peer / ".crucible").iterdir())
+    read_only = os.name != "nt" and os.geteuid() != 0
+    if read_only:
+        (peer / ".crucible").chmod(0o555)
+    try:
+        result = CliRunner().invoke(cli, ["merge", str(peer), "--yes"])
+    finally:
+        (peer / ".crucible").chmod(0o755)
+    assert result.exit_code == 0, result.output
+    assert (kb / ".crucible/wiki/concepts/z.org").exists()
+    assert sorted(p.name for p in (peer / ".crucible").iterdir()) == before

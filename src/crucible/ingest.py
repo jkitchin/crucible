@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import unicodedata
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
@@ -439,11 +440,14 @@ def parse_bib_file(bib_path: Path) -> list[dict]:
     return parsed
 
 
-def _read_bib_entries(root: Path) -> tuple[list[dict], int]:
+def _read_bib_entries(root: Path, lock: bool = True) -> tuple[list[dict], int]:
     """references.bib parsed as parse_bib_file does, read under the bib lock,
-    plus the number of malformed entries (unbalanced braces, no key)."""
+    plus the number of malformed entries (unbalanced braces, no key).
+
+    lock=False reads without the lock (see reconcile_sources).
+    """
     bib_path = root / CRUCIBLE_DIR / "references.bib"
-    with _bib_lock(root):
+    with _bib_lock(root) if lock else nullcontext():
         if not bib_path.exists():
             return [], 0
         text = bib_path.read_text(encoding="utf-8", errors="replace")
@@ -813,7 +817,7 @@ def _release_unlisted_sources(root: Path, db, bib_keys: set[str]) -> None:
         db.update_source(src["id"], **_disk_scan_fields(path, src["path"]), metadata=new_md)
 
 
-def reconcile_sources(root: Path, db, on_warning=None) -> int:
+def reconcile_sources(root: Path, db, on_warning=None, lock: bool = True) -> int:
     """Make the sources table agree with references.bib and the files on disk.
 
     The database must be regenerable from committed files (#6). A bib
@@ -840,6 +844,12 @@ def reconcile_sources(root: Path, db, on_warning=None) -> int:
     missing key may be one that failed to parse, so no row is released and
     on_warning (if given) is called with a message.
 
+    lock=False skips the bib lock, which creates references.bib.lock next
+    to the bibliography. Only for a database that root's own commands never
+    see, such as the one merge builds in a temporary directory to plan from
+    a source crucible: such a database knows no files, so nothing is
+    written to the bibliography, and the source may be read-only.
+
     Returns the number of source rows inserted.
     """
     inserted = 0
@@ -850,8 +860,8 @@ def reconcile_sources(root: Path, db, on_warning=None) -> int:
     # appends its entry before it adds its row, and the row cannot be added
     # while this transaction holds the write lock, so every ingested row
     # seen here has its entry in what is read.
-    with _bib_lock(root), db.conn.transaction():
-        entries, malformed = _read_bib_entries(root)
+    with _bib_lock(root) if lock else nullcontext(), db.conn.transaction():
+        entries, malformed = _read_bib_entries(root, lock=lock)
         bib_keys = {entry["cite_key"] for entry in entries}
         key_counts: dict[str, int] = {}
         for entry in entries:

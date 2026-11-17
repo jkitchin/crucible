@@ -3421,8 +3421,10 @@ def _merge_source_db(source_root: Path, tmp_dir: Path) -> CrucibleDB:
         try:
             db.initialize()
             # An empty database knows no files, so reconciling it writes
-            # nothing to the source's references.bib.
-            reconcile_sources(source_root, db)
+            # nothing to the source's references.bib. Without the bib lock,
+            # which would create a lock file in the source (and fails when
+            # the source is read-only).
+            reconcile_sources(source_root, db, lock=False)
             _sync_wiki_to_db(source_root, db, **quiet)
         except BaseException:
             db.close()
