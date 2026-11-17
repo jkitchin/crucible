@@ -250,8 +250,10 @@ Modes:
 Keyword search matches article titles and text (not paths). Each word is
 matched literally, so FTS5 operators such as =AND=, =NOT= or quotes are
 plain text. A trailing =*= makes a word a prefix: =catal*= matches
-catalysis and catalyst. Prefixes are stemmed like other words, so the
-prefix one letter shorter is matched as well.
+catalysis and catalyst. The prefix is used as given; because words are
+indexed by their porter stems, a prefix that cuts into a stemmed suffix
+(=cataly*=, =oxidat*=) can miss, so use a shorter one (=catal*=, =oxid*=).
+A word with no letters or digits (=&=, =-=) is ignored.
 - *semantic*: vector similarity only
 - *hybrid*: FTS + semantic combined with Reciprocal Rank Fusion
 
