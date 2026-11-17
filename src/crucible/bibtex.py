@@ -222,6 +222,39 @@ def scan(text: str) -> tuple[list[Entry], list[int]]:
     return entries, malformed
 
 
+_STRING_NAME_RE = re.compile(r"\s*(?P<name>[A-Za-z][\w:.+-]*)\s*=")
+
+
+def macro_blocks(text: str) -> list[tuple[str, str | None, str]]:
+    """The ``@string`` and ``@preamble`` blocks scan() skips, in order.
+
+    Each is (kind, name, block text): kind is "string" or "preamble", and
+    name is the macro a @string defines (None for a @preamble).
+    """
+    blocks: list[tuple[str, str | None, str]] = []
+    i = 0
+    while True:
+        at = text.find("@", i)
+        if at == -1:
+            break
+        head = _HEAD_RE.match(text, at)
+        if head is None or _commented(text, at):
+            i = at + 1
+            continue
+        close = _match_close(text, head.end(), head["open"])
+        if close is None:
+            i = head.end()
+            continue
+        etype = head["type"].lower()
+        if etype == "string":
+            m = _STRING_NAME_RE.match(text, head.end(), close)
+            blocks.append(("string", m["name"].lower() if m else None, text[at:close]))
+        elif etype == "preamble":
+            blocks.append(("preamble", None, text[at:close]))
+        i = close
+    return blocks
+
+
 def entries(text: str) -> list[Entry]:
     """Every entry in BibTeX text, in order."""
     return scan(text)[0]
