@@ -1903,6 +1903,10 @@ def merge(source, dry_run, yes):
     )
     if plan.skipped:
         click.echo(f"  Skipped {plan.skipped} existing sources")
+    if plan.outside:
+        click.echo(
+            f"  Skipped {plan.outside} source(s) stored outside {CRUCIBLE_DIR}/"
+        )
     if plan.sidecars:
         action = "Would copy" if dry_run else "Copied"
         click.echo(f"  {action} {len(plan.sidecars)} missing text sidecar(s)")
@@ -1932,7 +1936,8 @@ class _MergePlan:
     # Sidecars missing beside sources the target already has.
     sidecars: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
     bib_entries: list[tuple[str, str]] = dataclass_field(default_factory=list)
-    skipped: int = 0
+    skipped: int = 0   # identical sources the target already has
+    outside: int = 0   # indexed sources stored outside .crucible/, not copied
     warnings: list[str] = dataclass_field(default_factory=list)
 
 
@@ -1956,7 +1961,7 @@ def _plan_source_merge(
     """
     from crucible.ingest import (
         _BIB_ENTRY_RE, _BIB_FIELD_RE, _parse_bib_fields, _resolve_bib_file,
-        file_sha256,
+        bib_has_key, file_sha256,
     )
 
     source_cdir = source_root / CRUCIBLE_DIR
@@ -2021,7 +2026,7 @@ def _plan_source_merge(
             try:
                 rel_within = Path(src["path"]).relative_to(CRUCIBLE_DIR)
             except ValueError:
-                plan.skipped += 1
+                plan.outside += 1
                 continue
 
             src_file = source_root / src["path"]
@@ -2132,7 +2137,9 @@ def _plan_source_merge(
                 plan.warnings.append(
                     f"bibliography-only source '{cite_key}' has no source file."
                 )
-        if cite_key in target_keys or f"{{{cite_key}," in target_text:
+        # bib_has_key also catches entries _BIB_ENTRY_RE misses (a closing
+        # brace not on its own line) without matching field text.
+        if cite_key in target_keys or bib_has_key(target_text, cite_key):
             if cite_key in copied_keys:
                 # The target's entry would win on the next rebuild and point
                 # this key at something other than the source being copied.
@@ -2240,7 +2247,8 @@ def _check_merge_copy(
     ):
         raise _MergeConflict(
             f"Cannot safely merge '{source}': a private file would be copied to "
-            "a shareable path."
+            "a shareable path. In the source crucible, move it under "
+            "sources/external/, or mark the source shareable if it may be shared."
         )
 
 

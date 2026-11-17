@@ -573,6 +573,18 @@ def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | Non
     return doi or None
 
 
+def bib_has_key(text: str, cite_key: str) -> bool:
+    """Return True if BibTeX text has an entry whose key is cite_key.
+
+    Matches the entry header ``@type{key,`` rather than ``{key,`` anywhere,
+    so field text such as ``author = {Smith, J}`` is not taken for the key
+    ``Smith``.
+    """
+    return re.search(
+        rf"@\w+\s*\{{\s*{re.escape(cite_key)}\s*,", text
+    ) is not None
+
+
 def append_bib_entry(root: Path, entry: str, cite_key: str):
     """Append a BibTeX entry to .crucible/references.bib if not already present.
 
@@ -585,7 +597,7 @@ def append_bib_entry(root: Path, entry: str, cite_key: str):
     with FileLock(lock_path, timeout=10):
         if bib_path.exists():
             existing = bib_path.read_text(encoding="utf-8")
-            if f"{{{cite_key}," in existing:
+            if bib_has_key(existing, cite_key):
                 return
             new_content = existing.rstrip() + "\n\n" + entry + "\n"
         else:
