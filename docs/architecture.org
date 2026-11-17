@@ -16,8 +16,10 @@ maintaining the knowledge base.
 
 * Database Schema
 
-The wiki graph database (=db/crucible.db=) models six entity types and
-their relationships:
+The wiki graph database (=.crucible/crucible.db=) models three entity
+types and their relationships. It holds nothing that is not in the
+committed files: it is rebuilt from the wiki articles and
+=.crucible/references.bib=, and a rebuild gives the same database.
 
 ** Entity Tables
 
@@ -25,10 +27,24 @@ their relationships:
 
 Primary source documents (papers, notebooks, data files).
 
+Source rows are derived from =references.bib= and the files on disk. An
+entry with a =file= field owns the row for that file, keyed by its cite
+key, and the row's title, authors and date come from the entry. Files in
+=sources/notebooks/= and =sources/data/= that no entry claims get a row
+from a disk scan, keyed =<stem>= or, when that key is taken,
+=<stem>-<ext>=. An entry without a =file= field gets no row.
+
+The bibliography is read with one brace-balanced parser
+(=src/crucible/bibtex.py=). Entries may be delimited with braces or
+parentheses, compact one-line entries such as doi.org returns are read
+correctly, and =@comment=, =@string= and =@preamble= blocks are ignored.
+An entry that is never closed is skipped (and reported by =crucible
+lint=) without swallowing the entries after it.
+
 | Column | Type | Description |
 |-----------+---------+----------------------------------------|
 | id | INTEGER | Primary key |
-| path | TEXT | Relative path in sources/ |
+| path | TEXT | Path relative to the project root (=.crucible/sources/...=) |
 | title | TEXT | Source title |
 | source_type | TEXT | pdf, web, notebook, data, other |
 | shareable | INTEGER | 0 = external/gitignored, 1 = shareable |
@@ -42,15 +58,21 @@ Primary source documents (papers, notebooks, data files).
 
 Distilled wiki articles (the org files in =wiki/=).
 
+The timestamps come from the article's properties drawer, so a rebuild
+reproduces them: =created_at= from =:CREATED:= and =updated_at= from
+=:MODIFIED:=, which falls back to =:CREATED:=. An article with only
+=:MODIFIED:= uses it for both. With neither, sync uses the time of the
+sync, which a rebuild cannot reproduce (=crucible lint= reports it).
+
 | Column | Type | Description |
 |---------------+---------+-------------------------------|
 | id | INTEGER | Primary key |
-| path | TEXT | Relative path in wiki/ |
+| path | TEXT | Path relative to the project root (=.crucible/wiki/...=) |
 | title | TEXT | Article title |
 | article_type | TEXT | concept, summary, comparison, method |
 | status | TEXT | draft, reviewed, verified |
-| created_at | TEXT | Timestamp |
-| updated_at | TEXT | Timestamp |
+| created_at | TEXT | From =:CREATED:= |
+| updated_at | TEXT | From =:MODIFIED:= |
 | distill_model | TEXT | Which LLM produced it |
 | abstract | TEXT | Brief summary |
 
@@ -89,16 +111,6 @@ A, B, C at a given time. Extracted from the =:DERIVED_FROM:= property.
 | derived_id | INTEGER | The synthesized article |
 | source_id | INTEGER | One of its input articles |
 | derived_at | TEXT | When the derivation happened |
-
-*** peers
-
-Registered peer crucible instances for cross-querying.
-
-| Column | Type | Description |
-|----------+------+---------------------------|
-| name | TEXT | Short alias (primary key) |
-| path | TEXT | Absolute path to peer root |
-| added_at | TEXT | When registered |
 
 ** Full-Text Search
 
@@ -150,12 +162,12 @@ naturally rank higher.
 
 The weights are configurable via =--fts-weight= and =--semantic-weight=.
 
-** Cross-Peer Search
+** Cross-Crucible Search
 
 FTS5 virtual tables cannot be queried across SQLite ATTACH boundaries
-with the MATCH operator. Instead, cross-peer search opens a separate
-SQLite connection to each peer's database and runs the query locally.
-Results from all connections are merged and re-ranked.
+with the MATCH operator. Instead, =search --all= opens a separate SQLite
+connection to each registered crucible's database and runs the query
+there. Results from all connections are merged and re-ranked.
 
 * Org-Mode Parser
 
@@ -174,7 +186,9 @@ for crucible's metadata extraction.
 
 * Sync Process
 
-=crucible sync= operates in two passes to avoid foreign key violations:
+=crucible sync= first reconciles the sources table with =references.bib=
+and the disk scan (see the sources table above), then operates in two
+passes to avoid foreign key violations:
 
 1. *Pass 1*: scan all org files, register/update articles in the database,
    create concepts from filetags, and link articles to concepts.
@@ -183,13 +197,22 @@ for crucible's metadata extraction.
 
 The two-pass approach ensures all articles exist before cross-referencing.
 
-* Peer Architecture
+* Global Registry
 
-Peers are registered in the =peers= table with a name and absolute path.
-When =--all= is used on a query, crucible opens separate read-only
-connections to each peer's =db/crucible.db= and runs the query against it.
-Results are tagged with the peer name and merged with local results.
+Crucibles find each other through the global registry,
+=~/.crucible/registry.json=, rather than through anything stored in a
+project's database. Each entry maps a name to the project's absolute
+path, with an optional description and the time it was registered.
+=crucible init=, =sync= and =update= register the current project, and
+=crucible registry= lists, adds, removes and cleans entries (=clean= drops
+those with no database on disk).
 
-No data is written to peer databases. The connection is read-only by
-convention (SQLite's default mode allows writes, but crucible never
-issues write queries against peer connections).
+When =--all= is used on =search= or =concepts=, crucible opens a separate
+connection to each other registered crucible's =.crucible/crucible.db=
+(entries with no database are skipped) and runs the query against it.
+Results are tagged with the crucible's registry name and merged with
+local results.
+
+No data is written to other crucibles' databases. The connection is
+read-only by convention (SQLite's default mode allows writes, but
+crucible never issues write queries against those connections).

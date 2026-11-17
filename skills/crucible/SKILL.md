@@ -43,14 +43,16 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Goal | Command |
 |------|---------|
 | Ingest a source | `crucible ingest paper.pdf` |
+| Ingest with full BibTeX | `crucible ingest paper.pdf --doi 10.xxxx/yyyy` |
 | Ingest from stdin | `cat doc.md \| crucible ingest - -t "Title" --type web` |
 | Sync wiki to database | `crucible sync` |
 | Search articles | `crucible search "query"` |
 | List concepts | `crucible concepts` |
 | Articles for a concept | `crucible concept thermodynamics` |
-| Backlinks to article | `crucible backlinks wiki/concepts/x.org` |
-| Sources for article | `crucible sources wiki/concepts/x.org` |
-| Implied relationships | `crucible related wiki/concepts/x.org` |
+| Backlinks to article | `crucible backlinks .crucible/wiki/concepts/x.org` |
+| Sources for article | `crucible sources .crucible/wiki/concepts/x.org` |
+| Everything about a source | `crucible source .crucible/sources/data/x.csv` |
+| Implied relationships | `crucible related .crucible/wiki/concepts/x.org` |
 | Orphan articles | `crucible orphans` |
 | Undigested sources | `crucible undigested` |
 | Regenerate index | `crucible index` |
@@ -59,6 +61,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Export link graph | `crucible graph -o wiki.dot` |
 | Database stats | `crucible stats` |
 | Merge another crucible | `crucible merge SOURCE [-n] [-y]` |
+| Delete an article or source | `crucible delete PATH [--file] [-y]` |
 | Full help | `crucible help all` |
 
 ## Working Directory
@@ -74,8 +77,17 @@ When asked to ingest and distill a source, follow this two-step process:
 Register the source in the database:
 
 ```bash
-crucible ingest <path> [--type TYPE] [-t "Title"] [--date YYYY-MM-DD] [-a "Author"]
+crucible ingest <path> [--type TYPE] [-t "Title"] [--date YYYY-MM-DD] [-a "Author"] \
+    [--doi DOI | --bibtex "@article{...}"]
 ```
+
+Ingest copies the source into `.crucible/sources/` and appends a BibTeX entry
+to `.crucible/references.bib`. Give `--doi` when you know it: the complete
+entry is fetched from doi.org (a DOI found in the text is used too). Use
+`--bibtex` to supply an entry yourself. Ingest prints the **cite key**
+(e.g. `smith2024`, or `smith2024a` when that key is taken). That key is what
+goes in `SOURCE_KEYS` and in `cite:` links. The entry's `file` field records
+the stored copy, so a fresh clone can rebuild the database from the bib.
 
 For URLs, fetch and convert first:
 ```bash
@@ -101,7 +113,7 @@ claude -p "ingest and distill this URL" \
 
 **Plan phase** - Read the source and assess:
 
-1. Read the ingested source file from `sources/`
+1. Read the ingested source file from `.crucible/sources/`
 2. Check existing wiki state:
    ```bash
    crucible concepts
@@ -117,7 +129,7 @@ Wait for user approval before proceeding.
 
 **Write phase** - After approval:
 
-1. Write org-mode articles into `wiki/` following the format below
+1. Write org-mode articles into `.crucible/wiki/` following the format below
 2. **Always** sync the database after writing:
    ```bash
    crucible sync
@@ -172,7 +184,7 @@ When the user says "capture this as an article", "save this to the wiki",
 The synthesized narrative goes here, citing citep:smith2024 and
 citet:jones2023 as appropriate...
 
-bibliography:~/Dropbox/bibliography/references.bib
+bibliography:../../references.bib
 ```
 
 4. **Run sync**:
@@ -220,28 +232,35 @@ when referencing sources: citep:smith2024, citet:jones2023.
 Cross-reference other wiki articles with file links:
 [[file:../concepts/other-topic.org][Other Topic]]
 
-bibliography:~/Dropbox/bibliography/references.bib
+bibliography:../../references.bib
 ```
+
+`SOURCE_KEYS` holds cite keys from `.crucible/references.bib`: the key
+`crucible ingest` printed for each source. A file in `sources/notebooks/` or
+`sources/data/` with no bib entry is keyed `<stem>-<ext>` (`results.csv` is
+`results-csv`). File names and titles are not keys. `crucible lint` reports a
+key that resolves to no source, or to several.
 
 ### Bibliography Requirement
 
 Every article that contains org-ref citations (`cite:`, `citep:`, `citet:`)
 **must** include a `bibliography:` link as the last line of the file. This
 is required for org-ref to resolve citations when the article is opened in
-Emacs. Use:
+Emacs. Point it at the project's own bibliography, relative to the article
+(articles live one directory below `.crucible/wiki/`):
 
 ```
-bibliography:~/Dropbox/bibliography/references.bib
+bibliography:../../references.bib
 ```
 
 ### Article Types
 
 | Type | Directory | Purpose |
 |------|-----------|---------|
-| concept | wiki/concepts/ | Single topic or idea |
-| summary | wiki/summaries/ | Summary of one primary source |
-| comparison | wiki/comparisons/ | Cross-source analysis |
-| method | wiki/methods/ | Technique or methodology |
+| concept | .crucible/wiki/concepts/ | Single topic or idea |
+| summary | .crucible/wiki/summaries/ | Summary of one primary source |
+| comparison | .crucible/wiki/comparisons/ | Cross-source analysis |
+| method | .crucible/wiki/methods/ | Technique or methodology |
 
 ### Naming Convention
 
@@ -305,10 +324,10 @@ articles for trivial or self-evident terms.
 
 | Type | Storage | Gitignored | Auto-detect |
 |------|---------|------------|-------------|
-| pdf | sources/external/pdfs/ | Yes | .pdf |
-| web | sources/external/web/ | Yes | .md, .html |
-| notebook | sources/notebooks/ | No | .org |
-| data | sources/data/ | No | .csv, .json, .xlsx, .hdf5 |
+| pdf | .crucible/sources/external/pdfs/ | Yes | .pdf |
+| web | .crucible/sources/external/web/ | Yes | .md, .html |
+| notebook | .crucible/sources/notebooks/ | No | .org |
+| data | .crucible/sources/data/ | No | .csv, .json, .xlsx, .hdf5 |
 
 ## Answering Questions Against the Wiki
 
@@ -322,7 +341,7 @@ When the user asks a question about the knowledge base:
 2. Read the matching wiki articles to gather information
 3. Check for related articles that might add context:
    ```bash
-   crucible related wiki/concepts/relevant-article.org
+   crucible related .crucible/wiki/concepts/relevant-article.org
    ```
 4. Synthesize an answer with citations back to the wiki articles
 5. If the wiki lacks sufficient information, say so and suggest sources to ingest
@@ -335,15 +354,29 @@ Run the maintenance cycle regularly, especially after distilling new sources:
 crucible sync          # pick up any file changes
 crucible lint          # find problems (broken links, missing properties, orphans)
 crucible suggest       # find opportunities (new articles, missing links, comparisons)
-crucible index         # regenerate wiki/index.org
+crucible index         # regenerate .crucible/wiki/index.org
 ```
 
 ### Lint
 
 `crucible lint` reports issues at three severity levels:
 - **error**: article registered but file missing
-- **warning**: broken links, undigested sources, missing properties, untracked wiki files
-- **info**: orphan articles, concepts without dedicated articles
+- **warning**: broken links, undigested sources, missing properties, untracked
+  wiki files, unreadable or reversed `:CREATED:`/`:MODIFIED:` dates
+  (`invalid_date`), `SOURCE_KEYS` values that match no source or several,
+  cite keys shared by several sources (`duplicate_cite_key`) or by several
+  bib entries (`duplicate_bib_key`), bib entries that are never closed
+  (`malformed_bib_entry`), committed sources whose file is gone
+  (`missing_source_file`), and citations missing from `references.bib`
+- **info**: orphan articles, concepts without dedicated articles, articles
+  with neither `:CREATED:` nor `:MODIFIED:` (their dates are sync time,
+  which a rebuild cannot reproduce), and sources whose full date sync did not
+  copy to `references.bib` because it may be the day of ingest
+  (`unrecorded_source_date`; add `date = {...}` to the entry if it is the
+  publication date)
+
+Fix a duplicate key by giving each entry or file its own key and updating
+the `SOURCE_KEYS` and citations that meant the other one.
 
 Use `crucible lint -j` for JSON output when processing programmatically.
 
@@ -360,7 +393,7 @@ Use `crucible suggest -j` for JSON output when processing programmatically.
 
 ### Index
 
-`crucible index` regenerates `wiki/index.org` with all articles organized by type
+`crucible index` regenerates `.crucible/wiki/index.org` with all articles organized by type
 and by concept. Always run this after adding or updating articles.
 
 ## Common Patterns
@@ -391,8 +424,9 @@ their extracted-text sidecars beside them, and BibTeX `file` fields are
 rewritten to the new paths. A citation key already in the target is reused
 only when the file bytes are identical. If any source cannot be merged safely
 (a key clash with different content, a missing file, a private file headed for
-a shareable path), merge stops before copying and lists every problem. Resolve
-them in either crucible and run the merge again.
+a shareable path, or a cite key that two of the incoming sources or bib entries
+share), merge stops before copying and lists every problem. Resolve them in
+either crucible and run the merge again.
 
 When the target has a bibliography-only reference (an entry with no `file`
 field) and the incoming crucible has the file for the same key, merge copies
@@ -409,8 +443,19 @@ run again. Only the final `crucible sync` runs after that point: if it fails,
 the merged files are all in place and running `crucible sync` finishes the
 job.
 
+### Deleting a source
+```bash
+crucible delete .crucible/sources/data/old.csv --file   # row and file
+```
+
+Deleting a source removes its row and the `file` field of its
+`references.bib` entry; the entry itself is kept, since articles may still cite
+it (`crucible lint` then reports their `SOURCE_KEYS` as unresolved). Without
+`--file`, a file left in `sources/notebooks/` or `sources/data/` is picked up
+again by the next sync's disk scan.
+
 ### Generating an index
-After syncing, run `crucible index` to regenerate wiki/index.org with
+After syncing, run `crucible index` to regenerate .crucible/wiki/index.org with
 categorized links to all articles, organized by type and concept. The index
 is generated output: do not edit it by hand, since `crucible sync` does not
 treat it as an article and the next `crucible index` overwrites it.

@@ -23,7 +23,7 @@ crucible uninstall   # removes skill and CLAUDE.md directive
 * How Agent Discovery Works
 
 When =crucible install= runs, it adds a directive to =~/.claude/CLAUDE.md=
-that points agents at the manifest file (=wiki/MANIFEST.md=). The
+that points agents at the manifest file (=.crucible/wiki/MANIFEST.md=). The
 manifest contains a compact summary of the knowledge base: article count,
 concept list, source count, and query instructions.
 
@@ -47,11 +47,14 @@ The skill activates on phrases like:
 
 When asked to distill a source, the skill instructs Claude to:
 
-1. Read the ingested source from =sources/=
+1. Read the ingested source from =.crucible/sources/=
 2. Check existing wiki state (=crucible concepts=, =crucible search=)
 3. Propose a plan: summary article, concept articles, cross-links
 4. Wait for user approval
-5. Write org files with proper metadata
+5. Write org files with proper metadata. =SOURCE_KEYS= holds the cite key
+   =crucible ingest= printed for each source (its key in
+   =.crucible/references.bib=), and =:CREATED:= and =:MODIFIED:= give the
+   article's dates
 6. Run =crucible sync= and =crucible embed=
 
 * Capture Workflow

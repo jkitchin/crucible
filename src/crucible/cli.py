@@ -369,7 +369,7 @@ def init(root):
 
     created = []
 
-    # .gitignore inside .crucible/
+    # .gitignore at the project root
     gitignore = root / ".gitignore"
     if not gitignore.exists():
         gitignore.write_text(
@@ -380,6 +380,11 @@ def init(root):
             ".crucible/crucible.db\n"
             ".crucible/crucible.db-wal\n"
             ".crucible/crucible.db-shm\n"
+            ".crucible/crucible.db-journal\n"
+            ".crucible/.crucible.db.rebuild-*.tmp\n"
+            "\n"
+            "# Crucible: lock file for references.bib\n"
+            ".crucible/references.bib.lock\n"
             "\n"
             "# Crucible: publish output\n"
             ".crucible/wiki/_build/\n"
@@ -404,6 +409,9 @@ def init(root):
         "`.crucible/crucible.db` (graph database).\n"
         "\n"
         "Conventions: org-mode with scimax, org-ref citations, narrative prose.\n"
+        "Each article's top heading has :ARTICLE_TYPE:, :SOURCE_KEYS: (the cite keys\n"
+        "`crucible ingest` prints), :STATUS:, :CREATED: and :MODIFIED: (update it on\n"
+        "every edit). Run `crucible sync` after writing or editing articles.\n"
         "The LLM maintains the wiki; manual edits are the exception.\n"
         "Run `crucible help all` for the full CLI reference.\n"
         f"{crucible_marker}\n"
@@ -490,6 +498,13 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
         if not bib_path.exists():
             raise click.ClickException(f"BibTeX file not found: {bib_path}")
         bibtex = bib_path.read_text(encoding="utf-8")
+    if bibtex and bibtex.strip().startswith("@"):
+        from crucible import bibtex as bibtex_mod
+        if bibtex_mod.first_entry(bibtex.strip()) is None:
+            raise click.ClickException(
+                "The --bibtex entry is not a complete BibTeX entry "
+                "(check that its braces are balanced)"
+            )
 
     if source == "-":
         # Reading from stdin
@@ -780,7 +795,10 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
             # existing rows, so incremental sync and a rebuild agree. Property
             # dates have no zone and count as midnight; the sync-time fallback
             # (datetime('now')) is UTC. Ordering is only meaningful by day.
-            created = _org_date(meta.properties.get("CREATED"))
+            # An article with only :MODIFIED: was created no later than that,
+            # and using it keeps created_at <= updated_at on a rebuild too.
+            created = (_org_date(meta.properties.get("CREATED"))
+                       or _org_date(meta.properties.get("MODIFIED")))
             modified = _org_date(meta.properties.get("MODIFIED")) or created
 
             existing = db.get_article_by_path(rel_path)
@@ -964,7 +982,7 @@ def sync():
         f"{stats['article_links']} article links"
     )
     if sources_added:
-        msg += f", {sources_added} sources from bib"
+        msg += f", {sources_added} sources added"
     if stats["skipped"]:
         msg += f", {stats['skipped']} skipped (modified during sync)"
     click.echo(msg)
@@ -1866,13 +1884,23 @@ def delete(path, yes, delete_file):
                 click.echo(f"    {a['title']}")
         if not yes:
             click.confirm("Delete this source?", abort=True)
-        if delete_file:
-            disk_path = root / src["path"]
-            if disk_path.exists():
-                disk_path.unlink()
-                click.echo(f"  Deleted file: {disk_path}")
+        disk_path = root / src["path"]
+        if delete_file and disk_path.exists():
+            disk_path.unlink()
+            click.echo(f"  Deleted file: {disk_path}")
+        # The bibliography is what sync rebuilds sources from, so the entry
+        # must stop naming the file or the next sync restores the row.
+        from crucible.ingest import drop_bib_file_fields
+        for key in drop_bib_file_fields(root, src["path"]):
+            click.echo(f"  Removed the file field from bib entry '{key}' (the entry is kept).")
         db.delete_source(src["id"])
         click.echo("  Deleted from database.")
+        scanned = (f"{CRUCIBLE_DIR}/sources/notebooks/", f"{CRUCIBLE_DIR}/sources/data/")
+        if disk_path.exists() and src["path"].startswith(scanned):
+            click.echo(
+                "  Note: the file is still on disk, so the next `crucible sync` adds it "
+                "back. Use --file to delete it too."
+            )
         db.close()
         return
 
@@ -2017,9 +2045,8 @@ def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path
     if not source_wiki.exists():
         return
     planned: set[Path] = set()
-    for org_path in sorted(source_wiki.rglob("*.org")):
-        if org_path.name == "index.org":
-            continue
+    # The same walk sync uses: only the top-level index.org is generated.
+    for org_path in _wiki_article_files(source_wiki):
         rel_within_wiki = org_path.relative_to(source_wiki)
         dest_path = target_wiki / rel_within_wiki
         if dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
@@ -2172,22 +2199,23 @@ def _undo_merge(
 
 def _merged_bib_text(text: str, plan: "_MergePlan") -> str:
     """The target bibliography with the plan's file fields and new entries."""
-    from crucible.ingest import _BIB_ENTRY_RE, _parse_bib_fields, bib_has_key, set_bib_field
+    from crucible import bibtex
+    from crucible.ingest import bib_has_key, set_bib_field
 
     attached: list[str] = []
 
-    def attach(m: re.Match) -> str:
-        path = plan.bib_file_fields.get(m["key"])
+    def attach(entry: "bibtex.Entry") -> str:
+        path = plan.bib_file_fields.get(entry.key)
         if path is None:
-            return m.group(0)
-        if _parse_bib_fields(m["body"]).get("file") or m["key"] in attached:
+            return entry.text
+        if entry.get("file") or entry.key in attached:
             raise click.ClickException(
-                f"the bibliography entry '{m['key']}' changed while merging."
+                f"the bibliography entry '{entry.key}' changed while merging."
             )
-        attached.append(m["key"])
-        return set_bib_field(m.group(0), "file", path)
+        attached.append(entry.key)
+        return set_bib_field(entry.text, "file", path)
 
-    text = _BIB_ENTRY_RE.sub(attach, text)
+    text = bibtex.map_entries(text, attach)
     missing = set(plan.bib_file_fields) - set(attached)
     if missing:
         raise click.ClickException(
@@ -2250,10 +2278,8 @@ def _plan_source_merge(
     Raises a ClickException listing every problem found, so the user can fix
     them all at once. Nothing has been written when it is raised.
     """
-    from crucible.ingest import (
-        _BIB_ENTRY_RE, _BIB_FIELD_RE, _parse_bib_fields, _resolve_bib_file,
-        bib_has_key, file_sha256,
-    )
+    from crucible import bibtex
+    from crucible.ingest import _parse_bib_fields, _resolve_bib_file, file_sha256
 
     source_cdir = source_root / CRUCIBLE_DIR
     target_cdir = cdir(root)
@@ -2310,7 +2336,9 @@ def _plan_source_merge(
                 if cite_key in incoming_keys:
                     raise _MergeConflict(
                         f"Cannot safely merge source with citation key '{cite_key}': "
-                        "multiple incoming sources use it."
+                        "multiple incoming sources use it. Give each its own key in the "
+                        "source crucible (`crucible lint` there reports it as "
+                        "duplicate_cite_key), sync it, and merge again."
                     )
                 incoming_keys.add(cite_key)
 
@@ -2417,8 +2445,8 @@ def _plan_source_merge(
     # Bibliography entries, with `file` fields pointing at the planned paths.
     target_text = target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
     target_entries: dict[str, list[str]] = {}
-    for m in _BIB_ENTRY_RE.finditer(target_text):
-        target_entries.setdefault(m["key"], []).append(m.group(0))
+    for e in bibtex.entries(target_text):
+        target_entries.setdefault(e.key, []).append(e.text)
     source_sources = (source_cdir / "sources").resolve()
     for cite_key, entry_text in source_entries.items():
         if not _parse_bib_fields(entry_text).get("file"):
@@ -2430,9 +2458,7 @@ def _plan_source_merge(
                 plan.warnings.append(
                     f"bibliography-only source '{cite_key}' has no source file."
                 )
-        # bib_has_key also catches entries _BIB_ENTRY_RE misses (a closing
-        # brace not on its own line) without matching field text.
-        if cite_key in target_entries or bib_has_key(target_text, cite_key):
+        if cite_key in target_entries:
             if cite_key in copied_keys:
                 # The target has the reference but no source for it. Attach
                 # the incoming file to the target's entry when it is plainly
@@ -2448,11 +2474,10 @@ def _plan_source_merge(
             continue
 
         try:
-            for match in reversed(list(_BIB_FIELD_RE.finditer(entry_text))):
-                if match.group(1).lower() != "file":
-                    continue
-                group = 2 if match.group(2) is not None else 3
-                file_path = _resolve_bib_file(source_root, match.group(group).strip())
+            parsed = bibtex.first_entry(entry_text)
+            file_fields = [f for f in parsed.fields if f.name == "file"] if parsed else []
+            for fld in reversed(file_fields):
+                file_path = _resolve_bib_file(source_root, fld.value.strip())
                 direct = planned_by_path.get(os.path.abspath(file_path), [])
                 resolved = planned_by_realpath.get(os.path.realpath(file_path), [])
                 # Prefer a destination planned for this same citation key.
@@ -2467,7 +2492,8 @@ def _plan_source_merge(
                         "to a source: several sources match its file field."
                     )
                 if candidates:
-                    start, end = match.span(group)
+                    start = parsed.start + fld.value_start
+                    end = parsed.start + fld.value_end
                     entry_text = entry_text[:start] + candidates[0][0] + entry_text[end:]
                 elif (
                     Path(os.path.abspath(file_path)).is_relative_to(source_cdir / "sources")
@@ -2656,16 +2682,17 @@ def _rewrite_article_links(
 
 def _parse_bib_entries(text: str) -> dict[str, str]:
     """Parse BibTeX text into a dict of cite_key -> full entry text."""
-    from crucible.ingest import _BIB_ENTRY_RE
+    from crucible import bibtex
 
     entries = {}
-    for match in _BIB_ENTRY_RE.finditer(text):
-        cite_key = match["key"]
-        if cite_key in entries:
+    for entry in bibtex.entries(text):
+        if entry.key in entries:
             raise _MergeConflict(
-                f"Cannot safely merge: duplicate bibliography key '{cite_key}'."
+                f"Cannot safely merge: duplicate bibliography key '{entry.key}'. "
+                "Give each entry its own key (`crucible lint` reports it as "
+                "duplicate_bib_key) and merge again."
             )
-        entries[cite_key] = match.group(0)
+        entries[entry.key] = entry.text
     return entries
 
 
@@ -2923,6 +2950,19 @@ def lint(json_output):
             "path": s['path'],
         })
 
+    # 3b. Committed sources whose file is gone. External sources are
+    # gitignored, so a fresh clone legitimately lacks their files.
+    for s in db.list_sources():
+        if s["path"].startswith(f"{CRUCIBLE_DIR}/sources/external/"):
+            continue
+        if not (root / s["path"]).exists():
+            issues.append({
+                "type": "missing_source_file",
+                "severity": "warning",
+                "message": f"Source file not found: {s['path']} ({s['title']})",
+                "path": s["path"],
+            })
+
     # 4. Concepts without dedicated articles
     missing_concepts = db.concepts_without_articles()
     for c in missing_concepts:
@@ -2949,12 +2989,55 @@ def lint(json_output):
                 "key": key,
                 "sources": paths,
             })
-    from crucible.ingest import parse_bib_file
-    bib_without_file = {
-        entry["cite_key"]
-        for entry in parse_bib_file(cdir(root) / "references.bib")
-        if not entry.get("file")
-    }
+    # The bibliography itself: a key used by two entries is ambiguous (each
+    # citation can only mean one), and an entry with no closing brace is
+    # ignored by everything that reads the file.
+    from crucible import bibtex
+    bib_file = cdir(root) / "references.bib"
+    bib_text = (bib_file.read_text(encoding="utf-8", errors="replace")
+                if bib_file.exists() else "")
+    bib_entries, malformed = bibtex.scan(bib_text)
+    if bib_entries or malformed:
+        counts: dict[str, int] = {}
+        for e in bib_entries:
+            counts[e.key] = counts.get(e.key, 0) + 1
+        for key, n in sorted(counts.items()):
+            if n > 1:
+                issues.append({
+                    "type": "duplicate_bib_key",
+                    "severity": "warning",
+                    "message": f"references.bib has {n} entries with the key '{key}'",
+                    "key": key,
+                })
+        for offset in malformed:
+            line = bib_text.count("\n", 0, offset) + 1
+            issues.append({
+                "type": "malformed_bib_entry",
+                "severity": "warning",
+                "message": f"references.bib line {line}: entry is never closed and is ignored",
+                "line": line,
+            })
+    bib_without_file = {e.key for e in bib_entries if not e.get("file")}
+    # Ingested rows whose full date sync withheld from the bib (it may be
+    # the day of ingest rather than a publication date): a rebuild keeps
+    # only the entry's year, so say so and let the user decide.
+    from crucible.ingest import _source_metadata
+    dated_keys = {e.key for e in bib_entries if e.get("date")}
+    for src in db.list_sources():
+        src_meta = _source_metadata(src)
+        key, withheld = src_meta.get("cite_key"), src_meta.get("unrecorded_date")
+        if withheld and key not in dated_keys:
+            issues.append({
+                "type": "unrecorded_source_date",
+                "severity": "info",
+                "message": (
+                    f"Source date {withheld} for '{key}' is not in references.bib "
+                    "(it may be the day of ingest); add "
+                    f"date = {{{withheld}}} to the entry if it is the publication date"
+                ),
+                "path": src["path"],
+                "key": key,
+            })
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
@@ -2965,6 +3048,39 @@ def lint(json_output):
                 "type": "missing_property",
                 "severity": "warning",
                 "message": f"Missing ARTICLE_TYPE property: {article['path']}",
+                "path": article['path'],
+            })
+        dates = {}
+        for prop in ("CREATED", "MODIFIED"):
+            raw = meta.properties.get(prop)
+            if raw is None:
+                continue
+            dates[prop] = _org_date(raw)
+            if dates[prop] is None:
+                issues.append({
+                    "type": "invalid_date",
+                    "severity": "warning",
+                    "message": (
+                        f"Unreadable :{prop}: date '{raw}' in {article['path']} "
+                        "(use YYYY-MM-DD or an org timestamp)"
+                    ),
+                    "path": article['path'],
+                })
+        if not meta.properties.get("CREATED") and not meta.properties.get("MODIFIED"):
+            issues.append({
+                "type": "missing_property",
+                "severity": "info",
+                "message": (
+                    f"Missing CREATED and MODIFIED properties: {article['path']} "
+                    "(its dates are sync time, which a rebuild cannot reproduce)"
+                ),
+                "path": article['path'],
+            })
+        elif dates.get("CREATED") and dates.get("MODIFIED") and dates["MODIFIED"] < dates["CREATED"]:
+            issues.append({
+                "type": "invalid_date",
+                "severity": "warning",
+                "message": f":MODIFIED: is earlier than :CREATED: in {article['path']}",
                 "path": article['path'],
             })
         source_keys = meta.properties.get("SOURCE_KEYS", "").split()
@@ -3026,13 +3142,7 @@ def lint(json_output):
             })
 
     # 7. Citation keys not in references.bib
-    bib_path = cdir(root) / "references.bib"
-    bib_keys = set()
-    if bib_path.exists():
-        import re as _re
-        from crucible.ingest import BIB_ENTRY_HEAD
-        for m in _re.finditer(BIB_ENTRY_HEAD, bib_path.read_text(encoding="utf-8")):
-            bib_keys.add(m["key"])
+    bib_keys = {e.key for e in bib_entries}
 
     for article in db.list_articles():
         org_path = root / article["path"]
@@ -3234,16 +3344,18 @@ Crucible ingests primary sources (papers, notebooks, data) and distills them
 into a structured, interlinked org-mode wiki. The wiki is maintained by an LLM;
 humans rarely edit it directly.
 
-Directory layout:
-  sources/external/     Copyrighted material (gitignored)
-  sources/notebooks/    Your own ELN entries (shareable)
-  sources/data/         Your own data files (shareable)
-  wiki/concepts/        Concept articles (one topic per file)
-  wiki/summaries/       Per-source summaries
-  wiki/comparisons/     Cross-source comparison articles
-  wiki/methods/         Methodology articles
-  wiki/index.org        Auto-maintained master index
-  db/crucible.db        Wiki graph database (SQLite)
+Directory layout (everything lives in .crucible/ at the project root):
+  .crucible/sources/external/   Copyrighted material (gitignored)
+  .crucible/sources/notebooks/  Your own ELN entries (shareable)
+  .crucible/sources/data/       Your own data files (shareable)
+  .crucible/wiki/concepts/      Concept articles (one topic per file)
+  .crucible/wiki/summaries/     Per-source summaries
+  .crucible/wiki/comparisons/   Cross-source comparison articles
+  .crucible/wiki/methods/       Methodology articles
+  .crucible/wiki/index.org      Auto-maintained master index
+  .crucible/references.bib      Bibliography; each entry's `file` field
+                                names the stored source file
+  .crucible/crucible.db         Wiki graph database (SQLite, regenerable)
 
 Run `crucible help all` for complete documentation.
 Run `crucible help <topic>` for a specific topic.
@@ -3258,10 +3370,10 @@ TYPICAL WORKFLOW
      curl URL | pandoc -t org | crucible ingest - -t "Title" --type web
 
 2. Distill the source (done by the LLM):
-   Read the source from sources/ and write org articles into wiki/.
-   Use the two-step process:
+   Read the source from .crucible/sources/ and write org articles into
+   .crucible/wiki/. Use the two-step process:
    a) Plan: identify concepts, propose articles, note cross-links
-   b) Write: create/update org files in wiki/ with proper metadata
+   b) Write: create/update org files in .crucible/wiki/ with proper metadata
 
 3. Sync the database:
      crucible sync
@@ -3269,11 +3381,11 @@ TYPICAL WORKFLOW
 4. Query the knowledge base:
      crucible search "query"
      crucible concepts
-     crucible related wiki/concepts/some-article.org
-     crucible backlinks wiki/concepts/some-article.org
+     crucible related .crucible/wiki/concepts/some-article.org
+     crucible backlinks .crucible/wiki/concepts/some-article.org
 
 5. Maintain the wiki:
-     crucible index            # regenerate wiki/index.org
+     crucible index            # regenerate .crucible/wiki/index.org
      crucible lint             # check for broken links, orphans, issues
      crucible suggest          # get improvement suggestions
      crucible orphans          # find unlinked articles
@@ -3301,6 +3413,8 @@ Options:
   --url TEXT                Original URL
   --date TEXT               ISO date (default: today)
   -a, --author TEXT         Author(s), repeatable
+  --doi TEXT                DOI; the full BibTeX entry is fetched from doi.org
+  --bibtex TEXT             A BibTeX entry to use for the source
   -f, --filename TEXT       Filename for stdin input
 
 Examples:
@@ -3310,14 +3424,22 @@ Examples:
   crucible ingest data.csv --type data --shareable
   cat article.md | crucible ingest - -t "Article Title" --type web --url "https://..."
   curl -s URL | pandoc -t org | crucible ingest - -t "Title" --type web
+  crucible ingest paper.pdf --doi 10.1038/s41586-020-2649-2
+  crucible ingest paper.pdf --bibtex "@article{x, title={...}, year={2024}}"
 
 Auto-detection:
   .pdf -> pdf (external)     .org -> notebook (shareable)
   .md/.html -> web (external)  .csv/.json/.xlsx/.hdf5 -> data (shareable)
 
 The source is copied to the appropriate directory, text is extracted,
-and a row is added to the sources table. The source is then ready
-for distillation by an LLM agent.
+and an entry is added to .crucible/references.bib. Its BibTeX entry is,
+in order of preference: --bibtex, the entry doi.org returns for --doi (or
+for a DOI found in the text), or a minimal entry from the options. The
+cite key is made unique against existing sources and bib entries
+(smith2024, smith2024a, ...), and the entry's `file` field records the
+stored copy. The sources-table row is described by that entry, so a fresh
+clone rebuilds the same row. Ingest prints the cite key: put it in the
+SOURCE_KEYS of the articles you distill from the source.
 """,
         "distill": """
 DISTILLATION GUIDE (for LLM agents)
@@ -3340,9 +3462,12 @@ STEP 2 - WRITE:
   Then run `crucible sync` to update the database.
 
 LINKING TO SOURCES:
-  In the :PROPERTIES: drawer, set SOURCE_KEYS to space-separated
-  identifiers that match the source filename or title in the database.
-  The sync command uses these to link articles to their sources.
+  In the :PROPERTIES: drawer, set SOURCE_KEYS to the space-separated
+  cite keys of the article's sources: the keys in references.bib that
+  `crucible ingest` printed. A file in sources/notebooks/ or sources/data/
+  that no bib entry claims is keyed <stem>-<ext> (results.csv ->
+  results-csv). Sync uses these keys to link articles to their sources;
+  `crucible lint` reports keys that resolve to no source or to several.
 
 UPDATING EXISTING ARTICLES:
   When a new source adds to an existing concept, add a new section
@@ -3355,14 +3480,20 @@ SEARCH AND QUERY COMMANDS
 Full-text search (FTS5 with porter stemming):
   crucible search "activation energy"
   crucible search "platinum catalysis" -n 5
+  crucible search "zeolites" --all     Search every registered crucible
+
+Semantic and hybrid search (after `crucible embed`, needs ollama):
+  crucible search "query" --mode semantic
+  crucible search "query" --mode hybrid
 
 Structured queries:
   crucible concepts                    List all concepts with article counts
   crucible concept thermodynamics      Articles covering a concept
-  crucible backlinks wiki/concepts/x.org   What links to this article
-  crucible sources wiki/concepts/x.org     Primary sources for an article
-  crucible related wiki/concepts/x.org     Implied links (shared concepts,
-                                           shared sources, temporal proximity)
+  crucible backlinks .crucible/wiki/concepts/x.org   What links here
+  crucible sources .crucible/wiki/concepts/x.org     Primary sources
+  crucible related .crucible/wiki/concepts/x.org     Implied links (shared
+                                    concepts, shared sources, temporal proximity)
+  crucible source SOURCE_PATH          Everything known about one source
   crucible orphans                     Articles with no incoming links
   crucible undigested                  Sources not yet distilled
 
@@ -3378,12 +3509,26 @@ SYNC COMMAND
 
   crucible sync
 
-Scans wiki/ for .org files and updates the database:
+Scans .crucible/wiki/ for .org files and updates the database:
   - Registers new articles (from path, title, ARTICLE_TYPE property)
-  - Updates FTS index for existing articles
+  - Rewrites only articles whose file changed (others count as unchanged
+    and keep their embeddings)
+  - Takes article dates from :CREATED: and :MODIFIED: (MODIFIED falls back
+    to CREATED, and an article with only MODIFIED uses it for both; with
+    neither, sync time is used, which a rebuild cannot reproduce)
   - Links articles to concepts (from #+FILETAGS)
   - Links articles to each other (from [[file:...]] links)
-  - Links articles to sources (from SOURCE_KEYS property)
+  - Links articles to sources (from SOURCE_KEYS cite keys)
+
+It also reconciles the sources table with .crucible/references.bib:
+  - An entry with a `file` field owns the row for that file
+  - An entry without one gets no row (lint reports keys cited this way)
+  - A file in sources/notebooks/ or sources/data/ that no entry claims gets
+    a row keyed <stem>-<ext> from a disk scan
+
+The database is regenerable: delete .crucible/crucible.db and the next
+command rebuilds it from the wiki, references.bib and the source files,
+with the same rows an incremental sync gives.
 
 Run sync after writing or updating any wiki articles.
 Sync is idempotent and safe to run repeatedly.
@@ -3392,7 +3537,7 @@ Sync is idempotent and safe to run repeatedly.
 WIKI MAINTENANCE COMMANDS
 
 Index generation:
-  crucible index               Regenerate wiki/index.org from database
+  crucible index               Regenerate .crucible/wiki/index.org
                                Organized by article type and by concept.
                                Re-run after any changes.
 
@@ -3404,6 +3549,17 @@ Lint (health checks):
                                - Undigested sources
                                - Missing concept articles
                                - Missing properties or filetags
+                               - Missing or unreadable :CREATED: and
+                                 :MODIFIED: dates
+                               - SOURCE_KEYS that resolve to no source
+                                 or to several
+                               - Cite keys shared by several sources, or
+                                 by several references.bib entries
+                               - references.bib entries never closed
+                               - Committed sources whose file is gone
+                               - Citations missing from references.bib
+                               - Source dates not copied to
+                                 references.bib (maybe the ingest day)
                                - Wiki files not in database
   crucible lint -j             JSON output (for agent consumption)
 
@@ -3422,6 +3578,16 @@ Merge another crucible:
                                SOURCE is a path or registry name.
   crucible merge SOURCE -n     Dry run (preview without changes)
   crucible merge SOURCE -y     Skip confirmation prompt
+                               A source crucible whose sources or bib
+                               entries repeat a cite key is refused:
+                               give each its own key there first.
+
+Delete:
+  crucible delete PATH         Remove an article or source from the
+                               database (--file also deletes the file).
+                               Deleting a source removes the `file` field
+                               from its references.bib entry so the next
+                               sync does not restore it.
 
 Typical maintenance cycle:
   crucible sync                # pick up any changes
@@ -3456,8 +3622,13 @@ Every wiki article must follow this structure:
 FILETAGS: include the article type (concept, summary, etc.) and
 all relevant topic tags. Tags become concepts in the database.
 
-SOURCE_KEYS: space-separated identifiers matching source filenames
-or titles. These create article-to-source links during sync.
+SOURCE_KEYS: space-separated cite keys from references.bib (the key
+`crucible ingest` printed), or <stem>-<ext> for a file in sources/notebooks/
+or sources/data/ with no bib entry. These create article-to-source links
+during sync.
+
+CREATED / MODIFIED: the article's dates; update MODIFIED on every edit.
+They are what the database records, so they survive a rebuild.
 
 ARTICLE TYPES:
   concept     - A single topic or idea (e.g., activation-energy.org)

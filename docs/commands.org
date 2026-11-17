@@ -58,7 +58,7 @@ Ingest a source into the crucible.
 crucible ingest SOURCE [OPTIONS]
 #+END_SRC
 
-SOURCE is a file path, glob pattern, or =-= for stdin.
+SOURCE is a file path, URL, glob pattern, or =-= for stdin.
 
 | Option | Description |
 |----------------------------+------------------------------------------------|
@@ -68,6 +68,8 @@ SOURCE is a file path, glob pattern, or =-= for stdin.
 | =--url TEXT= | Original URL |
 | =--date TEXT= | ISO date (default: today) |
 | =-a=, =--author TEXT= | Author(s), repeatable |
+| =--doi TEXT= | DOI for the source |
+| =--bibtex TEXT= | Full BibTeX entry, or =@file.bib= to read one from a file |
 | =-f=, =--filename TEXT= | Filename for stdin input |
 
 Examples:
@@ -78,10 +80,30 @@ crucible ingest paper.pdf -t "Smith 2024" -a "Smith, J." --date 2024-03-15
 crucible ingest "papers/*.pdf"
 crucible ingest lab-notes.org --type notebook
 echo "content" | crucible ingest - -t "Title" --type web
+crucible ingest paper.pdf --doi 10.1021/acscatal.5b00001
+crucible ingest paper.pdf --bibtex @paper.bib
 #+END_SRC
 
 Auto-detection: =.pdf= maps to pdf (external), =.org= to notebook (shareable),
 =.md/.html= to web (external), =.csv/.json/.xlsx/.hdf5= to data (shareable).
+
+Each ingested source gets an entry in =references.bib=. With =--bibtex=,
+the supplied entry is used. Otherwise, with =--doi=, or when a DOI is
+found near the start of the extracted text, crucible fetches the full
+BibTeX entry from doi.org, so the entry has its real type and fields.
+When neither gives an entry, a minimal one is generated from the known
+metadata. The cite key is generated from the title, authors and date, and
+replaces the key of a supplied or fetched entry. It is made unique against
+both the existing sources and every key already in =references.bib=
+(=smith2024=, then =smith2024a=, =smith2024b=, ...), so a new source never
+takes over an unrelated entry. Authors and a full date given on the
+command line are added to the entry when it lacks them.
+
+The stored file's path is written to the entry's =file= field, and the
+source row's title, authors and date are read back from the entry, so
+rebuilding the database from =references.bib= gives the same row. A file
+whose content was already ingested is reported as a duplicate and not
+added again.
 
 * Database Commands
 
@@ -94,7 +116,7 @@ crucible sync
 #+END_SRC
 
 First reconciles the sources table with =references.bib= and the files
-under =sources/=, then a two-pass process:
+under =sources/notebooks/= and =sources/data/=, then a two-pass process:
 1. Register/update all articles and concepts from org file metadata
 2. Process inter-article links, source links, and derivation chains
 
@@ -107,17 +129,43 @@ entry without one gets no source row, and =crucible lint= reports any
 fields from sources ingested earlier, so running it once on a machine that
 has the database upgrades an older =references.bib=. Files under
 =sources/notebooks/= and =sources/data/= that no entry names get a source
-row keyed by file name. When that name is already a key in
-=references.bib= (or of an ingested source), the file is keyed
-=<name>-<extension>= instead, so it cannot take that key's article links
-from the file the entry names.
+row from a disk scan, keyed by the file name without its extension.
+When that name is already a key
+in =references.bib= (or of an ingested source), the file is keyed
+=<name>-<extension>= instead (then =<name>-<extension>-2=, ...), so it
+cannot take that key's article links from the file the entry names.
 
 A source's type comes from the folder it is stored in. Shareable PDFs and
 web sources are stored in =sources/data/=: a =.pdf= there is a PDF, and an
 =@online= entry (what ingest writes for web sources) is a web source.
 
 Parses: =#+TITLE=, =#+FILETAGS=, =:ARTICLE_TYPE:=, =:SOURCE_KEYS:=,
-=:DERIVED_FROM:=, =[[file:...]]= links, and full text for FTS.
+=:DERIVED_FROM:=, =:CREATED:=, =:MODIFIED:=, =[[file:...]]= links, and
+full text for FTS.
+
+An article's dates come from its =:CREATED:= and =:MODIFIED:= properties
+(an ISO date, optionally with a time, or an org timestamp). =:MODIFIED:=
+falls back to =:CREATED:=, and an article with only =:MODIFIED:= uses it
+for both. An article with neither gets the time of the sync, which a
+rebuild cannot reproduce, so =crucible lint= reports it.
+
+The database is regenerable: everything in it comes from the wiki files
+and =references.bib=, so deleting =.crucible/crucible.db= and syncing (or
+running any command, which rebuilds a missing database) gives the same
+database again.
+
+Sync reports what it did, for example:
+
+#+BEGIN_EXAMPLE
+Sync complete: 2 added, 1 updated, 40 unchanged, 0 removed, 120 concept links, 85 article links, 1 sources added
+#+END_EXAMPLE
+
+The counts are articles added, updated, unchanged and removed, then the
+concept and article links recorded. =N sources added= appears when
+reconciliation inserted source rows, and =N skipped (modified during
+sync)= when a file changed while it was being read (re-run sync once
+edits settle). A warning follows if a =:SOURCE_KEYS:= value matched more
+than one source.
 
 Idempotent and safe to run repeatedly.
 
@@ -151,17 +199,23 @@ crucible search QUERY [OPTIONS]
 |------------------------+---------------------------------------------------|
 | =-n=, =--limit= | Max results (default: 20) |
 | =--mode MODE= | auto, fts, semantic, or hybrid (default: auto) |
-| =--all= | Search all peers too |
-| =--peer NAME= | Search a specific peer |
+| =--all= | Search all registered crucibles too |
 | =-m=, =--model= | Embedding model for semantic modes |
 | =--fts-weight= | FTS weight for hybrid RRF (default: 1.0) |
 | =--semantic-weight= | Semantic weight for hybrid RRF (default: 1.0) |
+| =--raw= | Skip dedup/quality filtering |
+| =-j=, =--json= | Output as JSON |
 
 Modes:
 - *auto*: hybrid if embeddings exist, FTS otherwise
 - *fts*: keyword search only (FTS5 with porter stemming)
 - *semantic*: vector similarity only
 - *hybrid*: FTS + semantic combined with Reciprocal Rank Fusion
+
+By default similar results are clustered and the best representative is
+shown; =--raw= returns every hit. =--all= also searches every other
+crucible in the global registry (see =crucible registry=); each result
+from another crucible is labelled with its registry name.
 
 * Navigation Commands
 
@@ -181,6 +235,18 @@ Show primary sources for an article.
 crucible sources wiki/concepts/activation-energy.org
 #+END_SRC
 
+** =crucible source=
+
+Show everything known about a source.
+
+#+BEGIN_SRC bash
+crucible source SOURCE_PATH [--json]
+#+END_SRC
+
+SOURCE_PATH is the source's path, or part of its path or title. Shows the
+source's metadata and the articles distilled from it, which is useful
+before asking Claude to reread and resummarize it.
+
 ** =crucible concepts=
 
 List all concepts with article counts.
@@ -188,6 +254,8 @@ List all concepts with article counts.
 #+BEGIN_SRC bash
 crucible concepts [--all]
 #+END_SRC
+
+=--all= includes the concepts of every registered crucible.
 
 ** =crucible concept=
 
@@ -257,13 +325,33 @@ Check wiki health and report issues.
 crucible lint [--json]
 #+END_SRC
 
-Checks: broken file links, missing article files, orphan articles,
-undigested sources, missing concept articles, missing properties/filetags,
-wiki files not in database.
+Each issue has a type and a severity (error, warning or info):
+
+| Type | Severity | Meaning |
+|-------------------------+----------+------------------------------------------------------|
+| =missing_file= | error | An article in the database has no file on disk |
+| =broken_link= | warning | A =[[file:...]]= link points to a missing file |
+| =orphan= | info | No other article links to this one |
+| =undigested= | warning | A source has no articles distilled from it |
+| =missing_source_file= | warning | A notebook or data source's file is gone (external sources are gitignored, so they are not checked) |
+| =missing_concept_article= | info | A concept has no dedicated concept article |
+| =duplicate_cite_key= | warning | Two or more sources share a cite key |
+| =duplicate_bib_key= | warning | =references.bib= has more than one entry with a key |
+| =malformed_bib_entry= | warning | A =references.bib= entry is never closed and is ignored |
+| =missing_property= | warning/info | No =:ARTICLE_TYPE:= (warning); neither =:CREATED:= nor =:MODIFIED:=, or no =:SOURCE_KEYS:= (info) |
+| =invalid_date= | warning | An unreadable =:CREATED:= or =:MODIFIED:=, or =:MODIFIED:= earlier than =:CREATED:= |
+| =unresolved_source_key= | warning | A =:SOURCE_KEYS:= value matches no source (the message says when the key is in =references.bib= but its entry has no =file= field) |
+| =ambiguous_source_key= | warning | A =:SOURCE_KEYS:= value matches more than one source |
+| =missing_tags= | warning | The article has no =#+FILETAGS:= |
+| =untracked= | warning | A wiki file is not in the database (run =crucible sync=) |
+| =missing_citation= | warning | A =cite:= key is not in =references.bib= |
+| =unrecorded_source_date= | info | An ingested source's full date was not written to =references.bib= because it may be the day of ingest; the source now has the entry's year. Add =date = {...}= to the entry if it is the publication date |
 
 =--json= outputs a list of issues, each with =type=, =severity=,
-=message= and the =path= it concerns (plus =link= for a broken link and
-=key= for a missing citation).
+=message= and, where it applies, the =path= it concerns, plus =link= for
+a broken link, =key= for a cite-key issue (with =sources= listing the
+paths for duplicate and ambiguous keys) and =line= for a malformed bib
+entry.
 
 ** =crucible suggest=
 
@@ -295,31 +383,104 @@ crucible manifest
 Writes =wiki/MANIFEST.md= with article counts, concept list, and query
 instructions. Used by agents to decide whether to search this crucible.
 
-* Peer Commands
+** =crucible merge=
 
-** =crucible peer add=
-
-Register a peer crucible for cross-querying.
+Merge another crucible into this one.
 
 #+BEGIN_SRC bash
-crucible peer add NAME /path/to/peer/crucible
+crucible merge SOURCE [-n] [-y]
 #+END_SRC
 
-Verifies the peer has a =db/crucible.db= before registering.
+| Option | Description |
+|-----------------+------------------------------|
+| =-n=, =--dry-run= | Preview without making changes |
+| =-y=, =--yes= | Skip confirmation prompt |
 
-** =crucible peer remove=
+SOURCE is a path to a crucible project or a name from the global
+registry. Merge copies the incoming crucible's sources (with their
+extracted-text sidecars), wiki articles and =references.bib= entries into
+this project, then runs =crucible sync=. Everything is planned and
+checked before anything is written: a source whose cite key is already
+here is reused only when the files are identical, distinct sources keep
+distinct paths (renamed with a numeric suffix when needed, and the bib
+=file= fields follow), conflicting article files are renamed and links to
+them rewritten, and existing sidecars are never overwritten. If any part
+cannot be merged safely, the merge stops and lists every problem.
+
+Merge refuses an incoming crucible in which two sources, or two
+=references.bib= entries, share a cite key, because it cannot tell which
+one the key's citations mean. Fix them in the source crucible first
+(=crucible lint= there reports =duplicate_cite_key= and
+=duplicate_bib_key=), sync it, and merge again.
+
+** =crucible delete=
+
+Delete an article or source from the database.
 
 #+BEGIN_SRC bash
-crucible peer remove NAME
+crucible delete PATH [-y] [--file]
 #+END_SRC
 
-** =crucible peer list=
+| Option | Description |
+|-------------+----------------------------|
+| =-y=, =--yes= | Skip confirmation |
+| =--file= | Also delete the file on disk |
+
+PATH can be a database path, part of a path, or a fragment of a title;
+articles are searched first, then sources. Without =--file= only the
+database row is removed, so the next sync restores an article whose file
+is still in the wiki.
+
+Deleting a source also removes the =file= field from its
+=references.bib= entry (the entry itself is kept, so citations to it still
+resolve); otherwise the next sync would recreate the row from the entry.
+A file in =sources/notebooks/= or =sources/data/= that is left on disk is
+picked up again by sync's disk scan, so delete warns about it; use
+=--file= to delete the file too.
+
+* Registry Commands
+
+The global registry, =~/.crucible/registry.json=, lists every crucible on
+the machine. Each entry records a name, the project's absolute path, an
+optional description and when it was registered. =crucible init=,
+=crucible sync= and =crucible update= register the current project
+automatically (a name already used by another path gets a =-2=, =-3=,
+... suffix). =crucible search --all= and =crucible concepts --all= query
+the other registered crucibles, and =crucible merge= accepts a registry
+name.
+
+** =crucible registry list=
 
 #+BEGIN_SRC bash
-crucible peer list
+crucible registry list [--json]
 #+END_SRC
 
-Shows all peers with their paths and status (ok/MISSING).
+Shows each crucible with its path and status (=ok=, or =MISSING= when
+there is no database there). =--json= includes each database's path
+(=null= if missing).
+
+** =crucible registry add=
+
+#+BEGIN_SRC bash
+crucible registry add NAME PATH [-d DESCRIPTION]
+#+END_SRC
+
+Registers a crucible by hand. PATH must contain a crucible database
+(=.crucible/crucible.db=).
+
+** =crucible registry remove=
+
+#+BEGIN_SRC bash
+crucible registry remove NAME
+#+END_SRC
+
+** =crucible registry clean=
+
+#+BEGIN_SRC bash
+crucible registry clean
+#+END_SRC
+
+Removes entries whose crucible no longer has a database on disk.
 
 * Export Commands
 
@@ -348,7 +509,63 @@ crucible graph [-o wiki.dot]
 
 Outputs to stdout or file. Render with graphviz: =dot -Tpng wiki.dot -o wiki.png=.
 
+** =crucible viz=
+
+Generate an interactive knowledge graph visualization.
+
+#+BEGIN_SRC bash
+crucible viz [-o FILE] [--open]
+#+END_SRC
+
+| Option | Description |
+|-----------------+-----------------------------------------------|
+| =-o=, =--output= | Output file (default: =.crucible/wiki/viz.html=) |
+| =--open= | Open in browser after generating |
+
+Writes a self-contained HTML file with a force-directed graph. Nodes are
+articles (colored by type) and concepts; edges are explicit links, shared
+concepts and derivations.
+
+** =crucible browse=
+
+Browse the wiki in your web browser.
+
+#+BEGIN_SRC bash
+crucible browse [-p PORT] [--no-open]
+#+END_SRC
+
+| Option | Description |
+|---------------+------------------------------------|
+| =-p=, =--port= | Port number (default: 8088) |
+| =--no-open= | Don't open the browser automatically |
+
+Starts a local HTTP server that renders the org articles as HTML with
+working links between them, search and sidebar navigation.
+
 * Meta Commands
+
+** =crucible about=
+
+Show the crucible version and schema version, the current project (its
+root and counts of sources, articles, concepts and links, when run inside
+one) and the crucibles in the global registry.
+
+#+BEGIN_SRC bash
+crucible about [--json]
+#+END_SRC
+
+** =crucible update=
+
+Update a project after upgrading the crucible package.
+
+#+BEGIN_SRC bash
+crucible update
+#+END_SRC
+
+Runs pending database migrations, updates the project's
+=.claude/settings.json=, re-registers the project in the global registry
+and reinstalls the skill files and manifest. Like =init=, it does not
+change the =~/.claude/CLAUDE.md= directive. Safe to run repeatedly.
 
 ** =crucible stats=
 
@@ -382,7 +599,7 @@ crucible help [TOPIC]
 #+END_SRC
 
 Topics: overview, workflow, ingest, distill, search, sync, maintain,
-org-format. Use =all= for everything.
+org-format, registry. Use =all= for everything.
 
 * JSON Output
 
@@ -404,5 +621,5 @@ crucible registry list --json                # registered crucibles, with their 
 #+END_SRC
 
 A command with no results prints =[]= (=source= prints =null= for an
-unknown source). =search --all --json= marks each result from a peer with
-=_crucible=, its registry name.
+unknown source). =search --all --json= marks each result with
+=_crucible=: =local=, or the registry name of the crucible it came from.

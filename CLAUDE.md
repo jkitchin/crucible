@@ -46,7 +46,8 @@ All wiki articles use org-mode format with scimax conventions:
 - Use `#+FILETAGS:` for categorization (include article type as a tag)
 - Use a properties drawer on the top heading with:
   - `:ARTICLE_TYPE:` - concept, summary, comparison, or method
-  - `:SOURCE_KEYS:` - space-separated cite keys of primary sources
+  - `:SOURCE_KEYS:` - space-separated cite keys of primary sources (the keys
+    in `references.bib`; a file with no bib entry is keyed `<stem>-<ext>`)
   - `:STATUS:` - draft, reviewed, or verified
   - `:CREATED:` - ISO date
   - `:MODIFIED:` - ISO date of the last substantive edit; update it on every edit
@@ -75,7 +76,8 @@ or `crucible manifest`.
 The wiki graph database supports:
 - Full-text keyword search (FTS5)
 - Structured queries (backlinks, concept lookup, source provenance)
-- Future: semantic/vector search
+- Semantic and hybrid search over embeddings (`crucible embed`, then
+  `crucible search --mode semantic|hybrid`; needs ollama)
 
 ### Principles
 

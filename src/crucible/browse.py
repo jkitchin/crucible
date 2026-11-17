@@ -11,38 +11,19 @@ import re
 import urllib.parse
 from pathlib import Path, PurePosixPath
 
-from crucible.ingest import BIB_ENTRY_CLOSE, BIB_ENTRY_HEAD
+from crucible import bibtex
 from crucible.orgparse import CITATION_RE, citation_keys, citation_type
 
 
 # ---------------------------------------------------------------------------
-# BibTeX parser (lightweight, no external deps)
+# BibTeX
 # ---------------------------------------------------------------------------
 
-_BIB_ENTRY_RE = re.compile(
-    BIB_ENTRY_HEAD + r"\s*(?P<body>.*?)\n\s*" + BIB_ENTRY_CLOSE,
-    re.DOTALL,
-)
-_BIB_FIELD_RE = re.compile(
-    r"(\w+)\s*=\s*\{(.*?)\}",
-    re.DOTALL,
-)
-
-
 def parse_bibtex(text: str) -> dict[str, dict[str, str]]:
-    """Parse bibtex into {key: {field: value, ...}, ...}.
-
-    Lightweight parser that handles the subset of bibtex that crucible generates.
-    """
+    """Parse bibtex into {key: {field: value, ...}, ...} with the shared reader."""
     entries: dict[str, dict[str, str]] = {}
-    for m in _BIB_ENTRY_RE.finditer(text):
-        entry_type = m["type"].lower()
-        key = m["key"].strip()
-        body = m["body"]
-        fields: dict[str, str] = {"_type": entry_type}
-        for fm in _BIB_FIELD_RE.finditer(body):
-            fields[fm.group(1).lower()] = fm.group(2).strip()
-        entries[key] = fields
+    for e in bibtex.entries(text):
+        entries[e.key] = {"_type": e.entry_type, **e.as_dict()}
     return entries
 
 

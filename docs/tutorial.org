@@ -32,9 +32,16 @@ ollama pull nomic-embed-text
 crucible ingest paper.pdf
 #+END_SRC
 
-This copies the PDF to =sources/external/pdfs/=, extracts text (via
-pdftotext or pandoc), and registers it in the database. The output shows
-the source ID and where the text was extracted to.
+This copies the PDF to =.crucible/sources/external/pdfs/=, extracts text
+(via pdftotext or pandoc), adds an entry to =.crucible/references.bib=
+and registers it in the database. The output shows the source ID, its
+cite key, the stored path and how many characters of text were extracted.
+
+If the paper's DOI appears near the start of its text, or you give it
+with =--doi=, crucible fetches the full BibTeX entry from doi.org. You can
+also supply your own entry with =--bibtex @paper.bib=. The entry's =file=
+field records where the PDF is stored, which is how a fresh clone ties the
+entry back to the file.
 
 ** From the Web
 
@@ -52,8 +59,8 @@ curl -sL "https://example.com/article" \
 crucible ingest lab-notes-2026-04-03.org --type notebook --date 2026-04-03
 #+END_SRC
 
-Notebook entries are stored in =sources/notebooks/= and are not gitignored
-(they are your own work).
+Notebook entries are stored in =.crucible/sources/notebooks/= and are not
+gitignored (they are your own work).
 
 ** Batch Ingestion
 
@@ -122,14 +129,14 @@ When embeddings exist, the default =auto= mode uses hybrid search:
 both FTS and semantic results are combined using Reciprocal Rank Fusion.
 Articles found by both methods rank highest.
 
-** Searching Across Peers
+** Searching Across Crucibles
 
 #+BEGIN_SRC bash
 crucible search "neural networks" --all
 #+END_SRC
 
-The =--all= flag searches your local crucible and all registered peers.
-Works with all search modes (FTS, semantic, hybrid).
+The =--all= flag searches your local crucible and every other crucible in
+the global registry. Works with all search modes (FTS, semantic, hybrid).
 
 * Navigating the Wiki
 
@@ -181,8 +188,10 @@ recorded in the database.
 crucible lint
 #+END_SRC
 
-Reports broken links, orphan articles, missing properties, undigested
-sources, and wiki files not in the database.
+Reports broken links, orphan articles, missing properties and unreadable
+dates, undigested sources, source keys that match no source or more than
+one, duplicate cite keys in the sources or in =references.bib=, and wiki
+files not in the database. See the command reference for the full list.
 
 ** Improvement Suggestions
 
@@ -240,18 +249,36 @@ existing articles rather than creating duplicates.
 
 * Connecting Multiple Crucibles
 
+Every crucible on the machine is listed in the global registry
+(=~/.crucible/registry.json=). =crucible init= and =crucible sync= add
+the current project, and you can register others by hand:
+
 #+BEGIN_SRC bash
-# Register a peer
-crucible peer add lab-shared /path/to/lab/crucible
-crucible peer list
+# Register another crucible
+crucible registry add lab-shared /path/to/lab/crucible
+crucible registry list
 
 # Search across all
 crucible search "topic" --all
 crucible concepts --all
 
-# Remove a peer
-crucible peer remove lab-shared
+# Remove an entry, or drop entries whose crucible is gone
+crucible registry remove lab-shared
+crucible registry clean
 #+END_SRC
 
-Peers are queried via separate database connections. Your data stays
-local, their data stays in their crucible. No writes cross boundaries.
+Other crucibles are queried via separate database connections. Your data
+stays local, their data stays in their crucible. No writes cross
+boundaries.
+
+To fold one crucible into another instead, use =crucible merge=:
+
+#+BEGIN_SRC bash
+crucible merge lab-shared --dry-run   # preview
+crucible merge lab-shared
+#+END_SRC
+
+This copies the other crucible's sources, articles and bibliography
+entries into this one and syncs. It refuses a crucible whose sources or
+bibliography entries repeat a cite key; run =crucible lint= there and fix
+them first.
