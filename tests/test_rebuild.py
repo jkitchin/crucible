@@ -149,3 +149,62 @@ def test_rebuild_reproduces_sources_and_provenance(rebuilt, table):
     before, after = rebuilt
     assert before[table]
     assert after[table] == before[table]
+
+
+def _bare_project(tmp_path, monkeypatch):
+    """A project with a wiki and one data source but no database yet."""
+    root = tmp_path / "project"
+    corpus = root / ".crucible"
+    (corpus / "wiki").mkdir(parents=True)
+    (corpus / "sources" / "data").mkdir(parents=True)
+    (corpus / "sources" / "data" / "sample.md").write_text("Synthetic source.")
+    monkeypatch.chdir(root)
+    return root
+
+
+def test_failed_rebuild_is_retried(tmp_path, registry, monkeypatch):
+    """A failed automatic rebuild must not leave a database later commands trust (#12)."""
+    import crucible.cli as cli_module
+
+    root = _bare_project(tmp_path, monkeypatch)
+    corpus = root / ".crucible"
+    with monkeypatch.context() as m:
+        m.setattr(cli_module, "_rebuild_db_from_wiki",
+                  lambda root, db: (_ for _ in ()).throw(RuntimeError("synthetic")))
+        with pytest.raises(RuntimeError, match="synthetic"):
+            cli_module.get_root()
+
+    assert not (corpus / "crucible.db").exists()
+    assert list(corpus.glob(".crucible.db.rebuild-*")) == []
+
+    db = cli_module.get_db(cli_module.get_root())
+    try:
+        assert len(db.list_sources()) == 1
+    finally:
+        db.close()
+
+
+def test_rebuild_keeps_concurrently_published_database(tmp_path, registry, monkeypatch):
+    """If another process publishes a database mid-rebuild, it is not replaced."""
+    import crucible.cli as cli_module
+
+    root = _bare_project(tmp_path, monkeypatch)
+    db_path = root / ".crucible" / "crucible.db"
+    real_rebuild = cli_module._rebuild_db_from_wiki
+
+    def rebuild_then_race(root, db):
+        result = real_rebuild(root, db)
+        other = CrucibleDB(db_path)
+        other.initialize()
+        other.close()
+        return result
+
+    monkeypatch.setattr(cli_module, "_rebuild_db_from_wiki", rebuild_then_race)
+    cli_module.get_root()
+
+    db = CrucibleDB(db_path)
+    try:
+        assert db.list_sources() == []  # the racing database, untouched
+    finally:
+        db.close()
+    assert list((root / ".crucible").glob(".crucible.db.rebuild-*")) == []
