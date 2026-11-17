@@ -177,6 +177,8 @@ crucible publish                 # export as HTML site
 
 * Documentation
 
+The documentation is published at https://kitchingroup.cheme.cmu.edu/crucible/.
+
 - [[file:docs/tutorial.org][Tutorial]]: step-by-step guide to ingesting your first source and building a wiki
 - [[file:docs/commands.org][Command Reference]]: complete documentation for every CLI command
 - [[file:docs/architecture.org][Architecture]]: database schema, search algorithms, and design decisions
