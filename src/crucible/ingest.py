@@ -529,13 +529,9 @@ def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> in
     rows_by_key: dict[str, dict] = {}
     invalid: list[str] = []
     for src in sources:
-        raw = src.get("metadata") or "{}"
-        try:
-            meta = json.loads(raw) if isinstance(raw, str) else (raw or {})
-        except (ValueError, TypeError):
-            meta = None
-        key = meta.get("cite_key") if isinstance(meta, dict) else None
-        if not isinstance(meta, dict) or (key is not None and not isinstance(key, str)):
+        meta = _load_source_metadata(src)
+        key = _metadata_cite_key(meta)
+        if meta is None or not isinstance(meta.get("cite_key", ""), str):
             invalid.append(src["path"])
             continue
         if key:
@@ -734,13 +730,30 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _source_metadata(src: dict) -> dict:
-    """Parse a source row's metadata JSON into a dict (empty on any error)."""
+def _load_source_metadata(src: dict) -> dict | None:
+    """Parse a source row's metadata JSON, or None if it is not a JSON object."""
     raw = src.get("metadata") or "{}"
     try:
-        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+        md = json.loads(raw) if isinstance(raw, str) else (raw or {})
     except (ValueError, TypeError):
-        return {}
+        return None
+    return md if isinstance(md, dict) else None
+
+
+def _source_metadata(src: dict) -> dict:
+    """Parse a source row's metadata into a dict (empty if it is invalid)."""
+    return _load_source_metadata(src) or {}
+
+
+def _metadata_cite_key(md: dict | None) -> str | None:
+    """The cite key in parsed metadata, or None if missing, empty or not a string."""
+    key = (md or {}).get("cite_key")
+    return key if isinstance(key, str) and key else None
+
+
+def _source_cite_key(src: dict) -> str | None:
+    """A source row's cite key, or None if missing, empty or not a string."""
+    return _metadata_cite_key(_load_source_metadata(src))
 
 
 def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str) -> dict | None:
@@ -774,7 +787,7 @@ def _unique_cite_key(base: str, db: CrucibleDB) -> str:
     """
     used = {
         k for src in db.list_sources()
-        if (k := _source_metadata(src).get("cite_key"))
+        if (k := _source_cite_key(src))
     }
     if base not in used:
         return base

@@ -231,6 +231,35 @@ def test_sync_handles_invalid_source_metadata_with_no_bibliography(project, meta
     assert "legacy.md" in result.stderr
 
 
+@pytest.mark.parametrize("metadata", ["[]", "not json", '{"cite_key": ["invalid"]}'])
+def test_ingest_and_lint_tolerate_invalid_source_metadata(project, tmp_path, metadata):
+    cdir = project / ".crucible"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_id = db.add_source(
+            path=".crucible/sources/data/legacy.md", title="Legacy", source_type="data"
+        )
+        db.conn.execute("UPDATE sources SET metadata = ? WHERE id = ?", (metadata, source_id))
+        db.conn.commit()
+    finally:
+        db.close()
+
+    original = tmp_path / "new-notes.md"
+    original.write_text("New notes.\n")
+    result = CliRunner().invoke(cli, ["ingest", str(original), "--title", "New Notes"])
+    assert result.exit_code == 0, result.output
+    assert isinstance(run_json("lint"), list)
+
+
+def test_source_cite_key_accepts_only_nonempty_strings():
+    from crucible.ingest import _source_cite_key, _source_metadata
+
+    assert _source_cite_key({"metadata": '{"cite_key": "k"}'}) == "k"
+    for raw in ["[]", "not json", '{"cite_key": ""}', '{"cite_key": ["k"]}', None]:
+        assert _source_cite_key({"metadata": raw}) is None
+    assert _source_metadata({"metadata": "[]"}) == {}
+
+
 def _bib_key_for(bib_text, title):
     from crucible.ingest import _BIB_ENTRY_RE
 

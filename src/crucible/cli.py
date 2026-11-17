@@ -12,7 +12,7 @@ import click
 from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
-from crucible.ingest import _source_metadata, ingest_source
+from crucible.ingest import _source_cite_key, _source_metadata, ingest_source
 from crucible.orgparse import parse_org_file
 
 
@@ -596,11 +596,8 @@ def _source_key_index(sources: list[dict]) -> tuple[dict[str, int], list[dict]]:
     key_to_src = {}
     legacy_sources = []
     for src in sources:
-        md = _source_metadata(src)
-        if not isinstance(md, dict):
-            md = {}
-        cite_key = md.get("cite_key")
-        if isinstance(cite_key, str) and cite_key:
+        cite_key = _source_cite_key(src)
+        if cite_key:
             key_to_src[cite_key] = src["id"]
         else:
             legacy_sources.append(src)
@@ -1844,9 +1841,7 @@ def merge(source, dry_run, yes):
             authors = src.get("authors", "[]")
             if isinstance(authors, str):
                 authors = json.loads(authors)
-            metadata = src.get("metadata", "{}")
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
+            metadata = _source_metadata(src)
 
             target_db.add_source(
                 path=new_rel, title=src["title"],
