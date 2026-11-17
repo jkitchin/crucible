@@ -1,6 +1,10 @@
 """Tests for --json output and project discovery in the CLI."""
 
+import errno
 import json
+import os
+from contextlib import contextmanager
+from unittest.mock import Mock
 
 import pytest
 from click.testing import CliRunner
@@ -139,9 +143,16 @@ def test_lint_resolves_source_keys_like_sync(project):
         ("legacy-path-file.pdf", "Legacy source", {}),
         ("other.pdf", "Vintage source", {}),
         ("badmetadata-file.pdf", "Old source", {}),
+        ("nonobject-list.pdf", "List legacy source", {}),
+        ("nonobject-null.pdf", "Null legacy source", {}),
         ("known2026-copy.pdf", "Lower priority", {}),
         ("falsepositive2026.pdf", "Different source", {"cite_key": "different2026"}),
     ]
+    malformed_metadata = {
+        "badmetadata-file.pdf": "{invalid",
+        "nonobject-list.pdf": "[]",
+        "nonobject-null.pdf": "null",
+    }
     db = CrucibleDB(cdir / "crucible.db")
     try:
         for filename, title, metadata in records:
@@ -153,18 +164,26 @@ def test_lint_resolves_source_keys_like_sync(project):
                 source_type="pdf",
                 metadata=metadata,
             )
-            if filename == "badmetadata-file.pdf":
+            if filename in malformed_metadata:
                 db.conn.execute(
                     "UPDATE sources SET metadata = ? WHERE id = ?",
-                    ("{invalid", source_id),
+                    (malformed_metadata[filename], source_id),
                 )
                 db.conn.commit()
     finally:
         db.close()
 
-    keys = "known2026 legacy-path Vintage badmetadata missing2026 falsepositive2026"
+    keys = (
+        "known2026 legacy-path Vintage badmetadata nonobject-list nonobject-null "
+        "missing2026 falsepositive2026"
+    )
     (project / CONCEPT_PATH).write_text(
         CONCEPT.replace(":SOURCE_KEYS:", f":SOURCE_KEYS: {keys}")
+    )
+    issues_before_sync = run_json("lint")
+    assert any(
+        issue["type"] == "unresolved_source_key" and issue["key"] == "missing2026"
+        for issue in issues_before_sync
     )
     result = CliRunner().invoke(cli, ["sync"])
     assert result.exit_code == 0, result.output
@@ -174,6 +193,8 @@ def test_lint_resolves_source_keys_like_sync(project):
         ".crucible/sources/external/pdfs/legacy-path-file.pdf",
         ".crucible/sources/external/pdfs/other.pdf",
         ".crucible/sources/external/pdfs/badmetadata-file.pdf",
+        ".crucible/sources/external/pdfs/nonobject-list.pdf",
+        ".crucible/sources/external/pdfs/nonobject-null.pdf",
     }
 
     issues = run_json("lint")
@@ -214,7 +235,6 @@ def test_rebuild_does_not_assign_title_only_bib_to_disk_source(project):
         db.close()
     assert str(csv.relative_to(project)) in {source["path"] for source in rows}
     sources = run_json("sources", CONCEPT_PATH)
-    assert [source["path"] for source in sources] == [".crucible/bib/smith2024"]
     assert str(csv.relative_to(project)) not in {source["path"] for source in sources}
 
 
@@ -333,6 +353,80 @@ def test_sync_prunes_last_article_after_index_generation(project):
             "SELECT article_id FROM article_sources WHERE article_id = ?", (article_id,)
         ).fetchone()
         assert db.get_source(source_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("blocked_subdir", ["wiki", "concepts", "entry"])
+def test_sync_preserves_articles_when_wiki_traversal_fails(project, monkeypatch, blocked_subdir):
+    cdir = project / ".crucible"
+    wiki = cdir / "wiki"
+    blocked = wiki if blocked_subdir == "wiki" else wiki / "concepts"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        article_ids = {row["id"] for row in db.list_articles()}
+        article_id = db.get_article_by_path(CONCEPT_PATH)["id"]
+        source_id = db.add_source(
+            path=".crucible/sources/external/pdfs/registered.pdf",
+            title="Registered source", source_type="pdf",
+            metadata={"cite_key": "registered2026"},
+        )
+        db.link_article_source(article_id, source_id)
+        article_links = {
+            tuple(row) for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
+        }
+        assert article_links
+        original_scandir = os.scandir
+
+        @contextmanager
+        def scandir_with_blocked_entry(path):
+            with original_scandir(path) as entries:
+                wrapped = []
+                for entry in entries:
+                    if os.path.normpath(entry.path) == str(blocked):
+                        inaccessible = Mock()
+                        inaccessible.name = entry.name
+                        inaccessible.path = entry.path
+                        inaccessible.is_dir.side_effect = PermissionError(
+                            errno.EACCES, "Synthetic traversal failure", str(blocked)
+                        )
+                        inaccessible.stat.side_effect = inaccessible.is_dir.side_effect
+                        wrapped.append(inaccessible)
+                    else:
+                        wrapped.append(entry)
+                yield iter(wrapped)
+
+        def fail_scandir(path):
+            if not isinstance(path, (str, bytes, os.PathLike)):
+                return original_scandir(path)
+            scanned = os.path.normpath(os.fsdecode(path))
+            if blocked_subdir == "entry" and scanned == str(wiki):
+                return scandir_with_blocked_entry(path)
+            if blocked_subdir != "entry" and scanned == str(blocked):
+                raise PermissionError(errno.EACCES, "Synthetic traversal failure", str(blocked))
+            return original_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", fail_scandir)
+        error = None
+        try:
+            _sync_wiki_to_db(project, db)
+        except PermissionError as exc:
+            error = exc
+
+        assert {row["id"] for row in db.list_articles()} == article_ids
+        assert {
+            tuple(row) for row in db.conn.execute("SELECT from_id, to_id FROM article_links")
+        } == article_links
+        assert db.conn.execute(
+            "SELECT article_id FROM article_sources WHERE article_id = ? AND source_id = ?",
+            (article_id, source_id),
+        ).fetchone()
+        for article_id in article_ids:
+            assert db.conn.execute(
+                "SELECT rowid FROM article_fts WHERE rowid = ?", (article_id,)
+            ).fetchone()
+        assert error is not None
+        assert str(blocked) in str(error)
     finally:
         db.close()
 

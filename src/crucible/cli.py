@@ -1,8 +1,10 @@
 """Crucible CLI - knowledge base management."""
 
 import json
+import os
 import re
 import shutil
+import stat
 from pathlib import Path
 
 import click
@@ -558,6 +560,8 @@ def _resolve_source_keys(keys: list[str], sources: list[dict]) -> dict[str, list
     legacy_sources = []
     for src in sources:
         md = _source_metadata(src)
+        if not isinstance(md, dict):
+            md = {}
         if md.get("cite_key"):
             key_to_src[md["cite_key"]] = src["id"]
         else:
@@ -587,10 +591,6 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         on_skip = lambda _p: None  # noqa: E731
 
     wiki_dir = cdir(root) / "wiki"
-    org_files = sorted(
-        p for p in wiki_dir.rglob("*.org") if p != wiki_dir / "index.org"
-    )
-
     stats = {
         "added": 0,
         "updated": 0,
@@ -598,11 +598,29 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         "links_added": 0,
         "concepts_added": 0,
         "skipped": 0,
-        "files": len(org_files),
+        "files": 0,
     }
 
-    if not wiki_dir.is_dir():
+    try:
+        wiki_stat = wiki_dir.stat()
+    except FileNotFoundError:
         return stats
+    if not stat.S_ISDIR(wiki_stat.st_mode):
+        return stats
+
+    # rglob and os.walk can suppress entry errors, leaving an incomplete scan.
+    org_files = []
+    pending = [wiki_dir]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode):
+                    pending.append(path)
+                if path.match("*.org") and path != wiki_dir / "index.org":
+                    org_files.append(path)
+    org_files.sort()
+    stats["files"] = len(org_files)
 
     file_mtimes = {p: p.stat().st_mtime for p in org_files}
 
