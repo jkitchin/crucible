@@ -33,8 +33,13 @@ crucible install
 
 Does three things:
 1. Copies =skills/crucible/SKILL.md= to =~/.claude/skills/crucible/=
-2. Runs =crucible manifest= to generate =wiki/MANIFEST.md=
+2. Generates =wiki/MANIFEST.md= (as =crucible manifest= does)
 3. Adds a directive to =~/.claude/CLAUDE.md= pointing agents at the manifest
+
+Install records what it copied (with a checksum) in
+=~/.claude/skills/crucible/.crucible-installed.json=. If you have edited an
+installed skill file since, install (and =init= and =update=) saves your
+copy as =SKILL.md.bak= before overwriting it, and says so.
 
 Idempotent: re-running updates the existing directive rather than duplicating.
 There is one directive, so running =install= in another crucible points it
@@ -47,6 +52,10 @@ Remove the skill and CLAUDE.md directive.
 #+BEGIN_SRC bash
 crucible uninstall
 #+END_SRC
+
+Removes only the skill files crucible installed. Files you added to
+=~/.claude/skills/crucible/=, backups, and installed files you have edited
+since are left in place (and named); the directory is removed once empty.
 
 * Ingestion Commands
 
@@ -219,12 +228,21 @@ from another crucible is labelled with its registry name.
 
 * Navigation Commands
 
+=backlinks=, =sources=, =related= and =history= take an article path. It
+may be the database path (relative to the project root, as =--json=
+output gives it, e.g. =.crucible/wiki/concepts/activation-energy.org=), a
+path relative to the current directory (so tab completion works from any
+subdirectory), an absolute path, or a path relative to the wiki
+(=concepts/activation-energy.org=). If no article has that path the
+command exits 1 with an error, rather than reporting no results; run
+=crucible sync= first if the file is new.
+
 ** =crucible backlinks=
 
 Show articles that link to the given article.
 
 #+BEGIN_SRC bash
-crucible backlinks wiki/concepts/activation-energy.org
+crucible backlinks concepts/activation-energy.org
 #+END_SRC
 
 ** =crucible sources=
@@ -232,7 +250,7 @@ crucible backlinks wiki/concepts/activation-energy.org
 Show primary sources for an article.
 
 #+BEGIN_SRC bash
-crucible sources wiki/concepts/activation-energy.org
+crucible sources concepts/activation-energy.org
 #+END_SRC
 
 ** =crucible source=
@@ -245,7 +263,8 @@ crucible source SOURCE_PATH [--json]
 
 SOURCE_PATH is the source's path, or part of its path or title. Shows the
 source's metadata and the articles distilled from it, which is useful
-before asking Claude to reread and resummarize it.
+before asking Claude to reread and resummarize it. Exits 1 if no source
+matches.
 
 ** =crucible concepts=
 
@@ -265,13 +284,16 @@ Show articles covering a specific concept.
 crucible concept thermodynamics
 #+END_SRC
 
+Concepts come from =#+FILETAGS:=, which sync lowercases, so the name is
+matched case-insensitively.
+
 ** =crucible related=
 
 Show articles related through implied links (shared concepts, shared
 sources, temporal proximity, explicit links).
 
 #+BEGIN_SRC bash
-crucible related wiki/concepts/activation-energy.org
+crucible related concepts/activation-energy.org
 #+END_SRC
 
 Results are sorted by number of relationship signals (more is stronger).
@@ -281,7 +303,7 @@ Results are sorted by number of relationship signals (more is stronger).
 Show the derivation history of an article.
 
 #+BEGIN_SRC bash
-crucible history wiki/comparisons/synthesis.org
+crucible history comparisons/synthesis.org
 #+END_SRC
 
 Shows upstream (what it was derived from) and downstream (what has been
@@ -322,8 +344,13 @@ Organized by article type and by concept.
 Check wiki health and report issues.
 
 #+BEGIN_SRC bash
-crucible lint [--json]
+crucible lint [--strict] [--json]
 #+END_SRC
+
+Exits 1 if any issue has severity =error=, so a script or CI job can gate
+on it. Warnings are common in a growing wiki (an undigested source, a link
+to an article not yet written) and do not fail lint unless =--strict= is
+given; info never does.
 
 Each issue has a type and a severity (error, warning or info):
 
@@ -334,7 +361,7 @@ Each issue has a type and a severity (error, warning or info):
 | =orphan= | info | No other article links to this one |
 | =undigested= | warning | A source has no articles distilled from it |
 | =missing_source_file= | warning | A notebook or data source's file is gone (external sources are gitignored, so they are not checked) |
-| =missing_concept_article= | info | A concept has no dedicated concept article |
+| =missing_concept_article= | info | A concept has no dedicated concept article: no concept article whose file name or title names it (=concepts/activation-energy.org= or "Activation Energy" covers the tag =activation_energy=) |
 | =duplicate_cite_key= | warning | Two or more sources share a cite key |
 | =duplicate_bib_key= | warning | =references.bib= has more than one entry with a key |
 | =malformed_bib_entry= | warning | A =references.bib= entry is never closed and is ignored |
@@ -497,7 +524,8 @@ crucible publish [OPTIONS]
 | =-o=, =--output= | Output directory (default: wiki/_build/html) |
 | =--init-only= | Only write config, do not publish |
 
-Regenerates =wiki/index.org= first, then runs =scimax publish=.
+Regenerates =wiki/index.org= first, then runs =scimax publish= (which
+must be on =PATH=).
 
 ** =crucible graph=
 
@@ -552,7 +580,11 @@ one) and the crucibles in the global registry.
 
 #+BEGIN_SRC bash
 crucible about [--json]
+crucible --version
 #+END_SRC
+
+=crucible --version= prints just the installed version of the
+=crucible-llm= package.
 
 ** =crucible update=
 
@@ -599,7 +631,17 @@ crucible help [TOPIC]
 #+END_SRC
 
 Topics: overview, workflow, ingest, distill, search, sync, maintain,
-org-format, registry. Use =all= for everything.
+org-format, registry. Use =all= for everything. An unknown topic exits 1.
+
+* Exit Codes
+
+Commands exit 0 on success and 1 on an error, with the message on stderr.
+Not finding what was asked for is an error: an article path that names no
+article (=backlinks=, =sources=, =related=, =history=), an unknown source
+(=source=) or an unknown help topic. An empty result for something that
+exists is not: an article with no backlinks prints nothing (=[]= with
+=--json=) and exits 0, as does =concept= for a name no article is tagged
+with. =lint= exits 1 when it finds errors (or warnings, with =--strict=).
 
 * JSON Output
 
@@ -616,10 +658,11 @@ Article and source paths are relative to the project root, which
 #+BEGIN_SRC bash
 crucible about --json      # {"version", "schema_version", "project": {"root", "wiki", "bibliography", ...}, "registry": [...]}
 crucible search "activation energy" --json   # list of articles (path, title, article_type, abstract, scores)
-crucible history wiki-article.org --json     # {"derived_from": [...], "derivatives": [...]}
+crucible history concepts/foo.org --json     # {"derived_from": [...], "derivatives": [...]}
 crucible registry list --json                # registered crucibles, with their database path (null if missing)
 #+END_SRC
 
-A command with no results prints =[]= (=source= prints =null= for an
-unknown source). =search --all --json= marks each result with
+A command with no results prints =[]=. A lookup that finds nothing to
+report on (an unknown article path or source) prints nothing on stdout,
+an error on stderr, and exits 1. =search --all --json= marks each result with
 =_crucible=: =local=, or the registry name of the crucible it came from.

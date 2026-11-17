@@ -44,6 +44,7 @@ From PyPI:
 
 #+BEGIN_SRC bash
 pip install crucible-llm
+crucible --version
 #+END_SRC
 
 Or from source for development:
@@ -72,7 +73,9 @@ The =install= command does three things:
 writes the =~/.claude/CLAUDE.md= directive. There is one directive, so a new
 crucible does not take it over until you run =install= in it.
 
-To remove: =crucible uninstall=.
+Re-running =install= (or =update=) keeps a copy of a skill file you have
+edited as =SKILL.md.bak=. To remove: =crucible uninstall=, which deletes
+only the files crucible installed.
 
 ** Installing the skill with knowhow
 
@@ -165,12 +168,12 @@ crucible search "catalyst" --mode fts                  # keyword only
 # Navigate
 crucible concepts                # list all topics
 crucible concept thermodynamics  # articles on a topic
-crucible backlinks wiki/concepts/activation-energy.org
-crucible related wiki/concepts/activation-energy.org
-crucible history wiki/comparisons/synthesis.org        # derivation chain
+crucible backlinks concepts/activation-energy.org   # paths: wiki-, root- or cwd-relative
+crucible related concepts/activation-energy.org
+crucible history comparisons/synthesis.org        # derivation chain
 
 # Maintain
-crucible lint                    # find problems (incl. duplicate cite keys)
+crucible lint                    # find problems; exits 1 on errors (--strict: warnings too)
 crucible suggest                 # find opportunities
 crucible index                   # regenerate index
 crucible publish                 # export as HTML site
@@ -389,7 +392,7 @@ includes a =:DERIVED_FROM:= property listing the source articles. This
 creates a derivation chain in the database:
 
 #+BEGIN_SRC bash
-crucible history wiki/comparisons/my-synthesis.org
+crucible history comparisons/my-synthesis.org
 # Derived from:
 #   [concept] Activation Energy (wiki/concepts/activation-energy.org)
 #   [summary] Smith 2024 Results (wiki/summaries/smith2024.org)
