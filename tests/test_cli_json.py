@@ -386,6 +386,11 @@ def test_add_bib_file_field_handles_single_line_entries(tmp_path):
     assert parsed["cite_key"] == "k"
     assert parsed["file"] == ".crucible/sources/external/pdfs/a.pdf"
     assert add_bib_file_field(entry, "elsewhere.pdf") == entry
+    # Paths are written verbatim, and skipped when BibTeX cannot hold them.
+    spaced = add_bib_file_field("@misc{s,\n  title = {S},\n}", "data/a  b.md")
+    assert "file = {data/a  b.md}" in spaced
+    for unsafe in ["data/a{b}.md", "data/a\nb.md"]:
+        assert add_bib_file_field("@misc{s,\n}", unsafe) == "@misc{s,\n}"
 
 
 def test_lint_resolves_source_keys_like_sync(project):
@@ -829,3 +834,115 @@ def test_nested_index_org_is_an_ordinary_article(project):
     assert result.exit_code == 0, result.output
     assert run_json("stats")["articles"] == 3
     assert nested in {r["path"] for r in run_json("concept", "kinetics")}
+
+
+def _sync():
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+
+
+def test_sync_drops_tags_removed_from_a_file(project):
+    path = project / CONCEPT_PATH
+    path.write_text(path.read_text().replace(":kinetics:", ":thermo:"))
+    _sync()
+    assert [r["path"] for r in run_json("concept", "kinetics")] == [SUMMARY_PATH]
+    assert [r["path"] for r in run_json("concept", "thermo")] == [CONCEPT_PATH]
+
+
+def test_sync_drops_links_and_derivations_removed_from_a_file(project):
+    path = project / SUMMARY_PATH
+    text = path.read_text()
+    text = text.replace(":DERIVED_FROM: ../concepts/activation-energy.org\n", "")
+    text = text.replace("[[file:../concepts/activation-energy.org][activation energy]]",
+                        "activation energy")
+    path.write_text(text)
+    _sync()
+    assert run_json("backlinks", CONCEPT_PATH) == []
+    assert run_json("history", SUMMARY_PATH)["derived_from"] == []
+
+
+def test_sync_drops_source_keys_removed_from_a_file(project):
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/sources/external/pdfs/paper.pdf",
+            title="A paper", source_type="pdf",
+            metadata={"cite_key": "paper2026"},
+        )
+    finally:
+        db.close()
+    path = project / CONCEPT_PATH
+    original = path.read_text()
+    path.write_text(original.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: paper2026"))
+    _sync()
+    assert [s["title"] for s in run_json("sources", CONCEPT_PATH)] == ["A paper"]
+    path.write_text(original)
+    _sync()
+    assert run_json("sources", CONCEPT_PATH) == []
+
+
+def test_sync_prunes_concepts_no_article_uses(project):
+    path = project / CONCEPT_PATH
+    path.write_text(path.read_text().replace(":kinetics:", ":kinetics:solo:"))
+    _sync()
+    assert "solo" in {c["name"] for c in run_json("concepts")}
+    path.unlink()
+    _sync()
+    names = {c["name"]: c["article_count"] for c in run_json("concepts")}
+    assert names == {"kinetics": 1}
+
+
+def test_incremental_sync_matches_a_fresh_rebuild(project, tmp_path):
+    """The DB must stay regenerable from the wiki: after edits, an
+    incrementally synced DB holds the same relations as a fresh one."""
+
+    concept = project / CONCEPT_PATH
+    concept.write_text(concept.read_text().replace(":kinetics:", ":catalysis:")
+                       .replace("See [[file:../summaries/smith.org][Smith]].", ""))
+    summary = project / SUMMARY_PATH
+    summary.write_text(summary.read_text().replace(":kinetics:", ":kinetics:platinum:"))
+    _sync()
+
+    def relations(db):
+        q = lambda sql: sorted(tuple(r.values()) for r in db.conn.execute(sql))  # noqa: E731
+        return {
+            "tags": q("SELECT a.path, c.name FROM article_concepts ac "
+                      "JOIN articles a ON a.id = ac.article_id "
+                      "JOIN concepts c ON c.id = ac.concept_id"),
+            "concepts": q("SELECT name FROM concepts"),
+            "links": q("SELECT f.path, t.path FROM article_links l "
+                       "JOIN articles f ON f.id = l.from_id "
+                       "JOIN articles t ON t.id = l.to_id"),
+            "derivations": q("SELECT d.path, s.path FROM article_derivations x "
+                             "JOIN articles d ON d.id = x.derived_id "
+                             "JOIN articles s ON s.id = x.source_id"),
+        }
+
+    synced = CrucibleDB(project / ".crucible" / "crucible.db")
+    fresh = CrucibleDB(tmp_path / "fresh.db")
+    fresh.initialize()
+    try:
+        _sync_wiki_to_db(project, fresh)
+        assert relations(synced) == relations(fresh)
+    finally:
+        synced.close()
+        fresh.close()
+
+
+def test_concept_prune_survives_a_null_concept_id(project):
+    """A NULL concept_id must not stop unused concepts being pruned
+    (`id NOT IN (... NULL ...)` matches no rows)."""
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        article_id = db.get_article_by_path(CONCEPT_PATH)["id"]
+        db.conn.execute(
+            "INSERT INTO article_concepts (article_id, concept_id) VALUES (?, NULL)",
+            (article_id,),
+        )
+        db.add_concept("unused")
+        db.prune_unused_concepts()
+        names = {c["name"] for c in db.list_concepts()}
+    finally:
+        db.close()
+    assert "unused" not in names
+    assert "kinetics" in names
