@@ -208,13 +208,19 @@ def _vectors_for(conn, ids, model: str, dim: int) -> dict[int, list[float]]:
 
 def _rrf(scores: dict, fts_rows: list[dict], sem_rows: list[dict],
          crucible: str | None, fts_weight: float, semantic_weight: float,
-         k: int):
+         k: int, scope=None):
     """Add Reciprocal Rank Fusion contributions of two ranked lists.
 
-    Keys are article ids, or "<crucible>:<id>" when crucible is given.
+    Keys are article ids, or (scope, id) when crucible is given; scope
+    defaults to the crucible name. Results get crucible as their _crucible
+    label. A search across crucibles passes a scope that tells the local
+    crucible from a peer of the same name, so their rows never merge.
     """
+    if scope is None:
+        scope = crucible
+
     def entry(r):
-        key = r["id"] if crucible is None else f"{crucible}:{r['id']}"
+        key = r["id"] if crucible is None else (scope, r["id"])
         if key not in scores:
             scores[key] = {**r, "rrf_score": 0.0, "methods": []}
             if crucible is not None:
@@ -419,13 +425,19 @@ class EmbeddingIndex:
 
     def _dedup_results(self, ranked: list[dict], limit: int,
                        vectors: dict, key,
-                       similarity_threshold: float = 0.85) -> list[dict]:
+                       similarity_threshold: float = 0.85,
+                       is_local=None) -> list[dict]:
         """Cluster ranked results and pick the best from each cluster.
 
         vectors maps key(article) to its unit vector; results without one
         are never clustered. Within a cluster, prefers: higher status, more
         derivatives (local articles), more recent, higher RRF score.
+        is_local(article) tells local results from peers' (by default, by
+        their _crucible label).
         """
+        if is_local is None:
+            def is_local(article):
+                return article.get("_crucible", "local") == "local"
         status_rank = {"verified": 3, "reviewed": 2, "draft": 1}
 
         derivative_counts = {}
@@ -439,7 +451,7 @@ class EmbeddingIndex:
             pass
 
         def quality_key(article):
-            local = article.get("_crucible", "local") == "local"
+            local = is_local(article)
             return (
                 status_rank.get(article.get("status", "draft"), 0),
                 derivative_counts.get(article.get("id", 0), 0) if local else 0,
@@ -539,14 +551,18 @@ class EmbeddingIndex:
         scores: dict = {}
         vectors: dict = {}
 
-        def collect(conn, name, fts_rows, sem_rows):
-            _rrf(scores, fts_rows, sem_rows, name, fts_weight, semantic_weight, k)
+        # Rows are keyed by (scope, article id). The scope (is_peer, name)
+        # keeps the local crucible apart from a peer that happens to be
+        # registered under the name "local"; the label shown is unchanged.
+        def collect(conn, scope, fts_rows, sem_rows):
+            _rrf(scores, fts_rows, sem_rows, scope[1], fts_weight,
+                 semantic_weight, k, scope=scope)
             if not raw and _has_embeddings_table(conn):
                 ids = [r["id"] for r in fts_rows + sem_rows]
                 for aid, v in _vectors_for(conn, ids, self.model, dim).items():
-                    vectors[f"{name}:{aid}"] = v
+                    vectors[(scope, aid)] = v
 
-        collect(self.conn, "local",
+        collect(self.conn, (False, "local"),
                 self._fts_rows(self.conn, query, limit * 3),
                 _semantic_rows(self.conn, query_blob, self.model, dim, limit * 3))
 
@@ -558,7 +574,7 @@ class EmbeddingIndex:
             try:
                 conn = DictConnection(libsql.connect(peer_db))
                 try:
-                    collect(conn, name,
+                    collect(conn, (True, name),
                             self._fts_rows(conn, query, limit * 3),
                             self._peer_semantic(conn, name, query_blob, dim,
                                                 limit * 3))
@@ -570,9 +586,11 @@ class EmbeddingIndex:
         ranked = sorted(scores.values(), key=lambda x: x["rrf_score"], reverse=True)
         if raw or not vectors:
             return ranked[:limit]
-        return self._dedup_results(
-            ranked, limit, vectors,
-            key=lambda a: f"{a.get('_crucible', 'local')}:{a.get('id')}")
+        # key_of[id(row)] is ((is_peer, name), article id).
+        key_of = {id(entry): key for key, entry in scores.items()}
+        return self._dedup_results(ranked, limit, vectors,
+                                   key=lambda a: key_of[id(a)],
+                                   is_local=lambda a: not key_of[id(a)][0][0])
 
     # -- Semantic analysis for suggest --
 

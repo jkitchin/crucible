@@ -111,6 +111,9 @@ entry is fetched from doi.org (a DOI found in the text is used too). Use
 (e.g. `smith2024`, or `smith2024a` when that key is taken). That key is what
 goes in `SOURCE_KEYS` and in `cite:` links. The entry's `file` field records
 the stored copy, so a fresh clone can rebuild the database from the bib.
+Re-ingesting a gitignored external file there restores it into its source
+when its DOI or title matches; if ingest refuses because only the name
+matches, ask the user before passing `--restore`.
 
 For URLs, fetch and convert first:
 ```bash

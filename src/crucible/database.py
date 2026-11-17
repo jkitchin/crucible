@@ -210,6 +210,9 @@ def _fts_query(raw: str) -> str:
     over-matches (cats* would find catalysis), so callers run it through
     fts_rows, which keeps only rows that really contain a word starting
     with each prefix.
+    A token with no letter or digit in it ("&", "-", "/", an en dash) is
+    dropped: the tokenizer reads it as an empty phrase, which, ANDed with
+    the rest, would make every search return nothing.
 
     The match is limited to the title and content columns: the path column
     holds ".crucible/wiki/concepts/x.org", whose words would otherwise match
@@ -226,8 +229,8 @@ def _fts_query(raw: str) -> str:
     terms = []
     for token in cleaned.split():
         stem = token.rstrip("*")
-        if not stem:
-            continue  # a bare "*" means nothing
+        if not any(ch.isalnum() for ch in stem):
+            continue  # "*", "&", "--": nothing the tokenizer would index
         if stem == token:
             terms.append(_fts_literal(token))
         elif len(stem) > 3:
@@ -252,7 +255,7 @@ def _fts_prefix_res(raw: str) -> list[re.Pattern]:
     patterns = []
     for token in cleaned.split():
         stem = token.rstrip("*")
-        if stem and stem != token:
+        if stem != token and any(ch.isalnum() for ch in stem):
             # A word starts after anything that is not a letter or digit
             # (unicode61 splits words there, underscores included).
             patterns.append(re.compile(r"(?<![^\W_])" + re.escape(_fold(stem))))
@@ -305,27 +308,47 @@ class CrucibleDB:
         raw_conn.execute("PRAGMA busy_timeout = 5000")
         self.conn = DictConnection(raw_conn)
         self._attached: dict[str, str] = {}
+        # (stamp, {concept key: [concept ids]}); see _concept_ids_by_key.
+        self._concept_key_cache: tuple | None = None
 
     def initialize(self):
-        """Create all tables and set schema version."""
+        """Create all tables, run pending migrations and set schema version.
+
+        The version on disk is read before the new one is recorded, so an
+        older database is migrated; a brand-new one has nothing to migrate
+        and is simply stamped with SCHEMA_VERSION.
+        """
+        current = self._stored_version()
         for statement in SCHEMA_SQL.split(";"):
             statement = statement.strip()
             if statement:
                 self.conn.execute(statement)
+        self.conn.commit()
+        if current:
+            self._migrate(current)
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
         self.conn.commit()
-        self._migrate()
 
-    def _migrate(self):
-        """Run any pending migrations based on schema_version."""
+    def _stored_version(self) -> int:
+        """The schema version of the database as found on disk.
+
+        0 for a brand-new (empty) database. One with crucible tables but no
+        recorded version predates versioning and counts as v1.
+        """
+        version = self.schema_version()
+        if version:
+            return version
         row = self.conn.execute(
-            "SELECT MAX(version) as v FROM schema_version"
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'"
+            " AND name IN ('articles', 'sources', 'peers')"
         ).fetchone()
-        current = row["v"] if row else 0
+        return 1 if row and row["n"] else 0
 
+    def _migrate(self, current: int):
+        """Run the migrations from version `current` up to SCHEMA_VERSION."""
         if current < 2:
             self._migrate_v2()
         # Future migrations:
@@ -345,7 +368,7 @@ class CrucibleDB:
             row = self.conn.execute(
                 "SELECT MAX(version) as v FROM schema_version"
             ).fetchone()
-            return row["v"] if row else 0
+            return (row["v"] or 0) if row else 0
         except (ValueError, Exception):
             # Table doesn't exist yet (pre-init database)
             return 0
@@ -786,6 +809,27 @@ class CrucibleDB:
             WHERE a.path = ?
         """, (article_path,))]
 
+    def _concept_ids_by_key(self) -> dict[str, list[int]]:
+        """Concept ids grouped by _concept_key of their names.
+
+        Cached per connection: building it scans every concept, and callers
+        such as suggest look up each concept in turn. The cache is dropped
+        whenever this connection writes (total_changes) or another one
+        commits (data_version).
+        """
+        stamp = (
+            self.conn.execute("PRAGMA data_version").fetchone()["data_version"],
+            self.conn.execute("SELECT total_changes() AS n").fetchone()["n"],
+        )
+        cached = self._concept_key_cache
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        by_key: dict[str, list[int]] = {}
+        for r in self.conn.execute("SELECT id, name FROM concepts ORDER BY id"):
+            by_key.setdefault(_concept_key(r["name"]), []).append(r["id"])
+        self._concept_key_cache = (stamp, by_key)
+        return by_key
+
     def concept_articles(self, concept_name: str) -> list[dict]:
         """Articles covering a given concept.
 
@@ -807,25 +851,6 @@ class CrucibleDB:
             WHERE ac.concept_id IN ({marks})
             ORDER BY a.title
         """, tuple(ids))]
-
-    def _concept_ids_by_key(self) -> dict[str, list[int]]:
-        """Concept ids grouped by _concept_key, cached until concepts change.
-
-        Callers such as suggest look up many concepts in a row, and
-        normalising every name on each lookup made that quadratic. This
-        connection's own concept writes clear the cache, and PRAGMA
-        data_version changes whenever another connection commits.
-        """
-        version = self.conn.execute("PRAGMA data_version").fetchone()
-        stamp = tuple(version.values()) if isinstance(version, dict) else tuple(version)
-        cached = getattr(self, "_concept_key_cache", None)
-        if cached is None or cached[0] != stamp:
-            by_key: dict[str, list[int]] = {}
-            for r in self.conn.execute("SELECT id, name FROM concepts"):
-                by_key.setdefault(_concept_key(r["name"]), []).append(r["id"])
-            cached = (stamp, by_key)
-            self._concept_key_cache = cached
-        return cached[1]
 
     def orphans(self) -> list[dict]:
         """Articles with no incoming links."""
@@ -849,17 +874,34 @@ class CrucibleDB:
 
     def graph_dot(self) -> str:
         """Export the article link graph in DOT format."""
+        def quoted(text: str | None) -> str:
+            # A DOT string escapes only \ and "; an unescaped trailing
+            # backslash would escape the closing quote.
+            text = (text or "").replace("\\", "\\\\").replace('"', '\\"')
+            return '"' + text.replace("\r", " ").replace("\n", " ") + '"'
+
         lines = ["digraph crucible {", "  rankdir=LR;", "  node [shape=box];"]
-        for row in self.conn.execute("""
-            SELECT a1.path as from_path, a1.title as from_title,
-                   a2.path as to_path, a2.title as to_title
+        links = [dict(r) for r in self.conn.execute("""
+            SELECT al.from_id, al.to_id
             FROM article_links al
             JOIN articles a1 ON a1.id = al.from_id
             JOIN articles a2 ON a2.id = al.to_id
+            ORDER BY a1.path, a2.path
+        """)]
+        # Nodes are named by article id and labelled with the title, so
+        # two articles that share a title stay two nodes.
+        # A subquery rather than one placeholder per id, which a large wiki
+        # could push past SQLite's variable limit.
+        for row in self.conn.execute("""
+            SELECT id, title, path FROM articles
+            WHERE id IN (SELECT from_id FROM article_links
+                         UNION SELECT to_id FROM article_links)
+            ORDER BY path
         """):
-            from_label = row["from_title"].replace('"', '\\"')
-            to_label = row["to_title"].replace('"', '\\"')
-            lines.append(f'  "{from_label}" -> "{to_label}";')
+            lines.append(f'  a{row["id"]} [label={quoted(row["title"])},'
+                         f' tooltip={quoted(row["path"])}];')
+        for r in links:
+            lines.append(f'  a{r["from_id"]} -> a{r["to_id"]};')
         lines.append("}")
         return "\n".join(lines)
 
