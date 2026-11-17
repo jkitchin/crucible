@@ -49,6 +49,7 @@ All wiki articles use org-mode format with scimax conventions:
   - `:SOURCE_KEYS:` - space-separated cite keys of primary sources
   - `:STATUS:` - draft, reviewed, or verified
   - `:CREATED:` - ISO date
+  - `:MODIFIED:` - ISO date of the last substantive edit; update it on every edit
 - Use org-ref citations: `cite:key`, `citep:key`, `citet:key`
 - Use `[[file:path][description]]` links for cross-references between articles
 - Write in narrative prose, not bulleted lists (unless content demands enumeration)

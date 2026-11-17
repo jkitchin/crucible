@@ -125,6 +125,35 @@ def cdir(root: Path) -> Path:
     return root / CRUCIBLE_DIR
 
 
+_ORG_DATE_RE = re.compile(
+    r"^[\[<]?\s*(\d{4}-\d{2}-\d{2})"         # date
+    r"(?:\s+[^\d\s\]>]+)?"                    # optional weekday, e.g. "Tue"
+    r"(?:[\sT]+(\d{1,2}:\d{2}(?::\d{2})?))?"  # optional time
+)
+
+
+def _org_date(value: str | None) -> str | None:
+    """Normalize an org date property to the DB's `YYYY-MM-DD HH:MM:SS`.
+
+    Accepts an ISO date (`2026-01-02`), optionally with a time, and org
+    timestamps (`[2026-01-02 Fri]`, `<2026-01-02 Fri 09:30>`). Returns None
+    for a missing or unparseable value, so callers fall back to sync time.
+    """
+    from datetime import datetime
+
+    m = _ORG_DATE_RE.match((value or "").strip())
+    if not m:
+        return None
+    date, time = m.group(1), m.group(2) or "00:00"
+    if time.count(":") == 1:
+        time += ":00"
+    try:
+        parsed = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     """Return the authored .org articles under a wiki directory, sorted.
 
@@ -742,6 +771,14 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
             rel_path = str(org_path.relative_to(root))
             article_type = meta.properties.get("ARTICLE_TYPE", "concept")
             status = meta.properties.get("STATUS") or "draft"
+            # :CREATED: and :MODIFIED: make an article's dates part of its
+            # file, so they survive a rebuild; without them sync time is used.
+            # :MODIFIED: falls back to :CREATED:, by the same rule for new and
+            # existing rows, so incremental sync and a rebuild agree. Property
+            # dates have no zone and count as midnight; the sync-time fallback
+            # (datetime('now')) is UTC. Ordering is only meaningful by day.
+            created = _org_date(meta.properties.get("CREATED"))
+            modified = _org_date(meta.properties.get("MODIFIED")) or created
 
             existing = db.get_article_by_path(rel_path)
             if existing:
@@ -767,6 +804,17 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     db.update_article(article_id, **fields)
                     db.update_article_fts(article_id, rel_path, meta.title, meta.content)
                     db.delete_embedding(article_id)
+                # Dates from properties are applied on their own, so a DB
+                # whose dates predate this (every :CREATED: article on
+                # upgrade) is corrected without dropping embeddings.
+                dates = {}
+                if created and existing["created_at"] != created:
+                    dates["created_at"] = created
+                if modified and (changed or existing["updated_at"] != modified):
+                    dates["updated_at"] = modified
+                if dates:
+                    db.set_article_dates(article_id, **dates)
+                if changed or dates:
                     stats["updated"] += 1
                 else:
                     stats["unchanged"] += 1
@@ -784,6 +832,8 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     abstract=meta.properties.get("ABSTRACT", ""),
                     content=meta.content,
                     status=status,
+                    created_at=created,
+                    updated_at=modified,
                 )
                 stats["added"] += 1
 
@@ -3173,6 +3223,7 @@ Every wiki article must follow this structure:
   :SOURCE_KEYS: key1 key2
   :STATUS: draft|reviewed|verified
   :CREATED: YYYY-MM-DD
+  :MODIFIED: YYYY-MM-DD
   :END:
 
   Body text in narrative prose. Use org-ref citations:

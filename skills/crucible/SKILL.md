@@ -134,6 +134,12 @@ When a new source adds information to an existing concept:
 - Add a new section to the existing article (do not create duplicates)
 - Add the new source key to the `SOURCE_KEYS` property
 - Add any new filetags
+- Set `:MODIFIED:` to today's date. Never change `:CREATED:`.
+
+`:CREATED:` and `:MODIFIED:` are the article's dates in the database, so
+they survive a rebuild. Search prefers recently modified articles, so keep
+`:MODIFIED:` current: sync uses it as is, even when the file changed, and
+an article without it counts as last modified on its `:CREATED:` date.
 
 ### Capturing Conversation Insights
 
@@ -160,6 +166,7 @@ When the user says "capture this as an article", "save this to the wiki",
 :SOURCE_KEYS: smith2024 jones2023
 :STATUS: draft
 :CREATED: 2026-04-03
+:MODIFIED: 2026-04-03
 :END:
 
 The synthesized narrative goes here, citing citep:smith2024 and
@@ -202,6 +209,7 @@ Every wiki article must follow this structure:
 :DERIVED_FROM: ../concepts/other.org ../summaries/another.org
 :STATUS: draft|reviewed|verified
 :CREATED: YYYY-MM-DD
+:MODIFIED: YYYY-MM-DD
 :END:
 
 Narrative prose describing the topic. Use org-ref citations

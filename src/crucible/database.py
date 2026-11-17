@@ -451,11 +451,16 @@ class CrucibleDB:
 
     def add_article(self, path: str, title: str, article_type: str,
                     distill_model: str | None = None, abstract: str | None = None,
-                    content: str = "", status: str = "draft") -> int:
+                    content: str = "", status: str = "draft",
+                    created_at: str | None = None, updated_at: str | None = None) -> int:
+        """Insert an article. Timestamps default to now when not given."""
         cur = self.conn.execute(
-            """INSERT INTO articles (path, title, article_type, distill_model, abstract, status)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (path, title, article_type, distill_model, abstract, status),
+            """INSERT INTO articles (path, title, article_type, distill_model, abstract, status,
+                                     created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?,
+                       COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))""",
+            (path, title, article_type, distill_model, abstract, status,
+             created_at, updated_at),
         )
         article_id = cur.lastrowid
         # Index content for FTS
@@ -490,6 +495,17 @@ class CrucibleDB:
                       distill_model = ?, abstract = ?, updated_at = datetime('now')
                WHERE id = ?""",
             (title, article_type, status, distill_model, abstract, article_id),
+        )
+        self.conn.commit()
+
+    def set_article_dates(self, article_id: int, created_at: str | None = None,
+                          updated_at: str | None = None):
+        """Set an article's timestamps; a None argument leaves that one as is."""
+        self.conn.execute(
+            """UPDATE articles SET created_at = COALESCE(?, created_at),
+                                   updated_at = COALESCE(?, updated_at)
+               WHERE id = ?""",
+            (created_at, updated_at, article_id),
         )
         self.conn.commit()
 
