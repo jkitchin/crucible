@@ -103,3 +103,54 @@ def test_urls_containing_cite_render_as_links():
     _, body, _ = org_to_html("* A\nSee [[https://example.com/cite:foo][a link]].\n")
     assert '<a href="https://example.com/cite:foo" target="_blank">a link</a>' in body
     assert "\x01" not in body
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "#+begin_src emacs-lisp\n(insert \"cite:&inside [[file:a.org]]\")\n#+end_src\n",
+        "#+BEGIN_SRC python\ncite:&inside [[file:a.org]]\n#+END_SRC\n",
+        "  #+begin_example\n  cite:&inside [[file:a.org]]\n  #+end_example\n",
+        "#+begin_export html\ncite:&inside [[file:a.org]]\n#+end_export\n",
+        "Inline code ~cite:&inside~ is literal too.\n",
+    ],
+)
+def test_literal_blocks_hold_no_citations_or_links(text):
+    meta = parse_org("* A\n" + text + "Prose cites cite:&outside, see [[file:b.org]].\n")
+    assert meta.cite_keys == ["outside"]
+    assert meta.file_links == ["b.org"]
+
+
+@pytest.mark.parametrize("begin, end", [("#+begin_src", "#+end_src"),
+                                        ("  #+BEGIN_SRC", "  #+END_SRC")])
+def test_src_blocks_render_as_code_in_any_case(begin, end):
+    _, body, _ = org_to_html(f"* A\n{begin}\nfirst line cite:&k /x/\n{end}\n")
+    assert "<pre><code>" in body  # no language: the first line is code
+    assert "first line cite:&amp;k /x/" in body
+    assert "citation" not in body and "<em>" not in body
+
+
+@pytest.mark.parametrize(
+    "text, html",
+    [
+        ("see https://x.org/a/?q=b now",
+         'see <a href="https://x.org/a/?q=b" target="_blank">https://x.org/a/?q=b</a> now'),
+        ("end https://x.org/path/.",
+         'end <a href="https://x.org/path/" target="_blank">https://x.org/path/</a>.'),
+        ("(https://x.org/a/b), ok",
+         '(<a href="https://x.org/a/b" target="_blank">https://x.org/a/b</a>), ok'),
+        ("(see https://w.org/wiki/F_(b))",
+         '(see <a href="https://w.org/wiki/F_(b)" target="_blank">https://w.org/wiki/F_(b)</a>)'),
+        ("[[https://x.org/a/b]] ok",
+         '<a href="https://x.org/a/b" target="_blank">https://x.org/a/b</a> ok'),
+    ],
+)
+def test_bare_urls_render_as_links(text, html):
+    _, body, _ = org_to_html(f"* A\n{text}\n")
+    assert html in body
+    assert "<em>" not in body
+
+
+def test_italics_still_render_next_to_urls():
+    _, body, _ = org_to_html("* A\nSee https://x.org/a/b and /this/ word.\n")
+    assert "<em>this</em>" in body

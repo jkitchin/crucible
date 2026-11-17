@@ -95,17 +95,20 @@ _DRAWER_RE = re.compile(
     r"^\s*:PROPERTIES:\s*\n(.*?)\n\s*:END:\s*$", re.MULTILINE | re.DOTALL | re.IGNORECASE
 )
 _PROP_LINE_RE = re.compile(r"^\s*:([A-Za-z_]+):\s+(.+?)\s*$", re.MULTILINE)
+# Org block names are case-insensitive and blocks may be indented. The
+# language is matched with [ \t] so a src block with none does not take its
+# first code line as the language.
 _SRC_BLOCK_RE = re.compile(
-    r"^#\+BEGIN_SRC\s*(.*?)\s*\n(.*?)^#\+END_SRC\s*$",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*#\+BEGIN_SRC[ \t]*([^\n]*?)[ \t]*\n(.*?)^[ \t]*#\+END_SRC[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _EXAMPLE_BLOCK_RE = re.compile(
-    r"^#\+BEGIN_EXAMPLE\s*\n(.*?)^#\+END_EXAMPLE\s*$",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*#\+BEGIN_EXAMPLE[^\n]*\n(.*?)^[ \t]*#\+END_EXAMPLE[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _QUOTE_BLOCK_RE = re.compile(
-    r"^#\+BEGIN_QUOTE\s*\n(.*?)^#\+END_QUOTE\s*$",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*#\+BEGIN_QUOTE[^\n]*\n(.*?)^[ \t]*#\+END_QUOTE[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _HEADING_RE = re.compile(r"^(\*{1,4})\s+(.+)$", re.MULTILINE)
 _TABLE_BLOCK_RE = re.compile(r"((?:^\|.*$\n?)+)", re.MULTILINE)
@@ -117,6 +120,11 @@ _FILE_LINK_RE = re.compile(
 _PLAIN_LINK_RE = re.compile(
     r"\[\[([^\]]+)\]\[([^\]]*)\]\]"
 )
+# An external link with no description: [[https://example.com]].
+_BARE_LINK_RE = re.compile(r"\[\[(https?://[^\]]+)\]\]")
+# A bare URL in prose. Trailing sentence punctuation is not part of it; a
+# trailing ')' is, only when it closes a '(' in the URL (see _bare_url).
+_URL_RE = re.compile(r"(?<![\w\"'=/])https?://[^\s<>\[\]\"']*[^\s<>\[\]\"'.,;:!?]")
 _BOLD_RE = re.compile(r"(?<![a-zA-Z0-9])\*([^\s*](?:.*?[^\s*])?)\*(?![a-zA-Z0-9])")
 _ITALIC_RE = re.compile(r"(?<![a-zA-Z0-9])/([^\s/](?:.*?[^\s/])?)/(?![a-zA-Z0-9])")
 _CODE_RE = re.compile(r"(?<![a-zA-Z0-9])~([^\s~](?:.*?[^\s~])?)~(?![a-zA-Z0-9])")
@@ -145,12 +153,27 @@ def _rewrite_file_link(match: re.Match, current_path: str) -> str:
     return f'<a href="{html.escape(url)}">{display}</a>'
 
 
+def _external_link(url: str, display: str | None = None) -> str:
+    """An HTML link to an external URL; display is already-escaped HTML."""
+    if display is None:
+        display = html.escape(url)
+    return f'<a href="{html.escape(url)}" target="_blank">{display}</a>'
+
+
+def _bare_url(url: str, hold) -> str:
+    """Link a bare URL, leaving unbalanced closing parentheses outside it."""
+    trailing = ""
+    while url.endswith(")") and url.count(")") > url.count("("):
+        url, trailing = url[:-1], ")" + trailing
+    return hold(_external_link(url)) + trailing
+
+
 def _rewrite_plain_link(match: re.Match) -> str:
     """Rewrite [[target][text]] non-file links."""
     target = match.group(1).strip()
     display = html.escape(match.group(2) or target)
     if target.startswith(("http://", "https://")):
-        return f'<a href="{html.escape(target)}" target="_blank">{display}</a>'
+        return _external_link(target, display)
     return f'<span class="link-unknown" title="{html.escape(target)}">{display}</span>'
 
 
@@ -208,6 +231,11 @@ def _process_inline(text: str, current_path: str,
 
     # Plain links
     text = _PLAIN_LINK_RE.sub(lambda m: _hold(_rewrite_plain_link(m)), text)
+
+    # External links without a description, then bare URLs. Held as
+    # placeholders so the italic pattern cannot match the slashes in them.
+    text = _BARE_LINK_RE.sub(lambda m: _hold(_external_link(m.group(1))), text)
+    text = _URL_RE.sub(lambda m: _bare_url(m.group(0), _hold), text)
 
     # LaTeX (before other inline markup to avoid conflicts)
     text = _LATEX_DISPLAY_RE.sub(

@@ -48,14 +48,22 @@ _CITE_TYPE = (
 # '.' or ':', so sentence punctuation after a bare citation is not captured.
 _CITE_KEY = r"[\w+/-](?:[\w:.+/-]*[\w+/-])?"
 # A bare citation must not follow a word character (so "excite:" is not one),
-# '[' (bracketed form), or URL and verbatim delimiters (so
-# https://example.com/cite:foo and =cite:x= are not citations).
+# '[' (bracketed form), or URL, verbatim and code delimiters (so
+# https://example.com/cite:foo, =cite:x= and ~cite:x~ are not citations).
 CITATION_RE = re.compile(
     rf"\[\[(?P<btype>{_CITE_TYPE}):(?P<bbody>[^\]]+)\](?:\[[^\]]*\])?\]"
-    rf"|(?<![\w\[/=?&#])(?P<type>{_CITE_TYPE}):"
+    rf"|(?<![\w\[/=~?&#])(?P<type>{_CITE_TYPE}):"
     rf"(?P<body>&?{_CITE_KEY}(?:[;,]\s*&{_CITE_KEY}|[;,]{_CITE_KEY})*)"
 )
 _V3_KEY_RE = re.compile(rf"&({_CITE_KEY})")
+
+# Blocks whose contents are literal text, not prose: citations and links
+# written inside them are examples, not references. Org block names are
+# case-insensitive and blocks may be indented.
+_LITERAL_BLOCK_RE = re.compile(
+    r"^[ \t]*#\+begin_(src|example|export)\b.*?^[ \t]*#\+end_\1[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
 
 
 def citation_type(m: re.Match) -> str:
@@ -96,13 +104,16 @@ def parse_org(text: str) -> OrgMetadata:
             if key not in meta.properties:
                 meta.properties[key] = val
 
+    # Links and citations come from prose only, not literal blocks.
+    prose = _LITERAL_BLOCK_RE.sub("", text)
+
     # File links
-    for m in FILE_LINK_RE.finditer(text):
+    for m in FILE_LINK_RE.finditer(prose):
         target = m.group(1).strip()
         meta.file_links.append(target)
 
     # Citation keys
-    for m in CITATION_RE.finditer(text):
+    for m in CITATION_RE.finditer(prose):
         meta.cite_keys.extend(citation_keys(m))
 
     return meta
