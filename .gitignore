@@ -17,3 +17,6 @@ __pycache__/
 dist/
 build/
 .venv/
+
+# Built documentation site (docs/site/build.sh)
+_site/
