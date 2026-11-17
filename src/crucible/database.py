@@ -6,6 +6,8 @@ search support (F32_BLOB, vector_distance_cos, libsql_vector_idx).
 """
 
 import json
+import re
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
@@ -15,12 +17,18 @@ import libsql
 def _concept_key(name: str) -> str:
     """Normalize a concept name, slug or title for comparison.
 
-    Case and punctuation are ignored, so the tag ``activation_energy``, the
-    slug ``activation-energy`` and the title "Activation Energy" agree.
-    Letters and digits of any script are kept, so a non-ASCII concept such
-    as ``触媒`` has a key of its own rather than an empty one.
+    Case, whitespace, underscores, dashes (any kind) and apostrophes are
+    ignored, so the tag ``activation_energy``, the slug
+    ``activation-energy`` and the title "Activation Energy" agree. Other
+    punctuation is kept, so ``c``, ``c++`` and ``c#`` stay distinct. Letters
+    of any script are kept, so a non-ASCII concept such as ``触媒`` has a
+    key of its own rather than an empty one.
     """
-    return "".join(ch for ch in name.casefold() if ch.isalnum())
+    return "".join(
+        ch for ch in name.casefold()
+        if not (ch.isspace() or ch in "_'\u2019"
+                or unicodedata.category(ch) == "Pd")
+    )
 
 
 class DictCursor:
@@ -184,21 +192,106 @@ CREATE INDEX IF NOT EXISTS idx_article_links_to ON article_links(to_id);
 """
 
 
+def _fts_literal(token: str) -> str:
+    """An FTS5 string literal for token (double quotes doubled)."""
+    return '"' + token.replace('"', '""') + '"'
+
+
 def _fts_query(raw: str) -> str:
     """Turn a raw user query into a safe FTS5 MATCH expression.
 
     Each whitespace-separated token is wrapped as a quoted string literal so
-    FTS5 query operators in user input (-, :, *, parentheses, the bare keywords
+    FTS5 query operators in user input (-, :, parentheses, the bare keywords
     AND/OR/NOT/NEAR) are treated as ordinary text rather than crashing the
-    parser. Returns "" when the query has no usable tokens, in which case
-    callers should skip the search and return no results.
+    parser. A token ending in * is a prefix query (catal* matches catalysis).
+    The porter tokenizer stems the prefix like any other word ("cataly"
+    becomes "catali", which misses the indexed "catalysi"; "cats" becomes
+    "cat"), so the query also takes the prefix one letter shorter. That
+    over-matches (cats* would find catalysis), so callers run it through
+    fts_rows, which keeps only rows that really contain a word starting
+    with each prefix.
+
+    The match is limited to the title and content columns: the path column
+    holds ".crucible/wiki/concepts/x.org", whose words would otherwise match
+    every article. A column filter rather than an UNINDEXED schema keeps
+    this working against peers whose index predates the change.
+
+    Returns "" when the query has no usable tokens, in which case callers
+    should skip the search and return no results.
     """
     # Drop NUL and other control characters first: a NUL terminates the string
     # at the SQLite C layer ("unterminated string"), and other control chars
     # contribute nothing to a text search. Tab/newline/CR are left for split().
     cleaned = "".join(ch for ch in raw if ch >= " " or ch in "\t\n\r")
-    tokens = cleaned.split()
-    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+    terms = []
+    for token in cleaned.split():
+        stem = token.rstrip("*")
+        if not stem:
+            continue  # a bare "*" means nothing
+        if stem == token:
+            terms.append(_fts_literal(token))
+        elif len(stem) > 3:
+            terms.append(f"({_fts_literal(stem)}* OR {_fts_literal(stem[:-1])}*)")
+        else:
+            terms.append(f"{_fts_literal(stem)}*")
+    if not terms:
+        return ""
+    # Explicit AND: FTS5 allows implicit AND only between plain phrases.
+    return "{title content} : (" + " AND ".join(terms) + ")"
+
+
+def _fold(text: str) -> str:
+    """Casefolded text without diacritics, as unicode61 compares words."""
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def _fts_prefix_res(raw: str) -> list[re.Pattern]:
+    """For each prefix token (catal*) in a query, a pattern for a word starting with it."""
+    cleaned = "".join(ch for ch in raw if ch >= " " or ch in "\t\n\r")
+    patterns = []
+    for token in cleaned.split():
+        stem = token.rstrip("*")
+        if stem and stem != token:
+            # A word starts after anything that is not a letter or digit
+            # (unicode61 splits words there, underscores included).
+            patterns.append(re.compile(r"(?<![^\W_])" + re.escape(_fold(stem))))
+    return patterns
+
+
+def fts_rows(conn, query: str, limit: int) -> list[dict]:
+    """Rows of articles matching a raw search query, best first, at most limit.
+
+    Each row is an article with its FTS rank. A prefix token is matched
+    exactly: the FTS query for it is broader than the prefix (see
+    _fts_query), so rows are kept only when their title or content has a
+    word that starts with it.
+    """
+    match = _fts_query(query)
+    if not match:
+        return []
+    prefixes = _fts_prefix_res(query)
+    sql = """
+        SELECT a.*, rank, fts.title AS _fts_title, fts.content AS _fts_content
+        FROM article_fts fts
+        JOIN articles a ON a.id = fts.rowid
+        WHERE article_fts MATCH ?
+        ORDER BY rank
+    """
+    # Without prefixes the FTS match is exact, so SQL can stop at limit.
+    params: tuple = (match,)
+    if not prefixes:
+        sql += " LIMIT ?"
+        params = (match, limit)
+    rows = []
+    for row in conn.execute(sql, params):
+        r = dict(row)
+        text = _fold(f"{r.pop('_fts_title') or ''}\n{r.pop('_fts_content') or ''}")
+        if all(p.search(text) for p in prefixes):
+            rows.append(r)
+            if len(rows) >= limit:
+                break
+    return rows
 
 
 class CrucibleDB:
@@ -314,18 +407,9 @@ class CrucibleDB:
             name = peer["name"]
 
             def do_search(conn, _name=name):
-                rows = []
-                for row in conn.execute("""
-                    SELECT a.*, rank
-                    FROM article_fts fts
-                    JOIN articles a ON a.id = fts.rowid
-                    WHERE article_fts MATCH ?
-                    ORDER BY rank
-                    LIMIT ?
-                """, (match, limit)):
-                    r = dict(row)
+                rows = fts_rows(conn, query, limit)
+                for r in rows:
                     r["_crucible"] = _name
-                    rows.append(r)
                 return rows
 
             results.extend(self._query_peer(peer_db, do_search))
@@ -558,6 +642,7 @@ class CrucibleDB:
 
     def add_concept(self, name: str, aliases: list[str] | None = None) -> int:
         # Atomic upsert: insert-if-missing, then select. Safe under concurrency.
+        self._concept_key_cache = None
         self.conn.execute(
             "INSERT OR IGNORE INTO concepts (name, aliases) VALUES (?, ?)",
             (name, json.dumps(aliases or [])),
@@ -593,26 +678,53 @@ class CrucibleDB:
         )
         self.conn.commit()
 
-    def add_article_link(self, from_id: int, to_id: int, context: str | None = None):
+    def add_article_link(self, from_id: int, to_id: int, context: str | None = None) -> bool:
+        """Record a link; returns whether it was new (not a duplicate)."""
         self.conn.execute(
             "INSERT OR IGNORE INTO article_links (from_id, to_id, context) VALUES (?, ?, ?)",
             (from_id, to_id, context),
         )
+        inserted = self.conn.execute("SELECT changes() AS n").fetchone()["n"] > 0
+        self.conn.commit()
+        return inserted
+
+    def set_derivations(self, derived_id: int, source_ids):
+        """Make derived_id's derivations exactly source_ids.
+
+        Rows that are still wanted are kept, so derived_at stays the time
+        each derivation first appeared; new ones are added and the rest
+        removed.
+        """
+        wanted = set(source_ids)
+        current = {r["source_id"] for r in self.conn.execute(
+            "SELECT source_id FROM article_derivations WHERE derived_id = ?",
+            (derived_id,),
+        )}
+        for sid in current - wanted:
+            self.conn.execute(
+                "DELETE FROM article_derivations WHERE derived_id = ? AND source_id = ?",
+                (derived_id, sid),
+            )
+        for sid in sorted(wanted - current):
+            self.conn.execute(
+                "INSERT OR IGNORE INTO article_derivations (derived_id, source_id) VALUES (?, ?)",
+                (derived_id, sid),
+            )
         self.conn.commit()
 
     def clear_article_relations(self, article_id: int):
         """Drop the relations sync derives from an article's own file.
 
-        Removes its concept tags, outgoing links, source links and
-        derivations so sync can re-add them from the file's current
-        contents. Incoming links belong to the articles they come from and
-        are left alone.
+        Removes its concept tags, outgoing links and source links so sync
+        can re-add them from the file's current contents. Incoming links
+        belong to the articles they come from and are left alone.
+        Derivations are not cleared: sync updates them with
+        set_derivations, which keeps each one's derived_at.
         """
         for sql in (
             "DELETE FROM article_concepts WHERE article_id = ?",
             "DELETE FROM article_links WHERE from_id = ?",
             "DELETE FROM article_sources WHERE article_id = ?",
-            "DELETE FROM article_derivations WHERE derived_id = ?",
         ):
             self.conn.execute(sql, (article_id,))
         self.conn.commit()
@@ -626,6 +738,7 @@ class CrucibleDB:
         """
         # NOT EXISTS, not NOT IN: a single NULL concept_id would make
         # NOT IN match nothing and silently skip the prune.
+        self._concept_key_cache = None
         self.conn.execute(
             "DELETE FROM concepts WHERE NOT EXISTS ("
             "SELECT 1 FROM article_concepts ac WHERE ac.concept_id = concepts.id)"
@@ -636,17 +749,7 @@ class CrucibleDB:
 
     def search(self, query: str, limit: int = 20) -> list[dict]:
         """Full-text search over article content."""
-        match = _fts_query(query)
-        if not match:
-            return []
-        return [dict(r) for r in self.conn.execute("""
-            SELECT a.*, rank
-            FROM article_fts fts
-            JOIN articles a ON a.id = fts.rowid
-            WHERE article_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-        """, (match, limit))]
+        return fts_rows(self.conn, query, limit)
 
     def backlinks(self, article_path: str) -> list[dict]:
         """Articles that link TO the given article."""
@@ -684,15 +787,45 @@ class CrucibleDB:
         """, (article_path,))]
 
     def concept_articles(self, concept_name: str) -> list[dict]:
-        """Articles covering a given concept."""
-        return [dict(r) for r in self.conn.execute("""
-            SELECT a.*
+        """Articles covering a given concept.
+
+        The name is matched by _concept_key, ignoring case and punctuation,
+        so "activation energy" finds the tag ``activation_energy``. An
+        article tagged with several spellings of the concept appears once.
+        """
+        key = _concept_key(concept_name)
+        if not key:
+            return []
+        ids = self._concept_ids_by_key().get(key)
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        return [dict(r) for r in self.conn.execute(f"""
+            SELECT DISTINCT a.*
             FROM article_concepts ac
             JOIN articles a ON a.id = ac.article_id
-            JOIN concepts c ON c.id = ac.concept_id
-            WHERE c.name = ?
+            WHERE ac.concept_id IN ({marks})
             ORDER BY a.title
-        """, (concept_name.lower(),))]
+        """, tuple(ids))]
+
+    def _concept_ids_by_key(self) -> dict[str, list[int]]:
+        """Concept ids grouped by _concept_key, cached until concepts change.
+
+        Callers such as suggest look up many concepts in a row, and
+        normalising every name on each lookup made that quadratic. This
+        connection's own concept writes clear the cache, and PRAGMA
+        data_version changes whenever another connection commits.
+        """
+        version = self.conn.execute("PRAGMA data_version").fetchone()
+        stamp = tuple(version.values()) if isinstance(version, dict) else tuple(version)
+        cached = getattr(self, "_concept_key_cache", None)
+        if cached is None or cached[0] != stamp:
+            by_key: dict[str, list[int]] = {}
+            for r in self.conn.execute("SELECT id, name FROM concepts"):
+                by_key.setdefault(_concept_key(r["name"]), []).append(r["id"])
+            cached = (stamp, by_key)
+            self._concept_key_cache = cached
+        return cached[1]
 
     def orphans(self) -> list[dict]:
         """Articles with no incoming links."""

@@ -70,27 +70,19 @@ def _read_registry(strict: bool = False) -> dict:
     raised, so the next write cannot erase its entries. Readers
     (``strict=False``) get the entries that are usable.
     """
-    empty = {"version": 1, "instances": {}}
-    if not REGISTRY_PATH.exists():
-        return empty
-    problem = None
-    try:
-        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
-    except (ValueError, OSError) as e:
-        problem, data = f"cannot be parsed ({e})", None
-    if problem is None:
-        if not isinstance(data, dict):
-            problem = "is not a JSON object"
-        elif not isinstance(data.setdefault("instances", {}), dict):
-            problem = "has an 'instances' value that is not an object"
-        else:
-            bad = [k for k, v in data["instances"].items() if not _valid_entry(v)]
-            if bad:
-                problem = f"has entries without a path: {', '.join(sorted(bad))}"
+    data, problem = _load()
     if problem is None:
         return data
     if strict:
-        backup = _backup_corrupt(problem)
+        try:
+            backup = _backup_corrupt(problem)
+        except OSError:
+            # A file that cannot even be read (mode 000, a directory in its
+            # place) cannot be copied aside either; it is left as it is.
+            raise RegistryError(
+                f"The registry {REGISTRY_PATH} {problem}. It was left unchanged; "
+                "fix or remove it, then retry."
+            ) from None
         raise RegistryError(
             f"The registry {REGISTRY_PATH} {problem}. It was left unchanged "
             f"(a copy is at {backup}); fix or remove it, then retry."
@@ -100,7 +92,44 @@ def _read_registry(strict: bool = False) -> dict:
             k: v for k, v in data["instances"].items() if _valid_entry(v)
         }
         return data
-    return empty
+    return {"version": 1, "instances": {}}
+
+
+def problem() -> str | None:
+    """Why the registry file cannot be used as it is, or None if it can.
+
+    Lets readers such as ``registry list`` report a damaged or unreadable
+    registry instead of presenting it as empty.
+    """
+    _, found = _load()
+    return f"The registry {REGISTRY_PATH} {found}." if found else None
+
+
+def _load() -> tuple[dict | None, str | None]:
+    """Read and check the registry: (data, None), or (data or None, problem)."""
+    empty = {"version": 1, "instances": {}}
+    try:
+        if not REGISTRY_PATH.exists():
+            return empty, None
+    except OSError as e:
+        return None, f"cannot be read ({e})"
+    problem = None
+    try:
+        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+    except ValueError as e:
+        problem, data = f"cannot be parsed ({e})", None
+    except OSError as e:
+        problem, data = f"cannot be read ({e})", None
+    if problem is None:
+        if not isinstance(data, dict):
+            problem = "is not a JSON object"
+        elif not isinstance(data.setdefault("instances", {}), dict):
+            problem = "has an 'instances' value that is not an object"
+        else:
+            bad = [k for k, v in data["instances"].items() if not _valid_entry(v)]
+            if bad:
+                problem = f"has entries without a path: {', '.join(sorted(bad))}"
+    return data, problem
 
 
 def _write_registry(data: dict) -> None:
@@ -186,6 +215,11 @@ def register_or_warn(name: str, path: str, warn) -> str | None:
         return register(name, path)
     except RegistryError as e:
         warn(f"Warning: not registered globally. {e}")
+        return None
+    except OSError as e:
+        # The registry directory or its lock cannot be created or written.
+        warn(f"Warning: not registered globally. The registry at {REGISTRY_PATH} "
+             f"cannot be written ({e}).")
         return None
 
 

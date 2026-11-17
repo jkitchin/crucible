@@ -48,7 +48,8 @@ def incoming(project, tmp_path, monkeypatch):  # noqa: F811
     """A crucible with a source, a bib entry and two articles, one colliding."""
     source = _ingest_into_new_crucible(tmp_path, monkeypatch, "source", "Imported.\n")
     wiki = source / ".crucible/wiki/concepts"
-    (wiki / "activation-energy.org").write_text(CONCEPT)
+    # Differs from the target's copy, so it is renamed rather than skipped.
+    (wiki / "activation-energy.org").write_text(CONCEPT + "\nIncoming version.\n")
     (wiki / "activation-energy_1.org").write_text(CONCEPT.replace("Activation", "Other"))
     (wiki / "linking.org").write_text(LINKING)
     (source / ".crucible/sources/data/new-dir").mkdir()

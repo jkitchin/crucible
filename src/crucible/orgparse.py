@@ -33,8 +33,13 @@ PROP_DRAWER_RE = re.compile(
     re.DOTALL | re.IGNORECASE | re.MULTILINE,
 )
 # [ \t], not \s: \s matches a newline, so an empty property would take
-# the next property line as its value.
-PROP_LINE_RE = re.compile(r"^[ \t]*:([A-Za-z_]+):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+# the next property line as its value. A property name is any run of
+# characters other than whitespace and ':' (so ID2 counts), and a trailing
+# '+' (:SOURCE_KEYS+: b) appends to the value, as in org. Group 1 is the
+# name, group 2 the '+' if present, group 3 the value.
+PROP_LINE_RE = re.compile(
+    r"^[ \t]*:([^\s:]+?)(\+)?:(?:[ \t]+(.*?))?[ \t]*$", re.MULTILINE
+)
 # File links: [[file:path]], plus the prefix-less forms org also reads as
 # file links: paths starting with ./ ../ / or ~/, and bare names ending in
 # .org (which contain no ':', so other link types such as id:, https: and
@@ -78,6 +83,42 @@ _LITERAL_BLOCK_RE = re.compile(
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 
+# Text org does not treat as live content, so links and citations in it
+# are not references: comment blocks, comment lines ('# ...'), fixed-width
+# lines (': ...'), COMMENT subtrees, and inline verbatim (=...=) and code
+# (~...~). Keywords (#+TITLE:) and drawer lines (:END:) are neither
+# comments nor fixed-width: those need a space or end of line after the
+# '#' or ':'.
+_COMMENT_BLOCK_RE = re.compile(
+    r"^[ \t]*#\+begin_comment\b.*?^[ \t]*#\+end_comment[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+_COMMENT_OR_FIXED_LINE_RE = re.compile(r"^[ \t]*[#:](?:[ \t].*)?$", re.MULTILINE)
+_COMMENT_HEADING_RE = re.compile(
+    r"^(\*+)[ \t]+(?:(?:TODO|DONE)[ \t]+)?(?:\[#\w\][ \t]+)?COMMENT(?:[ \t].*)?$",
+    re.MULTILINE,
+)
+# Org's emphasis rules: the marker follows the start of a line, whitespace
+# or one of -('"{, the contents neither start nor end with whitespace, and
+# the closing marker is followed by whitespace, punctuation or end of line.
+_VERBATIM_RE = re.compile(
+    r"(?:^|(?<=[\s\-('\"{]))([=~])(?=\S)[^\n]*?(?<=\S)\1"
+    r"(?=[\s\-.,;:!?')}\"\\\[]|$)",
+    re.MULTILINE,
+)
+
+
+# Any drawer (:PROPERTIES:, :LOGBOOK:, ...) up to its :END: line. Like org,
+# a drawer cannot span a heading, so a stray ":note:" line followed later by
+# some other drawer's :END: does not swallow the prose between them. Shared
+# by browse and embeddings.embedding_text.
+DRAWER_RE = re.compile(
+    r"^[ \t]*:(?!END:)([A-Za-z][\w-]*):[ \t]*\n"
+    r"((?:(?![ \t]*:END:[ \t]*$)(?!\*+[ \t]).*\n)*?)"
+    r"[ \t]*:END:[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
 
 def citation_type(m: re.Match) -> str:
     """The link type (cite, citep, ...) of a CITATION_RE match."""
@@ -106,9 +147,39 @@ def _article_property_sections(prose: str) -> list[str]:
     return sections
 
 
+def _strip_comment_subtrees(text: str) -> str:
+    """Remove each COMMENT heading and its subtree."""
+    while True:
+        m = _COMMENT_HEADING_RE.search(text)
+        if not m:
+            return text
+        level = len(m.group(1))
+        end = len(text)
+        for h in _HEADING_RE.finditer(text, m.end()):
+            if h.end() - h.start() - 1 <= level:
+                end = h.start()
+                break
+        text = text[:m.start()] + text[end:]
+
+
+def live_text(text: str) -> str:
+    """The parts of org text whose links and citations are references.
+
+    Drops literal blocks, comment blocks, COMMENT subtrees, comment and
+    fixed-width lines, and inline verbatim and code.
+    """
+    text = _LITERAL_BLOCK_RE.sub("", text)
+    text = _COMMENT_BLOCK_RE.sub("", text)
+    text = _strip_comment_subtrees(text)
+    text = _COMMENT_OR_FIXED_LINE_RE.sub("", text)
+    return _VERBATIM_RE.sub(" ", text)
+
+
 def parse_org(text: str) -> OrgMetadata:
     """Parse org-mode text and extract metadata."""
     meta = OrgMetadata(content=text)
+    # A UTF-8 byte order mark would hide a keyword on the first line.
+    text = text.removeprefix("﻿")
 
     # Literal blocks hold examples, not this article's metadata, links or
     # citations, so everything is read from the prose around them.
@@ -119,32 +190,40 @@ def parse_org(text: str) -> OrgMetadata:
     if m:
         meta.title = m.group(1).strip()
 
-    # Filetags
-    m = FILETAGS_RE.search(prose)
-    if m:
-        raw = m.group(1).strip()
-        meta.filetags = [t for t in raw.strip(":").split(":") if t]
+    # Filetags: org accumulates every #+FILETAGS: line.
+    for m in FILETAGS_RE.finditer(prose):
+        for tag in m.group(1).strip().strip(":").split(":"):
+            if tag and tag not in meta.filetags:
+                meta.filetags.append(tag)
 
     # Properties come from the file-level drawer (before the first heading,
     # where org-id and org-roam put :ID:) and the first heading's drawer,
-    # first value winning. Drawers on later headings describe those
-    # sections, not the article.
+    # first value winning; :KEY+: appends to the value, as in org. Drawers
+    # on later headings describe those sections, not the article.
     for section in _article_property_sections(prose):
         drawer = PROP_DRAWER_RE.search(section)
         if not drawer:
             continue
         for m in PROP_LINE_RE.finditer(drawer.group(1)):
             key = m.group(1).upper()
-            if key not in meta.properties:
-                meta.properties[key] = m.group(2).strip()
+            value = (m.group(3) or "").strip()
+            if m.group(2):
+                old = meta.properties.get(key, "")
+                meta.properties[key] = f"{old} {value}".strip()
+            elif key not in meta.properties:
+                meta.properties[key] = value
+
+    # Links and citations count only in live text: not in comments,
+    # fixed-width lines or inline verbatim and code.
+    live = live_text(text)
 
     # File links
-    for m in FILE_LINK_RE.finditer(prose):
+    for m in FILE_LINK_RE.finditer(live):
         target = m.group(1).strip()
         meta.file_links.append(target)
 
     # Citation keys
-    for m in CITATION_RE.finditer(prose):
+    for m in CITATION_RE.finditer(live):
         meta.cite_keys.extend(citation_keys(m))
 
     return meta

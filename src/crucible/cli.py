@@ -14,12 +14,13 @@ from typing import NoReturn
 
 import click
 
-from crucible import DISTRIBUTION, package_version
+from crucible import package_version
 from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
+from crucible.viz import _VIZ_TEMPLATE, _script_json, viz_html  # noqa: F401
 
 
 CRUCIBLE_DIR = ".crucible"
@@ -192,6 +193,10 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     Symlinked directories are followed (a wiki kept in Dropbox is often
     linked in), each real directory once, so a symlink loop cannot recurse
     forever. Paths are returned under `wiki_dir` as spelled, not resolved.
+    A symlink to a directory inside the wiki is an alias of articles that
+    already have a path, so it is skipped: otherwise which spelling an
+    article got would depend on scan order. Entries are visited in name
+    order, so the result never depends on the order scandir returns them.
 
     Errors are raised rather than suppressed, so an incomplete scan can never
     be mistaken for deleted articles. That is why this walks with scandir:
@@ -199,6 +204,7 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     is an entry that vanishes during the scan, which really is gone.
     """
     index_path = wiki_dir / "index.org"
+    wiki_real = wiki_dir.resolve()
     org_files = []
     seen_dirs = set()
     pending = [wiki_dir]
@@ -214,9 +220,11 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
         seen_dirs.add(dir_key)
         try:
             with os.scandir(directory) as it:
-                entries = list(it)
+                entries = sorted(it, key=lambda e: e.name)
         except FileNotFoundError:
             continue
+        # Pushed in reverse so the stack visits directories in name order.
+        subdirs = []
         for entry in entries:
             path = Path(entry.path)
             try:
@@ -224,23 +232,26 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
                 if stat.S_ISLNK(mode):
                     # A dangling link, such as an Emacs `.#name.org` lock,
                     # or a link to itself is skipped; a link to a directory
-                    # is followed.
+                    # is followed, unless it points back into the wiki.
                     try:
                         mode = entry.stat(follow_symlinks=True).st_mode
                     except OSError as exc:
                         if isinstance(exc, FileNotFoundError) or exc.errno == errno.ELOOP:
                             continue
                         raise
+                    if stat.S_ISDIR(mode) and path.resolve().is_relative_to(wiki_real):
+                        continue
             except FileNotFoundError:
                 continue
             if stat.S_ISDIR(mode):
-                pending.append(path)
+                subdirs.append(path)
             elif (
                 entry.name.endswith(".org")
                 and path != index_path
                 and stat.S_ISREG(mode)
             ):
                 org_files.append(path)
+        pending.extend(reversed(subdirs))
     return sorted(org_files)
 
 
@@ -311,7 +322,9 @@ def _emit_json(data) -> None:
 
 
 @click.group()
-@click.version_option(package_name=DISTRIBUTION, prog_name="crucible")
+# version=, not package_name=: click raises RuntimeError when the
+# distribution metadata is missing, where package_version() says "dev".
+@click.version_option(version=package_version(), prog_name="crucible")
 @click.pass_context
 def cli(ctx):
     """Crucible - LLM-compiled knowledge base."""
@@ -380,8 +393,57 @@ def about(json_output):
 
     click.echo()
     click.echo("Help topics: overview, workflow, ingest, distill, search,")
-    click.echo("  sync, maintain, org-format, registry")
+    click.echo("  sync, maintain, org-format, registry, commands")
     click.echo("Run `crucible help <topic>` or `crucible help all`")
+
+
+# What a crucible project keeps out of git, as (comment, patterns) groups.
+_GITIGNORE_GROUPS = [
+    ("# Crucible: external sources (copyrighted, not shareable)",
+     [".crucible/sources/external/"]),
+    ("# Crucible: database (regenerable from wiki via auto-rebuild)",
+     [".crucible/crucible.db",
+      ".crucible/crucible.db-wal",
+      ".crucible/crucible.db-shm",
+      ".crucible/crucible.db-journal",
+      ".crucible/.crucible.db.rebuild-*.tmp"]),
+    ("# Crucible: lock file for references.bib",
+     [".crucible/references.bib.lock"]),
+    ("# Crucible: publish output",
+     [".crucible/wiki/_build/"]),
+    ("# Crucible: left behind only if a merge is killed",
+     [".crucible/.merge-staging-*/"]),
+]
+
+_GITIGNORE_MARKER = "# Crucible: entries added to an existing .gitignore"
+
+
+def _ensure_gitignore(root: Path) -> str | None:
+    """Make root/.gitignore ignore what crucible must keep out of git.
+
+    A missing .gitignore is created. An existing one keeps its contents and
+    gets any missing crucible patterns appended under a marker comment, so
+    copyrighted sources and the database are not committable in a repository
+    that already had a .gitignore. Idempotent. Returns a description of the
+    change for the "Created:" line, or None if nothing changed.
+    """
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        blocks = ["\n".join([comment, *patterns]) for comment, patterns in _GITIGNORE_GROUPS]
+        gitignore.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        return ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8", errors="replace")
+    present = {line.strip() for line in existing.splitlines()}
+    missing = [pattern for _comment, patterns in _GITIGNORE_GROUPS
+               for pattern in patterns if pattern not in present]
+    if not missing:
+        return None
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"\n{_GITIGNORE_MARKER}\n" + "\n".join(missing) + "\n"
+    gitignore.write_text(text, encoding="utf-8")
+    return f".gitignore (added {len(missing)} crucible entr{'y' if len(missing) == 1 else 'ies'})"
 
 
 @cli.command()
@@ -390,9 +452,11 @@ def about(json_output):
 def init(root):
     """Initialize a new crucible project.
 
-    Creates .crucible/ with the full directory structure, CLAUDE.md,
-    .gitignore, and the SQLite database. Everything lives inside
-    .crucible/ to keep the project directory clean.
+    Creates .crucible/ with the full directory structure, an empty
+    references.bib and the SQLite database, plus CLAUDE.md and .gitignore
+    (an existing .gitignore gets any missing crucible entries appended).
+    Registers the project, installs the skill and writes the manifest, but
+    leaves ~/.claude/CLAUDE.md alone (run `crucible install` for that).
 
     Safe to re-run on an existing project (creates only what's missing).
     """
@@ -423,30 +487,15 @@ def init(root):
     created = []
 
     # .gitignore at the project root
-    gitignore = root / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text(
-            "# Crucible: external sources (copyrighted, not shareable)\n"
-            ".crucible/sources/external/\n"
-            "\n"
-            "# Crucible: database (regenerable from wiki via auto-rebuild)\n"
-            ".crucible/crucible.db\n"
-            ".crucible/crucible.db-wal\n"
-            ".crucible/crucible.db-shm\n"
-            ".crucible/crucible.db-journal\n"
-            ".crucible/.crucible.db.rebuild-*.tmp\n"
-            "\n"
-            "# Crucible: lock file for references.bib\n"
-            ".crucible/references.bib.lock\n"
-            "\n"
-            "# Crucible: publish output\n"
-            ".crucible/wiki/_build/\n"
-            "\n"
-            "# Crucible: left behind only if a merge is killed\n"
-            ".crucible/.merge-staging-*/\n",
-            encoding="utf-8",
-        )
-        created.append(".gitignore")
+    gitignore_change = _ensure_gitignore(root)
+    if gitignore_change:
+        created.append(gitignore_change)
+
+    # An empty bibliography, so references.bib exists from the start
+    bib_path = cdir / "references.bib"
+    if not bib_path.exists():
+        bib_path.write_text("", encoding="utf-8")
+        created.append(".crucible/references.bib")
 
     # CLAUDE.md at project root
     claude_md = root / "CLAUDE.md"
@@ -500,8 +549,9 @@ def init(root):
         click.echo(f"  Registered in global registry as '{actual_name}'")
 
     # Install the skill and this project's manifest; the global CLAUDE.md
-    # directive is left to an explicit `crucible install`.
-    _install(root=root, directive=False)
+    # directive is left to an explicit `crucible install`. The project is
+    # registered above, so _install does not register (and report) it again.
+    _install(root=root, directive=False, register=False)
 
 
 @cli.command()
@@ -556,12 +606,14 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
         if not bib_path.exists():
             raise click.ClickException(f"BibTeX file not found: {bib_path}")
         bibtex = bib_path.read_text(encoding="utf-8")
-    if bibtex and bibtex.strip().startswith("@"):
+    if bibtex:
+        # Decided by whether an entry is found, not by a leading "@": an
+        # export may start with a comment such as "% Encoding: UTF-8".
         from crucible import bibtex as bibtex_mod
-        if bibtex_mod.first_entry(bibtex.strip()) is None:
+        if bibtex_mod.first_entry(bibtex) is None:
             raise click.ClickException(
-                "The --bibtex entry is not a complete BibTeX entry "
-                "(check that its braces are balanced)"
+                "The --bibtex value is not a complete BibTeX entry "
+                "(it holds no @type{key, ...} entry, or its braces are not balanced)"
             )
         if len(bibtex_mod.entries(bibtex)) > 1:
             raise click.ClickException(
@@ -629,6 +681,16 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
     else:
         # Check for glob pattern
         if "*" in source or "?" in source:
+            # These describe one source; applied to every matched file they
+            # would give them all the same title, entry or DOI.
+            per_file = [opt for opt, value in (
+                ("--title", title), ("--url", url), ("--doi", doi), ("--bibtex", bibtex),
+            ) if value]
+            if per_file:
+                raise click.UsageError(
+                    f"{', '.join(per_file)} describe a single source and cannot be "
+                    "used with a glob pattern; ingest those files one at a time"
+                )
             paths = sorted(globmod.glob(source, recursive=True))
             paths = [Path(p) for p in paths if Path(p).is_file()]
             if not paths:
@@ -640,8 +702,9 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, bibtex
                         root=root, db=db, source_path=p,
                         title=None, source_type=source_type, shareable=shareable,
                         url=None, date=date, authors=list(author) if author else None,
-                        doi=doi,
                     )
+                    for warning in result.get("warnings", ()):
+                        click.echo(f"  Warning: {p}: {warning}", err=True)
                     if result.get("duplicate"):
                         click.echo(f"  DUP  {result['title']} (identical to existing source, skipped)")
                     else:
@@ -742,6 +805,8 @@ def _print_ingest_result(result: dict):
         click.echo(f"  Stored: {result['relative_path']}")
         click.echo("  Skipped: no changes made.")
         return
+    for warning in result.get("warnings", ()):
+        click.echo(f"Warning: {warning}", err=True)
     click.echo(f"Ingested: {result['title']}")
     click.echo(f"  Source ID: {result['source_id']}")
     click.echo(f"  Cite key: {result['cite_key']}")
@@ -924,6 +989,38 @@ def _normalize_article_type(value: str | None) -> str:
     return (value or "").strip().lower() or "concept"
 
 
+ARTICLE_STATUSES = ("draft", "reviewed", "verified")
+
+
+def _normalize_status(value: str | None) -> str:
+    """A :STATUS: value as stored: lowercase, defaulting to draft."""
+    return (value or "").strip().lower() or "draft"
+
+
+def _utc_now() -> str:
+    """The current UTC time in SQLite's datetime('now') format."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _resolve_derived_from(db: CrucibleDB, root: Path, org_path: Path, ref: str) -> dict | None:
+    """The article a DERIVED_FROM entry names, or None.
+
+    Paths are relative to the article, or to the wiki directory
+    (optionally written with a leading wiki/).
+    """
+    article = _find_linked_article(db, root, _link_target_rel(root, org_path, ref))
+    if article is None and not Path(ref).is_absolute():
+        within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
+        article = _find_linked_article(
+            db, root,
+            _safe_relative_to(
+                Path(os.path.normpath(cdir(root) / "wiki" / within)), root
+            ),
+        )
+    return article
+
+
 def _report_unreadable(path: Path, exc: Exception) -> None:
     """Tell the user on stderr that an article could not be read."""
     if isinstance(exc, UnicodeDecodeError):
@@ -1006,7 +1103,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                 continue
             rel_path = str(org_path.relative_to(root))
             article_type = _normalize_article_type(meta.properties.get("ARTICLE_TYPE"))
-            status = meta.properties.get("STATUS") or "draft"
+            status = _normalize_status(meta.properties.get("STATUS"))
             # :CREATED: and :MODIFIED: make an article's dates part of its
             # file, so they survive a rebuild; without them sync time is used.
             # :MODIFIED: falls back to :CREATED:, by the same rule for new and
@@ -1049,6 +1146,17 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                 dates = {}
                 if created and existing["created_at"] != created:
                     dates["created_at"] = created
+                elif (created is None and changed and indexed
+                      and "CREATED" not in meta.properties
+                      and "MODIFIED" not in meta.properties):
+                    # The file's dates were removed: its creation date is
+                    # now sync time, as a rebuild would make it, rather
+                    # than the old property date. (An unreadable date is
+                    # left as it was; lint reports it.)
+                    from crucible.orgparse import parse_org
+                    old = parse_org(indexed["content"]).properties
+                    if _org_date(old.get("CREATED")) or _org_date(old.get("MODIFIED")):
+                        dates["created_at"] = _utc_now()
                 if modified and (changed or existing["updated_at"] != modified):
                     dates["updated_at"] = modified
                 if dates:
@@ -1105,8 +1213,10 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                 target_article = _find_linked_article(
                     db, root, _link_target_rel(root, org_path, link_target)
                 )
-                if target_article:
-                    db.add_article_link(article_id, target_article["id"])
+                # A link to a heading in the same file is not an edge in the
+                # wiki graph; a repeated link is stored once.
+                if (target_article and target_article["id"] != article_id
+                        and db.add_article_link(article_id, target_article["id"])):
                     stats["article_links"] += 1
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
@@ -1117,23 +1227,14 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                     for sid in source_ids:
                         db.link_article_source(article_id, sid)
 
-            # DERIVED_FROM paths are relative to the article, or to the wiki
-            # directory (optionally written with a leading wiki/).
-            wiki_rel = cdir(root) / "wiki"
+            # Existing derivations are kept, so derived_at records when each
+            # first appeared rather than the last sync.
+            derived = set()
             for ref in meta.properties.get("DERIVED_FROM", "").split():
-                source_article = _find_linked_article(
-                    db, root, _link_target_rel(root, org_path, ref)
-                )
-                if source_article is None and not Path(ref).is_absolute():
-                    within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
-                    source_article = _find_linked_article(
-                        db, root,
-                        _safe_relative_to(
-                            Path(os.path.normpath(wiki_rel / within)), root
-                        ),
-                    )
+                source_article = _resolve_derived_from(db, root, org_path, ref)
                 if source_article:
-                    db.add_derivation(article_id, source_article["id"])
+                    derived.add(source_article["id"])
+            db.set_derivations(article_id, derived)
 
         # Tags dropped from files, or deleted articles, can leave concepts
         # that no article uses any more.
@@ -1217,7 +1318,9 @@ def sync():
 
 
 @cli.command()
-@click.option("--model", "-m", default="nomic-embed-text", help="Ollama embedding model")
+@click.option("--model", "-m", default=None,
+              help="Ollama embedding model (default: the model of the stored"
+                   " embeddings, else nomic-embed-text)")
 @click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
               default="http://localhost:11434/api/embed", show_envvar=True,
               help="Ollama embed API URL")
@@ -1226,8 +1329,10 @@ def embed(model, url, force):
     """Generate embeddings for all wiki articles.
 
     Uses ollama to create vector embeddings for semantic search.
-    Only embeds articles that have no embedding from MODEL, so switching
-    models re-embeds everything with the new one. `crucible sync` drops
+    Without --model, the model of the stored embeddings is used (as
+    `crucible search` does), else nomic-embed-text. Only embeds articles
+    that have no embedding from that model, so switching models with
+    --model re-embeds everything with the new one. `crucible sync` drops
     the embedding of any article whose file changed, so edited articles
     are re-embedded here. The org header and drawers are stripped and the
     first 8000 characters of the rest are embedded.
@@ -1248,6 +1353,7 @@ def embed(model, url, force):
                 a["content"] = org_path.read_text(encoding="utf-8", errors="replace")
             articles.append(a)
 
+        model = idx.model  # resolved: --model, else the stored model
         click.echo(f"Embedding with {model}...")
         try:
             count = idx.embed_missing(articles, force=force)
@@ -1274,8 +1380,13 @@ def registry():
 @json_option
 def registry_list(json_output):
     """List all registered crucible instances."""
-    from crucible.registry import list_instances, resolve_db_path
+    from crucible.registry import list_instances, problem, resolve_db_path
     instances = list_instances()
+    trouble = problem()
+    if trouble and not instances:
+        raise click.ClickException(trouble)
+    if trouble:
+        _warn(f"Warning: {trouble} Only its usable entries are listed.")
     if json_output:
         for inst in instances:
             db_path = resolve_db_path(inst)
@@ -1382,7 +1493,9 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
       auto      Hybrid if embeddings exist, FTS otherwise (default).
                 Falls back to FTS with a warning if the embedding
                 service cannot be used.
-      fts       Keyword search only (FTS5 with porter stemming)
+      fts       Keyword search only (FTS5 with porter stemming) over
+                titles and text; a trailing * makes a word a prefix
+                (catal* matches catalysis)
       semantic  Vector similarity only (requires `crucible embed`)
       hybrid    Combines FTS + semantic with reciprocal rank fusion
     """
@@ -1477,35 +1590,74 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
             click.echo(f"    (absorbed: {', '.join(absorbed)})")
 
 
+def _project_path_candidates(root: Path, path: str) -> list[str]:
+    """Database paths (relative to the project root) that PATH may name.
+
+    In order: PATH as given (normalized), relative to the current
+    directory or absolute, relative to the wiki (``concepts/x.org``), and
+    relative to ``.crucible/`` (``wiki/concepts/x.org``,
+    ``sources/data/x.csv``). Raises a ClickException for an empty PATH,
+    which would otherwise match everything.
+    """
+    if not path or not path.strip():
+        raise click.ClickException("The path is empty.")
+    candidates: list[str] = []
+
+    def add(candidate: str | None) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(path)
+    given = Path(os.path.expanduser(path))
+    if not given.is_absolute():
+        add(os.path.normpath(given.as_posix()).replace(os.sep, "/"))
+    absolute = given if given.is_absolute() else Path.cwd() / given
+    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
+        for base in (root, root.resolve()):
+            rel = _safe_relative_to(target, base)
+            if rel is not None:
+                add(Path(rel).as_posix())
+    if not given.is_absolute():
+        for base in (Path(CRUCIBLE_DIR) / "wiki", Path(CRUCIBLE_DIR)):
+            normalized = os.path.normpath(base / given)
+            # Never let ../ climb out of the project.
+            if not normalized.startswith(".."):
+                add(Path(normalized).as_posix())
+    return candidates
+
+
+def _lookup_project_path(root: Path, path: str, lookup) -> dict | None:
+    """The row lookup(candidate) returns for the first candidate PATH names.
+
+    lookup is a database getter such as db.get_article_by_path or
+    db.get_source_by_path. See _project_path_candidates for the path forms
+    accepted. Returns None if no candidate matches.
+    """
+    for candidate in _project_path_candidates(root, path):
+        row = lookup(candidate)
+        if row:
+            return row
+    return None
+
+
 def _resolve_article_arg(root: Path, db: CrucibleDB, article_path: str) -> str:
     """Return the database path of the article that ARTICLE_PATH names.
 
     Database paths are relative to the project root
     (``.crucible/wiki/concepts/foo.org``). The argument may also be relative
     to the current directory (``./.crucible/...``, or ``foo.org`` from inside
-    the wiki), absolute, or relative to the wiki directory
-    (``concepts/foo.org``). Raises a ClickException (exit 1) if no article
-    has that path, so a typo is not mistaken for "no results".
+    the wiki), absolute, relative to the wiki directory
+    (``concepts/foo.org``), or relative to ``.crucible/``
+    (``wiki/concepts/foo.org``). Raises a ClickException (exit 1) if no
+    article has that path, so a typo is not mistaken for "no results".
     """
-    if db.get_article_by_path(article_path):
-        return article_path
-    candidates = []
-    given = Path(os.path.expanduser(article_path))
-    absolute = given if given.is_absolute() else Path.cwd() / given
-    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
-        for base in (root, root.resolve()):
-            rel = _safe_relative_to(target, base)
-            if rel is not None:
-                candidates.append(Path(rel).as_posix())
-    if not given.is_absolute():
-        candidates.append((Path(CRUCIBLE_DIR) / "wiki" / given).as_posix())
-    for candidate in candidates:
-        if db.get_article_by_path(candidate):
-            return candidate
+    article = _lookup_project_path(root, article_path, db.get_article_by_path)
+    if article:
+        return article["path"]
     raise click.ClickException(
         f"No article at {article_path} (paths are relative to the current "
-        "directory, the project root, or the wiki; run `crucible sync` if "
-        "the file is new)"
+        "directory, the project root, .crucible/ or the wiki; run "
+        "`crucible sync` if the file is new)"
     )
 
 
@@ -1520,7 +1672,8 @@ def history(article_path, json_output):
     Traces the evolution of knowledge over time.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -1561,7 +1714,8 @@ def backlinks(article_path, json_output):
     """Show articles that link to the given article.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -1584,6 +1738,18 @@ def backlinks(article_path, json_output):
             click.echo(f"    ...{r['context']}...")
 
 
+def _source_cite_key(src: dict) -> str | None:
+    """The cite key stored in a source row's metadata, if any."""
+    meta = src.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            return None
+    key = meta.get("cite_key") if isinstance(meta, dict) else None
+    return str(key) if key else None
+
+
 @cli.command("source")
 @click.argument("source_path")
 @json_option
@@ -1592,18 +1758,33 @@ def source_info(source_path, json_output):
 
     Displays the source metadata and all articles distilled from it.
     Useful for resummarization: see what's already been captured before
-    asking Claude to reread the source. Exits 1 if no source matches.
+    asking Claude to reread the source. SOURCE_PATH may be relative to the
+    current directory, the project root or .crucible/, or absolute; failing
+    that, it may be a cite key, or a fragment of exactly one source's path
+    or title. Exits 1 if no source matches, or if a fragment matches
+    several (they are listed).
     """
     root = get_root()
     db = get_db(root)
 
-    src = db.get_source_by_path(source_path)
-    if not src:
-        # Try matching by title or partial path
-        for s in db.list_sources():
-            if source_path in s["path"] or source_path in s["title"]:
-                src = s
-                break
+    # Exact path, then cite key, then a fragment that must match exactly
+    # one source (as for delete): never the first of several by row order.
+    try:
+        src = _lookup_project_path(root, source_path, db.get_source_by_path)
+        if not src:
+            src = _source_by_cite_key(db, source_path)
+        if not src:
+            found = [s for s in db.list_sources()
+                     if source_path in s["path"] or source_path in (s["title"] or "")]
+            if len(found) > 1:
+                lines = [f"  {s['path']} ({s['title']})" for s in found]
+                raise click.ClickException(
+                    f"'{source_path}' matches {len(found)} sources. Give the exact "
+                    "path or cite key of one:\n" + "\n".join(lines))
+            src = found[0] if found else None
+    except click.ClickException:
+        db.close()
+        raise
     if not src:
         db.close()
         raise click.ClickException(f"Source not found: {source_path}")
@@ -1616,6 +1797,8 @@ def source_info(source_path, json_output):
 
     click.echo(f"Source: {src['title']}")
     click.echo(f"  Path: {src['path']}")
+    if _source_cite_key(src):
+        click.echo(f"  Key: {_source_cite_key(src)}")
     click.echo(f"  Type: {src['source_type']} ({'shareable' if src.get('shareable') else 'external'})")
     click.echo(f"  Date: {src.get('date', 'unknown')}")
     click.echo(f"  Ingested: {src['ingested_at']}")
@@ -1641,7 +1824,8 @@ def sources(article_path, json_output):
     """Show primary sources for an article.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -1659,7 +1843,8 @@ def sources(article_path, json_output):
         click.echo("No sources linked.")
         return
     for r in results:
-        click.echo(f"  [{r['source_type']}] {r['title']}")
+        key = _source_cite_key(r)
+        click.echo(f"  [{r['source_type']}] {r['title']}" + (f" ({key})" if key else ""))
         if r.get("url"):
             click.echo(f"    {r['url']}")
 
@@ -1696,7 +1881,8 @@ def concepts(query_all, json_output):
 def concept(name, json_output):
     """Show articles covering a concept.
 
-    NAME is matched case-insensitively (sync lowercases FILETAGS).
+    NAME is matched ignoring case, spaces, underscores, dashes and
+    apostrophes, so "activation energy" finds the tag activation_energy.
     """
     root = get_root()
     db = get_db(root)
@@ -1758,7 +1944,8 @@ def related(article_path, json_output):
     temporal proximity, and explicit links.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -1801,75 +1988,12 @@ def graph(output):
 def _write_viz(root: Path, db: CrucibleDB,
                output: Path | None = None) -> tuple[Path, int, int]:
     """Write the knowledge-graph HTML; return (path, node count, edge count)."""
-    # Build graph data
-    nodes = []
-    node_ids = {}  # path -> index
-
-    # Article nodes
-    for a in db.list_articles():
-        idx = len(nodes)
-        node_ids[a["path"]] = idx
-        nodes.append({
-            "id": idx,
-            "label": a["title"],
-            "path": a["path"],
-            "type": a["article_type"],
-            "status": a.get("status", "draft"),
-            "group": a["article_type"],
-        })
-
-    # Concept nodes
-    for c in db.list_concepts():
-        idx = len(nodes)
-        node_ids[f"concept:{c['name']}"] = idx
-        nodes.append({
-            "id": idx,
-            "label": c["name"],
-            "type": "concept",
-            "group": "concept",
-        })
-
-    edges = []
-
-    # Article-to-article links
-    for link in db.all_article_links():
-        src = node_ids.get(link["from_path"])
-        tgt = node_ids.get(link["to_path"])
-        if src is not None and tgt is not None:
-            edges.append({"source": src, "target": tgt, "type": "link"})
-
-    # Article-to-concept links
-    by_concept = db.articles_by_concept()
-    for concept_name, articles in by_concept.items():
-        concept_key = f"concept:{concept_name}"
-        if concept_key not in node_ids:
-            continue
-        concept_idx = node_ids[concept_key]
-        for a in articles:
-            article_idx = node_ids.get(a["path"])
-            if article_idx is not None:
-                edges.append({"source": article_idx, "target": concept_idx,
-                              "type": "concept"})
-
-    # Derivation links
-    for a in db.list_articles():
-        for d in db.derivatives(a["path"]):
-            src = node_ids.get(a["path"])
-            tgt = node_ids.get(d["path"])
-            if src is not None and tgt is not None:
-                edges.append({"source": src, "target": tgt, "type": "derivation"})
-
-    graph_json = json.dumps({"nodes": nodes, "edges": edges})
-    root_path = json.dumps(str(root.resolve()))
-
-    html = _VIZ_TEMPLATE.replace("/*GRAPH_DATA*/", graph_json)
-    html = html.replace("/*ROOT_PATH*/", root_path)
-
+    html, n_nodes, n_edges = viz_html(root, db)
     if output is None:
         output = cdir(root) / "wiki" / "viz.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html, encoding="utf-8")
-    return output, len(nodes), len(edges)
+    return output, n_nodes, n_edges
 
 
 @cli.command()
@@ -1896,148 +2020,6 @@ def viz(output, open_browser):
         webbrowser.open(f"file://{output.resolve()}")
 
 
-_VIZ_TEMPLATE = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Crucible Knowledge Graph</title>
-<style>
-  body { margin: 0; background: #1a1a2e; font-family: system-ui, sans-serif; }
-  svg { width: 100vw; height: 100vh; }
-  .node text { font-size: 11px; pointer-events: none; }
-  .link { stroke-opacity: 0.4; }
-  .link.link-type-link { stroke: #888; }
-  .link.link-type-concept { stroke: #444; stroke-dasharray: 3,3; }
-  .link.link-type-derivation { stroke: #e94560; }
-  #tooltip {
-    position: absolute; padding: 8px 12px; background: #16213e;
-    color: #eee; border-radius: 6px; font-size: 13px;
-    pointer-events: none; display: none; max-width: 300px;
-    border: 1px solid #0f3460;
-  }
-  #legend {
-    position: absolute; top: 12px; left: 12px; background: #16213e;
-    color: #eee; padding: 12px; border-radius: 6px; font-size: 12px;
-    border: 1px solid #0f3460;
-  }
-  #legend div { margin: 4px 0; }
-  #legend span { display: inline-block; width: 12px; height: 12px;
-    border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-  #search {
-    position: absolute; top: 12px; right: 12px;
-    padding: 8px 12px; border-radius: 6px; border: 1px solid #0f3460;
-    background: #16213e; color: #eee; font-size: 14px; width: 220px;
-  }
-  #search::placeholder { color: #666; }
-</style>
-</head>
-<body>
-<div id="tooltip"></div>
-<div id="legend">
-  <strong>Crucible Knowledge Graph</strong>
-  <div><span style="background:#e94560"></span>Concept article</div>
-  <div><span style="background:#0f3460"></span>Summary</div>
-  <div><span style="background:#533483"></span>Comparison</div>
-  <div><span style="background:#1a8a5c"></span>Method</div>
-  <div><span style="background:#e9a045"></span>Topic tag</div>
-  <div style="margin-top:8px; color:#888">Drag to rearrange. Scroll to zoom.</div>
-</div>
-<input id="search" type="text" placeholder="Search nodes...">
-<svg></svg>
-<script src="https://d3js.org/d3.v7.min.js"></script>
-<script>
-const data = /*GRAPH_DATA*/;
-
-const colors = {
-  concept: "#e94560", summary: "#0f3460", comparison: "#533483",
-  method: "#1a8a5c", "concept": "#e9a045"
-};
-function nodeColor(d) {
-  if (d.type === "concept" && !d.path) return colors["concept"];
-  return colors[d.group] || "#888";
-}
-function nodeRadius(d) {
-  return d.type === "concept" && !d.path ? 6 : 10;
-}
-
-const svg = d3.select("svg");
-const width = window.innerWidth, height = window.innerHeight;
-const g = svg.append("g");
-
-svg.call(d3.zoom().scaleExtent([0.1, 8]).on("zoom", (e) => {
-  g.attr("transform", e.transform);
-}));
-
-const sim = d3.forceSimulation(data.nodes)
-  .force("link", d3.forceLink(data.edges).id(d => d.id).distance(80))
-  .force("charge", d3.forceManyBody().strength(-200))
-  .force("center", d3.forceCenter(width / 2, height / 2))
-  .force("collision", d3.forceCollide().radius(20));
-
-const link = g.append("g").selectAll("line")
-  .data(data.edges).join("line")
-  .attr("class", d => "link link-type-" + d.type)
-  .attr("stroke-width", d => d.type === "derivation" ? 2 : 1);
-
-const node = g.append("g").selectAll("g")
-  .data(data.nodes).join("g")
-  .call(d3.drag()
-    .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-    .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
-    .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
-
-node.append("circle")
-  .attr("r", nodeRadius)
-  .attr("fill", nodeColor)
-  .attr("stroke", "#fff")
-  .attr("stroke-width", 1.5);
-
-node.append("text")
-  .text(d => d.label.length > 25 ? d.label.slice(0, 23) + "..." : d.label)
-  .attr("dx", 14).attr("dy", 4)
-  .attr("fill", "#ccc");
-
-const tooltip = d3.select("#tooltip");
-node.on("mouseover", (e, d) => {
-  let html = "<strong>" + d.label + "</strong>";
-  if (d.type) html += "<br>Type: " + d.type;
-  if (d.status) html += "<br>Status: " + d.status;
-  if (d.path) html += "<br>" + d.path;
-  tooltip.html(html).style("display", "block");
-}).on("mousemove", (e) => {
-  tooltip.style("left", (e.pageX + 12) + "px").style("top", (e.pageY - 12) + "px");
-}).on("mouseout", () => tooltip.style("display", "none"))
-.on("click", (e, d) => {
-  if (d.path) {
-    const rootPath = /*ROOT_PATH*/;
-    window.location.href = "vscode://file/" + rootPath + "/" + d.path;
-  }
-});
-node.style("cursor", d => d.path ? "pointer" : "default");
-
-sim.on("tick", () => {
-  link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-      .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-  node.attr("transform", d => "translate(" + d.x + "," + d.y + ")");
-});
-
-d3.select("#search").on("input", function() {
-  const q = this.value.toLowerCase();
-  node.select("circle").attr("opacity", d =>
-    !q || d.label.toLowerCase().includes(q) ? 1 : 0.15);
-  node.select("text").attr("opacity", d =>
-    !q || d.label.toLowerCase().includes(q) ? 1 : 0.1);
-  link.attr("opacity", d => {
-    if (!q) return 1;
-    const sn = data.nodes[typeof d.source === "object" ? d.source.id : d.source];
-    const tn = data.nodes[typeof d.target === "object" ? d.target.id : d.target];
-    return (sn.label.toLowerCase().includes(q) || tn.label.toLowerCase().includes(q)) ? 1 : 0.05;
-  });
-});
-</script>
-</body>
-</html>
-"""
 
 
 @cli.command()
@@ -2061,16 +2043,14 @@ def browse(port, no_open):
     if not wiki_dir.exists():
         raise click.ClickException("No wiki directory found. Run 'crucible init' first.")
 
-    # Ensure knowledge graph is up to date
-    viz_path = wiki_dir / "viz.html"
-    if not viz_path.exists():
-        click.echo("Generating knowledge graph...")
-        # In-process: a `crucible` subprocess depends on PATH and its
-        # failure went unnoticed.
-        try:
-            _write_viz(root, db, viz_path)
-        except Exception as e:
-            click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
+    # Refresh viz.html, which goes stale whenever the wiki changes. (The
+    # server's /_graph page is built from the database on each request.)
+    # In-process: a `crucible` subprocess depends on PATH and its failure
+    # went unnoticed.
+    try:
+        _write_viz(root, db, wiki_dir / "viz.html")
+    except Exception as e:
+        click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
 
     articles = db.list_articles()
     db_path = cdir(root) / "crucible.db"
@@ -2137,22 +2117,28 @@ def vscode(file):
     if not wiki_dir.exists():
         raise click.ClickException("No wiki directory found. Run 'crucible init' first.")
 
-    # Ensure knowledge graph is up to date
-    viz_path = wiki_dir / "viz.html"
-    if not viz_path.exists():
-        click.echo("Generating knowledge graph...")
-        db = get_db(root)
-        try:
-            _write_viz(root, db, viz_path)
-        finally:
-            db.close()
+    # Refresh viz.html, which goes stale whenever the wiki changes.
+    db = get_db(root)
+    try:
+        _write_viz(root, db, wiki_dir / "viz.html")
+    finally:
+        db.close()
 
     # Open the project root in VS Code
     cmd = ["code", str(root)]
 
     # Also open a specific file (or index.org by default)
     if file:
-        target = wiki_dir / file
+        # A wiki-relative path, or one relative to the current directory
+        # or absolute. A FILE that does not exist is an error, not a silent
+        # fallback to opening only the project.
+        given = Path(os.path.expanduser(file))
+        target = next((c for c in (wiki_dir / given, given) if c.is_file()), None)
+        if target is None:
+            raise click.ClickException(
+                f"No such file: {file} (give a path relative to the wiki, "
+                "like concepts/foo.org, or to the current directory)"
+            )
     else:
         target = wiki_dir / "index.org"
 
@@ -2207,19 +2193,28 @@ def _is_own_sidecar(root: Path, db, src: dict, disk_path: Path, sidecar: Path) -
 def delete(path, yes, delete_file):
     """Delete an article or source from the database.
 
-    PATH can be a database path, partial path, or title fragment.
-    Searches articles first, then sources.
+    PATH can be an article or source path, a source's cite key, or a
+    partial path or title fragment. Exact matches win: an article path,
+    then a source path, then a cite key. A fragment must match exactly one
+    article or source; if it matches several, nothing is deleted and the
+    candidates are listed.
     """
     root = get_root()
     db = get_db(root)
 
-    # Try to find as article
-    article = db.get_article_by_path(path)
-    if not article:
-        for a in db.list_articles():
-            if path in a["path"] or path in a["title"]:
-                article = a
-                break
+    # Exact matches first, so a cite key such as smith2024 deletes that
+    # source, not an article whose path merely contains it. Paths may be
+    # given relative to the cwd, the project, the wiki, or absolute.
+    try:
+        article = _lookup_project_path(root, path, db.get_article_by_path)
+        src = None if article else _lookup_project_path(root, path, db.get_source_by_path)
+        if not article and not src:
+            src = _source_by_cite_key(db, path)
+        if not article and not src:
+            article, src = _fuzzy_delete_match(db, path)
+    except click.ClickException:
+        db.close()
+        raise
 
     if article:
         click.echo(f"Article: {article['title']}")
@@ -2236,14 +2231,6 @@ def delete(path, yes, delete_file):
         click.echo("  Deleted from database.")
         db.close()
         return
-
-    # Try to find as source
-    src = db.get_source_by_path(path)
-    if not src:
-        for s in db.list_sources():
-            if path in s["path"] or path in s["title"]:
-                src = s
-                break
 
     if src:
         articles = db.source_articles(src["id"])
@@ -2290,6 +2277,33 @@ def delete(path, yes, delete_file):
 
     db.close()
     raise click.ClickException(f"Not found: {path}")
+
+
+def _source_by_cite_key(db, key: str) -> dict | None:
+    """The one source row with cite key `key`, or None (also when several share it)."""
+    found = [s for s in db.list_sources() if _source_metadata(s).get("cite_key") == key]
+    return found[0] if len(found) == 1 else None
+
+
+def _fuzzy_delete_match(db, fragment: str) -> tuple[dict | None, dict | None]:
+    """The single article or source whose path or title contains `fragment`.
+
+    Returns (article, None), (None, source) or (None, None). Raises a
+    ClickException listing the candidates when more than one matches, so
+    delete never picks one by the order rows happen to be listed in.
+    """
+    articles = [a for a in db.list_articles()
+                if fragment in a["path"] or fragment in (a["title"] or "")]
+    sources = [s for s in db.list_sources()
+               if fragment in s["path"] or fragment in (s["title"] or "")]
+    if len(articles) + len(sources) > 1:
+        lines = [f"  article: {a['path']} ({a['title']})" for a in articles]
+        lines += [f"  source:  {s['path']} ({s['title']})" for s in sources]
+        raise click.ClickException(
+            f"'{fragment}' matches {len(lines)} articles and sources; nothing was "
+            "deleted. Give the exact path or cite key of one:\n" + "\n".join(lines)
+        )
+    return (articles[0] if articles else None), (sources[0] if sources else None)
 
 
 @cli.command()
@@ -2365,6 +2379,11 @@ def merge(source, dry_run, yes):
                     click.echo(f"  article: {rel_within_wiki} -> {label} (renamed)")
                 else:
                     click.echo(f"  article: {rel_within_wiki}")
+            for wiki_file, dest_path in plan.wiki_files:
+                rel_within_wiki = str(wiki_file.relative_to(source_wiki))
+                label = plan.wiki_renames.get(rel_within_wiki)
+                suffix = f" -> {label} (renamed)" if label else ""
+                click.echo(f"  wiki file: {rel_within_wiki}{suffix}")
             for cite_key, _ in plan.bib_entries:
                 click.echo(f"  bib: {cite_key}")
             for cite_key, path in plan.bib_file_fields.items():
@@ -2379,7 +2398,8 @@ def merge(source, dry_run, yes):
 
     # Sync. Everything above is already in place, so a failure here leaves
     # a complete merge whose database the next sync brings up to date.
-    if not dry_run and (plan.articles or plan.sources or plan.bib_entries):
+    if not dry_run and (plan.articles or plan.sources or plan.bib_entries
+                        or plan.wiki_files or plan.bib_file_fields):
         click.echo()
         ctx = click.get_current_context()
         try:
@@ -2413,9 +2433,16 @@ def merge(source, dry_run, yes):
     if plan.sidecars:
         action = "Would copy" if dry_run else "Copied"
         click.echo(f"  {action} {len(plan.sidecars)} missing text sidecar(s)")
+    if plan.wiki_files:
+        action = "Would copy" if dry_run else "Copied"
+        click.echo(f"  {action} {len(plan.wiki_files)} other wiki file(s) (figures, data)")
+    if plan.wiki_unchanged:
+        click.echo(
+            f"  Skipped {plan.wiki_unchanged} wiki file(s) the target already has"
+        )
     if plan.wiki_renames:
         click.echo(
-            f"  Renamed {len(plan.wiki_renames)} article(s) to avoid conflicts"
+            f"  Renamed {len(plan.wiki_renames)} wiki file(s) to avoid conflicts"
         )
 
 
@@ -2425,25 +2452,183 @@ _MERGE_STAGING_PREFIX = ".merge-staging-"
 
 
 def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path) -> None:
-    """Add the incoming wiki articles to plan, renaming any that collide."""
+    """Add the incoming wiki files to plan, renaming any that collide.
+
+    Articles (.org) and the other files beside them (figures, data) follow
+    the same rules. An incoming file is not copied again when its
+    destination, or one of the renamed copies an earlier merge made of it
+    (``name_1.org``...), already holds it: the same bytes, or for an
+    article the same text once its links are rewritten the way this merge
+    would rewrite them. A file found under another name is recorded in
+    ``plan.wiki_aliases``, so links to it from copied articles follow it.
+    Any other collision gets a free name and links to it are rewritten.
+
+    Whether an article matches depends on where the files it links to
+    land, which depends on which other articles match, so matching is
+    repeated until it settles: articles are first paired with a copy whose
+    text agrees apart from link targets, and a pair is dropped when its
+    rewritten text differs. Pairs are only ever dropped, so this ends.
+    """
     if not source_wiki.exists():
         return
-    planned: set[Path] = set()
+    target_cdir = target_wiki.parent
+
     # The same walk sync uses: only the top-level index.org is generated.
-    for org_path in _wiki_article_files(source_wiki):
-        rel_within_wiki = org_path.relative_to(source_wiki)
-        dest_path = target_wiki / rel_within_wiki
-        if dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
-            stem, suffix = dest_path.stem, dest_path.suffix
+    try:
+        articles = _wiki_article_files(source_wiki)
+    except OSError as exc:
+        raise click.ClickException(f"Cannot read {source_wiki}: {exc}") from exc
+    incoming = [(p, True) for p in articles]
+    incoming += [(p, False) for p in _wiki_other_files(source_wiki)]
+
+    def existing_copies(dest: Path) -> list[Path]:
+        """dest and the renamed copies of it that exist, in order."""
+        found, candidate, counter = [], dest, 1
+        while candidate.exists() or candidate.is_symlink():
+            if candidate.is_file() and not candidate.is_symlink():
+                found.append(candidate)
+            candidate = dest.parent / f"{dest.stem}_{counter}{dest.suffix}"
+            counter += 1
+        return found
+
+    def decode(data: bytes) -> str:
+        return data.decode("utf-8", errors="surrogateescape")
+
+    data: dict[Path, bytes] = {}
+    dests: dict[Path, Path] = {}
+    matches: dict[Path, Path] = {}   # incoming file -> existing copy of it
+    used: set[Path] = set()
+    for src_path, is_article in incoming:
+        dest = target_wiki / src_path.relative_to(source_wiki)
+        dests[src_path] = dest
+        try:
+            data[src_path] = src_path.read_bytes()
+        except OSError as exc:
+            raise click.ClickException(f"Cannot read {src_path}: {exc}") from exc
+        copies = [c for c in existing_copies(dest) if c not in used]
+        contents = {}
+        for copy in copies:
+            try:
+                contents[copy] = copy.read_bytes()
+            except OSError:
+                continue
+        exact = [c for c in contents if contents[c] == data[src_path]]
+        loose = []
+        if is_article and not exact:
+            masked = _mask_link_targets(decode(data[src_path]))
+            loose = [c for c in contents
+                     if _mask_link_targets(decode(contents[c])) == masked]
+        match = (exact or loose or [None])[0]
+        if match is not None:
+            matches[src_path] = match
+            used.add(match)
+
+    while True:
+        # Free names for the files that will be copied.
+        planned: set[Path] = set()
+        placed: dict[Path, Path] = {}
+        for src_path, _ in incoming:
+            if src_path in matches:
+                continue
+            dest = dests[src_path]
             counter = 1
-            while dest_path.exists() or dest_path.is_symlink() or dest_path in planned:
-                dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
+            while dest.exists() or dest.is_symlink() or dest in planned:
+                base = dests[src_path]
+                dest = base.parent / f"{base.stem}_{counter}{base.suffix}"
                 counter += 1
-            plan.wiki_renames[str(rel_within_wiki)] = str(
-                dest_path.relative_to(target_wiki)
-            )
-        planned.add(dest_path)
-        plan.articles.append((org_path, dest_path))
+            planned.add(dest)
+            placed[src_path] = dest
+        renames = dict(plan.path_renames)
+        for src_path, final in list(matches.items()) + list(placed.items()):
+            if final != dests[src_path]:
+                renames[str(dests[src_path].relative_to(target_cdir))] = str(
+                    final.relative_to(target_cdir))
+        dropped = False
+        for src_path, is_article in incoming:
+            match = matches.get(src_path)
+            if match is None or not is_article:
+                continue
+            existing = match.read_bytes()
+            if existing == data[src_path]:
+                continue
+            rewritten = _rewrite_links_in_text(
+                decode(data[src_path]), match, target_cdir, renames)
+            if rewritten.encode("utf-8", errors="surrogateescape") != existing:
+                del matches[src_path]
+                dropped = True
+        if not dropped:
+            break
+
+    for src_path, is_article in incoming:
+        rel_within_wiki = str(src_path.relative_to(source_wiki))
+        if src_path in matches:
+            plan.wiki_unchanged += 1
+            if matches[src_path] != dests[src_path]:
+                plan.wiki_aliases[rel_within_wiki] = str(
+                    matches[src_path].relative_to(target_wiki))
+            continue
+        dest_path = placed[src_path]
+        if dest_path != dests[src_path]:
+            plan.wiki_renames[rel_within_wiki] = str(dest_path.relative_to(target_wiki))
+        if is_article:
+            plan.articles.append((src_path, dest_path))
+        else:
+            plan.wiki_files.append((src_path, dest_path))
+
+
+def _mask_link_targets(text: str) -> str:
+    """text with the path of every file link blanked out.
+
+    Two versions of an article that differ only in where their links point
+    compare equal, as a renamed copy made by an earlier merge does.
+    """
+    def repl(match: re.Match) -> str:
+        start = match.start(1) - match.start(0)
+        end = match.end(1) - match.start(0)
+        whole = match.group(0)
+        return whole[:start] + "\0" + whole[end:]
+
+    return FILE_LINK_RE.sub(repl, text)
+
+
+def _wiki_other_files(wiki_dir: Path) -> list[Path]:
+    """The files under a wiki's subdirectories that are not .org articles, sorted.
+
+    Figures and data that articles link to. Files at the top level of the
+    wiki (MANIFEST.md, viz.html, ...) are generated, and so is _build/;
+    hidden files and directories and editor backups are skipped too.
+    """
+    found: list[Path] = []
+    seen: set[tuple[int, int]] = set()
+    wiki_resolved = wiki_dir.resolve()
+
+    def walk(directory: Path, top: bool) -> None:
+        try:
+            st = directory.stat()
+            with os.scandir(directory) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as exc:
+            raise click.ClickException(f"Cannot read {directory}: {exc}") from exc
+        if (st.st_dev, st.st_ino) in seen:
+            return
+        seen.add((st.st_dev, st.st_ino))
+        for entry in entries:
+            name = entry.name
+            if name.startswith((".", "#")) or name.endswith("~"):
+                continue
+            path = Path(entry.path)
+            # A symlink may point anywhere (~/.ssh, sources/external/);
+            # only what lies inside the wiki is copied into the target.
+            if entry.is_symlink() and not path.resolve().is_relative_to(wiki_resolved):
+                continue
+            if entry.is_dir():
+                if not (top and name == "_build"):
+                    walk(path, False)
+            elif entry.is_file() and not top and not name.endswith(".org"):
+                found.append(path)
+
+    walk(wiki_dir, True)
+    return found
 
 
 def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
@@ -2465,7 +2650,6 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
     from crucible.ingest import atomic_write_text
 
     target_cdir = cdir(root)
-    target_wiki = target_cdir / "wiki"
     bib_path = target_cdir / "references.bib"
     staging = Path(tempfile.mkdtemp(prefix=_MERGE_STAGING_PREFIX, dir=target_cdir))
 
@@ -2475,6 +2659,7 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
         if copy.src_text is not None:
             copies.append((copy.src_text, copy.dest_file.with_suffix(".txt")))
     copies.extend(plan.sidecars)
+    copies.extend(plan.wiki_files)
     copies.extend(plan.articles)
 
     placed: list[tuple[Path, Path]] = []   # (staged, dest) moved into place
@@ -2489,9 +2674,8 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
             shutil.copy2(src, staged)
             staged_files.append((staged, dest))
         article_files = staged_files[len(copies) - len(plan.articles):]
-        rewrites = (
-            _rewrite_article_links(article_files, target_wiki, plan.wiki_renames)
-            if plan.wiki_renames else 0
+        rewrites = _rewrite_article_links(
+            article_files, target_cdir, _merge_renames(plan)
         )
 
         with FileLock(bib_path.with_suffix(".bib.lock"), timeout=10):
@@ -2661,6 +2845,15 @@ class _MergePlan:
     # wiki-relative renames of those that collide with existing articles.
     articles: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
     wiki_renames: dict[str, str] = dataclass_field(default_factory=dict)
+    # Other incoming wiki files (figures, data), (source path, destination).
+    wiki_files: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
+    wiki_unchanged: int = 0   # incoming wiki files the target already has
+    # Of those, the ones an earlier merge stored under another name
+    # (wiki-relative), so links from copied articles follow them.
+    wiki_aliases: dict[str, str] = dataclass_field(default_factory=dict)
+    # Incoming sources (and sidecars) stored under another path in the
+    # target, relative to .crucible/, so article links can follow them.
+    path_renames: dict[str, str] = dataclass_field(default_factory=dict)
     skipped: int = 0   # identical sources the target already has
     outside: int = 0   # indexed sources stored outside .crucible/, not copied
     warnings: list[str] = dataclass_field(default_factory=list)
@@ -2685,7 +2878,10 @@ def _plan_source_merge(
     them all at once. Nothing has been written when it is raised.
     """
     from crucible import bibtex
-    from crucible.ingest import _parse_bib_fields, _resolve_bib_file, file_sha256
+    from crucible.ingest import (
+        _from_disk_scan, _parse_bib_fields, _resolve_bib_file, file_sha256,
+        generate_bib_entry,
+    )
 
     source_cdir = source_root / CRUCIBLE_DIR
     target_cdir = cdir(root)
@@ -2736,6 +2932,8 @@ def _plan_source_merge(
     incoming_keys: set[str] = set()
     mapped_keys: set[str] = set()   # keys whose source file is accounted for
     copied_keys: dict[str, str] = {}   # key -> new path, for sources copied as new
+    # Copied sources keyed by the disk scan (no bib entry): (key, copy).
+    disk_scanned: list[tuple[str, _SourceCopy]] = []
 
     for src in source_db.list_sources():
         try:
@@ -2840,12 +3038,24 @@ def _plan_source_merge(
                 ))
                 if cite_key:
                     copied_keys[cite_key] = new_rel
+                    if _from_disk_scan(src) and cite_key not in source_entries:
+                        disk_scanned.append((cite_key, plan.sources[-1]))
         except _MergeConflict as exc:
             problems.append(str(exc))
             continue
 
         if cite_key:
             mapped_keys.add(cite_key)
+        # Article links to the incoming file follow it to its new name.
+        try:
+            dest_within = str(Path(new_rel).relative_to(CRUCIBLE_DIR))
+        except ValueError:
+            dest_within = None   # a target row stored outside .crucible/
+        if dest_within is not None and dest_within != str(rel_within):
+            plan.path_renames[str(rel_within)] = dest_within
+            if src_text is not None:
+                plan.path_renames[str(rel_within.with_suffix(".txt"))] = str(
+                    Path(dest_within).with_suffix(".txt"))
         remember(src_file, new_rel, cite_key)
         if src_text is not None:
             remember(src_text, str(Path(new_rel).with_suffix(".txt")), cite_key)
@@ -2879,6 +3089,19 @@ def _plan_source_merge(
                     problems.append(problem)
                 else:
                     plan.bib_file_fields[cite_key] = copied_keys[cite_key]
+            elif cite_key not in mapped_keys:
+                # A bibliography-only entry the target already has under
+                # this key is dropped as a duplicate, which is only right
+                # when it is the same reference. If it is a different
+                # paper, the merge is refused, as for a source whose key
+                # collides: the user renames one key and merges again.
+                problem = _bib_identity_problem(
+                    f"Cannot safely merge bibliography entry '{cite_key}': the "
+                    "target bibliography already has an entry with this key",
+                    target_entries.get(cite_key, []), entry_text,
+                )
+                if problem:
+                    problems.append(problem)
             continue
 
         try:
@@ -2916,9 +3139,61 @@ def _plan_source_merge(
             continue
         plan.bib_entries.append((cite_key, entry_text))
 
+    # A source the disk scan keyed is keyed by its file's stem, so one the
+    # merge renames (foo.csv -> foo_1.csv), or whose key was not its stem,
+    # would get a new key on the next sync and break the incoming articles
+    # that cite it. Its key is pinned with a bibliography entry naming the
+    # file. A target entry with the key would capture it instead.
+    for cite_key, copy in disk_scanned:
+        if cite_key in target_entries:
+            problems.append(
+                f"Cannot safely merge '{copy.src['path']}' (citation key "
+                f"'{cite_key}', from its file name): the target bibliography "
+                "already has an entry with this key. Rename the file in the "
+                "source crucible, sync it, and merge again."
+            )
+            continue
+        if Path(copy.new_rel).stem == cite_key:
+            continue
+        entry = generate_bib_entry(
+            cite_key, copy.src["title"] or cite_key, None, copy.src.get("date"),
+            None, copy.src["source_type"], file=copy.new_rel,
+        )
+        plan.bib_entries.append((cite_key, entry))
+        copy.metadata = {k: v for k, v in copy.metadata.items() if k != "disk_scan"}
+
     if problems:
         _raise_merge_problems(problems)
     return plan
+
+
+def _bib_identity_problem(
+    prefix: str, target_entries: list[str], incoming_entry: str
+) -> str | None:
+    """Why entries sharing a key may be different references, if they may.
+
+    They may when they disagree on DOI or title.
+    """
+    from crucible.ingest import _parse_bib_fields
+
+    incoming_fields = _parse_bib_fields(incoming_entry)
+    identifying = [
+        ("doi", "DOIs", lambda v: re.sub(
+            r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "", v.strip().lower())),
+        # Braces only protect case: {E}vidence is Evidence.
+        ("title", "titles", lambda v: re.sub(
+            r"[\W_]+", " ", v.replace("{", "").replace("}", "").lower()).strip()),
+    ]
+    for target_entry in target_entries:
+        target_fields = _parse_bib_fields(target_entry)
+        for name, label, norm in identifying:
+            ours, theirs = target_fields.get(name), incoming_fields.get(name)
+            if ours and theirs and norm(ours) != norm(theirs):
+                return (
+                    f"{prefix}, and the two entries have different {label}, so they "
+                    "may not be the same reference. Rename one of the keys."
+                )
+    return None
 
 
 def _bib_attach_problem(
@@ -2949,22 +3224,7 @@ def _bib_attach_problem(
             "target (correcting the file field if the file has moved), or rename "
             "one of the keys."
         )
-    incoming_fields = _parse_bib_fields(incoming_entry)
-    identifying = [
-        ("doi", "DOIs", lambda v: re.sub(
-            r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "", v.strip().lower())),
-        # Braces only protect case: {E}vidence is Evidence.
-        ("title", "titles", lambda v: re.sub(
-            r"[\W_]+", " ", v.replace("{", "").replace("}", "").lower()).strip()),
-    ]
-    for name, label, norm in identifying:
-        ours, theirs = target_fields.get(name), incoming_fields.get(name)
-        if ours and theirs and norm(ours) != norm(theirs):
-            return (
-                f"{prefix}, and the two entries have different {label}, so they "
-                "may not be the same reference. Rename one of the keys."
-            )
-    return None
+    return _bib_identity_problem(prefix, target_entries, incoming_entry)
 
 
 def _raise_merge_problems(problems: list[str]) -> NoReturn:
@@ -3052,57 +3312,81 @@ def _resolve_merge_source(source: str) -> Path:
     )
 
 
+def _merge_renames(plan: "_MergePlan") -> dict[str, str]:
+    """Every file a merge puts at a path other than its own, relative to .crucible/.
+
+    Renamed sources and their sidecars, sources the target already holds
+    under another name, and renamed wiki files.
+    """
+    renames = dict(plan.path_renames)
+    for old, new in {**plan.wiki_aliases, **plan.wiki_renames}.items():
+        renames[str(Path("wiki") / old)] = str(Path("wiki") / new)
+    return renames
+
+
+def _rewrite_links_in_text(
+    content: str, final_path: Path, target_cdir: Path, renames: dict[str, str]
+) -> str:
+    """Rewrite [[file:...]] links in an article's text for renamed files.
+
+    Links are resolved relative to final_path, the path the article has in
+    the target. renames maps paths relative to target_cdir (.crucible/).
+    """
+    target_cdir_resolved = target_cdir.resolve()
+
+    def repl(match: re.Match) -> str:
+        # FILE_LINK_RE is the pattern sync reads links with, so every
+        # form it counts ([[file:x]], [[./x.org]], [[x.org]]) is
+        # rewritten. Group 1 is the path alone: an org search option
+        # (::*Heading) and the description stay as they were.
+        link_path = match.group(1)
+        target = Path(os.path.expanduser(link_path))
+        resolved = (final_path.parent / target).resolve()
+        try:
+            rel = str(resolved.relative_to(target_cdir_resolved))
+        except ValueError:
+            return match.group(0)
+        if rel not in renames:
+            return match.group(0)
+        new_target = target_cdir / renames[rel]
+        if target.is_absolute():
+            new_link = str(new_target.resolve())
+        else:
+            new_link = os.path.relpath(new_target, final_path.parent)
+            bare_link = not match.group(0).startswith("[[file:")
+            if bare_link and not new_link.startswith(("./", "../")):
+                new_link = "./" + new_link  # keep it a link org reads
+        start = match.start(1) - match.start(0)
+        end = match.end(1) - match.start(0)
+        whole = match.group(0)
+        return whole[:start] + new_link + whole[end:]
+
+    # One pass, so a link already rewritten is not rewritten again.
+    return FILE_LINK_RE.sub(repl, content)
+
+
 def _rewrite_article_links(
-    files: list[tuple[Path, Path]], target_wiki: Path, wiki_renames: dict[str, str]
+    files: list[tuple[Path, Path]], target_cdir: Path, renames: dict[str, str]
 ) -> int:
     """Rewrite [[file:...]] links in copied articles for renamed files.
 
-    Each item is (file to edit, the path that file will have in the target
-    wiki); links are resolved relative to the latter. Returns the number of
-    files modified.
+    Each item is (file to edit, the path that file will have in the target);
+    links are resolved relative to the latter. renames maps paths relative
+    to the target's .crucible/ directory: renamed wiki files and sources
+    alike. Returns the number of files modified.
     """
-    target_wiki_resolved = target_wiki.resolve()
+    if not renames:
+        return 0
     count = 0
-
     for org_file, final_path in files:
         # surrogateescape round-trips bytes that are not valid UTF-8, so
         # one badly encoded file neither aborts the merge nor is mangled.
         content = org_file.read_text(encoding="utf-8", errors="surrogateescape")
-
-        def repl(match: re.Match) -> str:
-            # FILE_LINK_RE is the pattern sync reads links with, so every
-            # form it counts ([[file:x]], [[./x.org]], [[x.org]]) is
-            # rewritten. Group 1 is the path alone: an org search option
-            # (::*Heading) and the description stay as they were.
-            link_path = match.group(1)
-            target = Path(os.path.expanduser(link_path))
-            resolved = (final_path.parent / target).resolve()
-            try:
-                wiki_rel = str(resolved.relative_to(target_wiki_resolved))
-            except ValueError:
-                return match.group(0)
-            if wiki_rel not in wiki_renames:
-                return match.group(0)
-            new_target = target_wiki / wiki_renames[wiki_rel]
-            if target.is_absolute():
-                new_link = str(new_target.resolve())
-            else:
-                new_link = os.path.relpath(new_target, final_path.parent)
-                bare_link = not match.group(0).startswith("[[file:")
-                if bare_link and not new_link.startswith(("./", "../")):
-                    new_link = "./" + new_link  # keep it a link org reads
-            start = match.start(1) - match.start(0)
-            end = match.end(1) - match.start(0)
-            whole = match.group(0)
-            return whole[:start] + new_link + whole[end:]
-
-        # One pass, so a link already rewritten is not rewritten again.
-        new_content = FILE_LINK_RE.sub(repl, content)
+        new_content = _rewrite_links_in_text(content, final_path, target_cdir, renames)
         if new_content != content:
             org_file.write_text(new_content, encoding="utf-8",
                                 errors="surrogateescape")
             count += 1
-
     return count
 
 
@@ -3524,6 +3808,39 @@ def lint(strict, json_output):
                 "message": f"Missing ARTICLE_TYPE property: {article['path']}",
                 "path": article['path'],
             })
+        elif _normalize_article_type(meta.properties["ARTICLE_TYPE"]) not in ARTICLE_TYPES:
+            issues.append({
+                "type": "invalid_article_type",
+                "severity": "warning",
+                "message": (
+                    f"Unknown ARTICLE_TYPE '{meta.properties['ARTICLE_TYPE']}' in "
+                    f"{article['path']} (use one of {', '.join(ARTICLE_TYPES)})"
+                ),
+                "path": article['path'],
+            })
+        raw_status = meta.properties.get("STATUS")
+        if raw_status and _normalize_status(raw_status) not in ARTICLE_STATUSES:
+            issues.append({
+                "type": "invalid_status",
+                "severity": "warning",
+                "message": (
+                    f"Unknown STATUS '{raw_status}' in {article['path']} "
+                    f"(use one of {', '.join(ARTICLE_STATUSES)})"
+                ),
+                "path": article['path'],
+            })
+        for ref in meta.properties.get("DERIVED_FROM", "").split():
+            if _resolve_derived_from(db, root, org_path, ref) is None:
+                issues.append({
+                    "type": "unresolved_derived_from",
+                    "severity": "warning",
+                    "message": (
+                        f"DERIVED_FROM entry '{ref}' in {article['path']} "
+                        "does not name a wiki article"
+                    ),
+                    "path": article['path'],
+                    "ref": ref,
+                })
         dates = {}
         for prop in ("CREATED", "MODIFIED"):
             raw = meta.properties.get(prop)
@@ -3615,8 +3932,9 @@ def lint(strict, json_output):
                 "path": rel,
             })
 
-    # 7. Citation keys not in references.bib
-    bib_keys = {e.key for e in bib_entries}
+    # 7. Citation keys not in references.bib. A source with no bib entry
+    # (a disk-scanned notebook or data file) is cited by its own key.
+    known_keys = {e.key for e in bib_entries} | set(source_index[0])
 
     for article in db.list_articles():
         org_path = root / article["path"]
@@ -3627,11 +3945,14 @@ def lint(strict, json_output):
         except (UnicodeDecodeError, OSError):
             continue  # reported above as unreadable_file
         for key in meta.cite_keys:
-            if key not in bib_keys:
+            if key not in known_keys:
                 issues.append({
                     "type": "missing_citation",
                     "severity": "warning",
-                    "message": f"Citation key '{key}' in {article['path']} not found in references.bib",
+                    "message": (
+                        f"Citation key '{key}' in {article['path']} not found in "
+                        "references.bib or the sources"
+                    ),
                     "path": article['path'],
                     "key": key,
                 })
@@ -3813,12 +4134,65 @@ def suggest(json_output):
     click.echo(f"\nTotal: {len(suggestions)} suggestions")
 
 
+def _commands_reference() -> str:
+    """Every command, argument and option, generated from the click tree.
+
+    Generated rather than written by hand so `crucible help commands` (and
+    `help all`) cannot fall behind the CLI.
+    """
+    import inspect
+
+    lines = ["COMMAND REFERENCE (every command and option)", ""]
+
+    def option_lines(cmd: click.Command, ctx: click.Context) -> list[str]:
+        out = []
+        for param in cmd.get_params(ctx):
+            if param.name == "help":
+                continue
+            record = param.get_help_record(ctx)
+            if record:
+                opts, text = record
+                out.append(f"      {opts:<34} {text}" if text else f"      {opts}")
+        return out
+
+    def walk(cmd: click.Command, ctx: click.Context) -> None:
+        if isinstance(cmd, click.Group) and ctx.parent is not None:
+            lines.append(f"crucible {ctx.command_path.split(' ', 1)[1]} COMMAND")
+            if cmd.help:
+                lines.append("    " + inspect.cleandoc(cmd.help).splitlines()[0])
+            lines.append("")
+        if isinstance(cmd, click.Group):
+            for name in sorted(cmd.commands):
+                sub = cmd.commands[name]
+                walk(sub, click.Context(sub, info_name=name, parent=ctx))
+            return
+        usage = " ".join(cmd.collect_usage_pieces(ctx))
+        lines.append(f"{ctx.command_path} {usage}".rstrip())
+        for line in inspect.cleandoc(cmd.help or "").splitlines():
+            if line.strip() != "\b":
+                lines.append(f"    {line}".rstrip())
+        opts = option_lines(cmd, ctx)
+        if opts:
+            lines.append("    Options:")
+            lines.extend(opts)
+        lines.append("")
+
+    root_ctx = click.Context(cli, info_name="crucible")
+    lines.append("crucible [--version] [--help] COMMAND ...")
+    lines.extend(option_lines(cli, root_ctx) or [])
+    lines.append("")
+    walk(cli, root_ctx)
+    return "\n".join(lines)
+
+
 @cli.command("help")
 @click.argument("topic", default="overview")
 def help_cmd(topic):
     """Show detailed help for agents and humans.
 
-    TOPIC can be: overview, workflow, ingest, distill, search, sync, maintain, org-format, registry, or all.
+    TOPIC can be: overview, workflow, ingest, distill, search, sync,
+    maintain, org-format, registry, commands, or all. `commands` lists
+    every command and option; `all` prints every topic.
     """
     topics = {
         "overview": """
@@ -3843,7 +4217,8 @@ Directory layout (everything lives in .crucible/ at the project root):
 
 Run `crucible help all` for complete documentation.
 Run `crucible help <topic>` for a specific topic.
-Topics: overview, workflow, ingest, distill, search, sync, maintain, org-format, registry
+Topics: overview, workflow, ingest, distill, search, sync, maintain, org-format,
+  registry, commands (every command and option)
 """,
         "workflow": """
 TYPICAL WORKFLOW
@@ -3949,8 +4324,10 @@ LINKING TO SOURCES:
   In the :PROPERTIES: drawer, set SOURCE_KEYS to the space-separated
   cite keys of the article's sources: the keys in references.bib that
   `crucible ingest` printed. A file in sources/notebooks/ or sources/data/
-  that no bib entry claims is keyed <stem>-<ext> (results.csv ->
-  results-csv). Sync uses these keys to link articles to their sources;
+  that no bib entry claims is keyed <stem> (results.csv -> results), or
+  <stem>-<ext> (results-csv, then -2, -3...) when the stem is already a
+  bib key or another source's key; `crucible source <file>` shows
+  it on its Key: line. Sync uses these keys to link articles to their sources;
   `crucible lint` reports keys that resolve to no source or to several.
 
 UPDATING EXISTING ARTICLES:
@@ -3965,6 +4342,9 @@ Full-text search (FTS5 with porter stemming):
   crucible search "activation energy"
   crucible search "platinum catalysis" -n 5
   crucible search "zeolites" --all     Search every registered crucible
+  crucible search "catal*"             A trailing * matches a word prefix
+  Titles and article text are searched; words are matched literally (no
+  AND/OR/NOT operators or quoting).
 
 Semantic and hybrid search (after `crucible embed`, needs ollama):
   crucible search "query" --mode semantic
@@ -3981,10 +4361,12 @@ Structured queries:
   crucible orphans                     Articles with no incoming links
   crucible undigested                  Sources not yet distilled
 
-  Article paths may be relative to the project root (as shown), to the
-  current directory, or to the wiki (concepts/x.org), or absolute. A path
-  that names no article, or an unknown source, exits 1 with an error.
-  Concept names are case-insensitive.
+  Article and source paths may be relative to the project root (as
+  shown), to the current directory, to .crucible/ (wiki/concepts/x.org),
+  or to the wiki (concepts/x.org), or absolute. A path that names no
+  article, or an unknown source, exits 1 with an error. Concept names
+  ignore case, spaces, underscores, dashes and apostrophes
+  ("activation energy" = activation_energy).
 
 Graph export:
   crucible graph                       DOT format to stdout
@@ -4013,7 +4395,8 @@ It also reconciles the sources table with .crucible/references.bib:
   - An entry with a `file` field owns the row for that file
   - An entry without one gets no row (lint reports keys cited this way)
   - A file in sources/notebooks/ or sources/data/ that no entry claims gets
-    a row keyed <stem>-<ext> from a disk scan
+    a row from a disk scan, keyed <stem>, or <stem>-<ext> (then -2, -3...)
+    when the stem is already a bib key or another source's key
 
 The database is regenerable: delete .crucible/crucible.db and the next
 command rebuilds it from the wiki, references.bib and the source files,
@@ -4115,12 +4498,22 @@ FILETAGS: include the article type (concept, summary, etc.) and
 all relevant topic tags. Tags become concepts in the database.
 
 SOURCE_KEYS: space-separated cite keys from references.bib (the key
-`crucible ingest` printed), or <stem>-<ext> for a file in sources/notebooks/
-or sources/data/ with no bib entry. These create article-to-source links
+`crucible ingest` printed). A file in sources/notebooks/ or sources/data/
+with no bib entry is keyed <stem>, or <stem>-<ext> (then -2, -3...) when
+the stem is already a bib key or another source's key; `crucible
+source <file>` shows it. These create article-to-source links
 during sync.
 
 CREATED / MODIFIED: the article's dates; update MODIFIED on every edit.
 They are what the database records, so they survive a rebuild.
+
+DERIVED_FROM (optional): space-separated paths of the wiki articles this
+one was synthesized from, e.g. for an article written from a conversation
+that drew on others:
+  :DERIVED_FROM: ../concepts/activation-energy.org ../summaries/smith2024.org
+Paths are relative to the article, or to the wiki (optionally with a
+leading wiki/). Sync records them as derivation links, which
+`crucible history ARTICLE` shows upstream and downstream.
 
 ARTICLE TYPES:
   concept     - A single topic or idea (e.g., activation-energy.org)
@@ -4154,8 +4547,11 @@ a numeric suffix (e.g., my-project-2).
 """,
     }
 
+    topics["commands"] = _commands_reference()
+
     if topic == "all":
-        for t in ["overview", "workflow", "ingest", "distill", "search", "sync", "maintain", "org-format", "registry"]:
+        for t in ["overview", "workflow", "ingest", "distill", "search", "sync",
+                  "maintain", "org-format", "registry", "commands"]:
             click.echo(topics[t])
     elif topic in topics:
         click.echo(topics[topic])
@@ -4230,6 +4626,12 @@ def publish(output, init_only):
         raise click.ClickException(
             "'scimax' command not found. Install scimax, or use --init-only "
             "to write the publish config without publishing."
+        )
+    except subprocess.TimeoutExpired:
+        raise click.ClickException(
+            "scimax publish did not finish within 300 seconds; the HTML in "
+            f"{out_dir} may be incomplete. Run `scimax publish` from {wiki_dir} "
+            "to publish without the time limit."
         )
     if result.returncode != 0:
         click.echo(result.stderr, err=True)
@@ -4322,47 +4724,89 @@ def _write_skill_record(skill_dest: Path, record: dict[str, str]) -> None:
     )
 
 
-def _install(root: Path | None, directive: bool) -> None:
+def _install_skill_files(skill_src: Path, skill_dest: Path) -> None:
+    """Copy the packaged skill files into skill_dest.
+
+    Symlinks are never written through: a skill directory or file that is
+    already a link to the packaged skill (a development setup) is reported
+    as linked, and a link to anything else is not crucible's and is left
+    alone. Copying onto a link would overwrite its target, or put the
+    install record in another directory.
+    """
+    if skill_dest.is_symlink():
+        try:
+            linked = skill_dest.exists() and skill_dest.samefile(skill_src)
+        except OSError:
+            linked = False
+        if linked:
+            click.echo(f"  Skill: {skill_dest} already links to {skill_src}")
+        else:
+            click.echo(f"  Skill: {skill_dest} is a symlink, not a crucible install; "
+                       "left it alone (remove it and re-run to install the skill)")
+        return
+
+    skill_dest.mkdir(parents=True, exist_ok=True)
+    record = _read_skill_record(skill_dest)
+
+    for src_file in sorted(skill_src.iterdir()):
+        if not src_file.is_file():
+            continue
+        dest_file = skill_dest / src_file.name
+        try:
+            linked = dest_file.exists() and src_file.samefile(dest_file)
+        except OSError:
+            linked = False
+        if linked:
+            record.pop(src_file.name, None)
+            click.echo(f"  Skill: {dest_file} already links to {src_file}")
+            continue
+        if dest_file.is_symlink():
+            record.pop(src_file.name, None)
+            click.echo(f"  Skill: {dest_file} is a symlink, not a crucible copy; "
+                       "left it alone")
+            continue
+        new_hash = _file_sha256(src_file)
+        if dest_file.is_file():
+            current = _file_sha256(dest_file)
+            shipped = (
+                {record[src_file.name]} if src_file.name in record
+                else _PRE_RECORD_SKILL_HASHES.get(src_file.name, frozenset())
+            )
+            if current != new_hash and current not in shipped:
+                # Not a copy crucible installed: keep the local edits,
+                # in a backup no later install overwrites.
+                backup = dest_file.with_name(dest_file.name + ".bak")
+                n = 1
+                while backup.exists():
+                    n += 1
+                    backup = dest_file.with_name(f"{dest_file.name}.bak{n}")
+                shutil.copy2(str(dest_file), str(backup))
+                click.echo(f"  Skill: {dest_file} had local changes; "
+                           f"saved a copy to {backup}")
+        shutil.copy2(str(src_file), str(dest_file))
+        record[src_file.name] = new_hash
+        click.echo(f"  Skill: {src_file.name} -> {dest_file}")
+    record_path = skill_dest / _SKILL_RECORD
+    if record_path.is_symlink():
+        click.echo(f"  Skill: {record_path} is a symlink; did not write the install record")
+    else:
+        _write_skill_record(skill_dest, record)
+
+
+def _install(root: Path | None, directive: bool, register: bool = True) -> None:
     """Install the skill; for a project, also its manifest and registry entry.
 
     `root` is the project (None: the one containing the current directory).
     Only `crucible install` passes directive=True: init and update must not
     repoint the global ~/.claude/CLAUDE.md at the project they act on.
+    register=False skips registering the project (the caller already did).
     """
     # 1. Install skill files (works from anywhere)
     skill_src = _skill_source()
     if not skill_src.exists():
         raise click.ClickException(f"Skill source not found at {skill_src}")
 
-    skill_dest = _skill_dest()
-    skill_dest.mkdir(parents=True, exist_ok=True)
-    record = _read_skill_record(skill_dest)
-
-    for src_file in sorted(skill_src.iterdir()):
-        if src_file.is_file():
-            dest_file = skill_dest / src_file.name
-            new_hash = _file_sha256(src_file)
-            if dest_file.is_file():
-                current = _file_sha256(dest_file)
-                shipped = (
-                    {record[src_file.name]} if src_file.name in record
-                    else _PRE_RECORD_SKILL_HASHES.get(src_file.name, frozenset())
-                )
-                if current != new_hash and current not in shipped:
-                    # Not a copy crucible installed: keep the local edits,
-                    # in a backup no later install overwrites.
-                    backup = dest_file.with_name(dest_file.name + ".bak")
-                    n = 1
-                    while backup.exists():
-                        n += 1
-                        backup = dest_file.with_name(f"{dest_file.name}.bak{n}")
-                    shutil.copy2(str(dest_file), str(backup))
-                    click.echo(f"  Skill: {dest_file} had local changes; "
-                               f"saved a copy to {backup}")
-            shutil.copy2(str(src_file), str(dest_file))
-            record[src_file.name] = new_hash
-            click.echo(f"  Skill: {src_file.name} -> {dest_file}")
-    _write_skill_record(skill_dest, record)
+    _install_skill_files(skill_src, _skill_dest())
 
     # 2. If inside a project, generate manifest and add CLAUDE.md directive
     if root is None:
@@ -4381,10 +4825,11 @@ def _install(root: Path | None, directive: bool) -> None:
         db.close()
     click.echo(f"  Manifest: {manifest_path}")
 
-    # Auto-register in global registry
-    actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
-    if actual_name:
-        click.echo(f"  Registry: registered as '{actual_name}'")
+    # Auto-register in global registry (init and update have already)
+    if register:
+        actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
+        if actual_name:
+            click.echo(f"  Registry: registered as '{actual_name}'")
 
     if not directive:
         click.echo("  CLAUDE.md: unchanged (run `crucible install` here to point agents at this crucible)")
@@ -4411,18 +4856,25 @@ def _install(root: Path | None, directive: bool) -> None:
     if claude_md.exists():
         existing = claude_md.read_text(encoding="utf-8")
         if marker in existing:
-            # Replace existing directive
-            import re as _re
-            pattern = _re.compile(
-                _re.escape(marker) + r".*?" + _re.escape(marker),
-                _re.DOTALL,
-            )
-            # A function, not a string: the directive holds the project
-            # path, and a string replacement would read its backslashes
-            # (every Windows path) as regex escapes.
-            updated = pattern.sub(lambda _m: directive_text.strip(), existing)
-            claude_md.write_text(updated, encoding="utf-8")
-            click.echo(f"  CLAUDE.md: updated existing directive")
+            if existing.count(marker) % 2:
+                # An unpaired marker: replacing from it to the next one
+                # would delete whatever lies between, and appending a block
+                # would pair the stray marker with the new one next time.
+                _warn(f"  CLAUDE.md: {claude_md} has an unpaired {marker} marker; "
+                      "left it unchanged. Remove the stray marker (or the "
+                      "partial crucible block) and run `crucible install` again.")
+            else:
+                # Replace existing directive
+                pattern = re.compile(
+                    re.escape(marker) + r".*?" + re.escape(marker),
+                    re.DOTALL,
+                )
+                # A function, not a string: the directive holds the project
+                # path, and a string replacement would read its backslashes
+                # (every Windows path) as regex escapes.
+                updated = pattern.sub(lambda _m: directive_text.strip(), existing)
+                claude_md.write_text(updated, encoding="utf-8")
+                click.echo(f"  CLAUDE.md: updated existing directive")
         else:
             claude_md.write_text(existing.rstrip() + "\n" + directive_text, encoding="utf-8")
             click.echo(f"  CLAUDE.md: added directive")
@@ -4445,21 +4897,31 @@ def uninstall():
     """
     # 1. Remove the skill files crucible installed
     skill_dest = _skill_dest()
-    if skill_dest.is_dir():
+    if skill_dest.is_symlink():
+        click.echo(f"  Left {skill_dest} in place: it is a symlink, not a crucible install")
+    elif skill_dest.is_dir():
         record = _read_skill_record(skill_dest)
+        skill_src = _skill_source()
         if record:
             installed = set(record)
         else:
             # Installed by a version that kept no record: only the files
-            # the package ships are crucible's.
-            skill_src = _skill_source()
+            # the package ships are crucible's, and only an unedited copy
+            # of one (a hash crucible shipped) may be removed.
             installed = ({p.name for p in skill_src.iterdir() if p.is_file()}
                          if skill_src.is_dir() else set())
         for name in sorted(installed):
             path = skill_dest / name
             if not path.is_file() or path.is_symlink():
                 continue
-            if name in record and _file_sha256(path) != record[name]:
+            current = _file_sha256(path)
+            if name in record:
+                ours = current == record[name]
+            else:
+                shipped = skill_src / name
+                ours = (current in _PRE_RECORD_SKILL_HASHES.get(name, frozenset())
+                        or (shipped.is_file() and current == _file_sha256(shipped)))
+            if not ours:
                 click.echo(f"  Kept {path}: it has local changes")
                 continue
             path.unlink()
@@ -4485,9 +4947,15 @@ def uninstall():
                 r"\n?" + re.escape(marker) + r".*?" + re.escape(marker) + r"\n?",
                 re.DOTALL,
             )
-            updated = pattern.sub("", existing).rstrip() + "\n"
-            claude_md.write_text(updated, encoding="utf-8")
-            click.echo(f"  Removed directive from CLAUDE.md")
+            updated, count = pattern.subn("", existing)
+            if existing.count(marker) % 2:
+                count = 0  # an unpaired marker: do not guess where the block ends
+            if count:
+                claude_md.write_text(updated.rstrip() + "\n", encoding="utf-8")
+                click.echo(f"  Removed directive from CLAUDE.md")
+            else:
+                _warn(f"  CLAUDE.md: {claude_md} has an unpaired {marker} marker; "
+                      "left it unchanged. Remove the crucible block by hand.")
         else:
             click.echo(f"  No crucible directive found in CLAUDE.md")
     else:
@@ -4500,8 +4968,9 @@ def uninstall():
 def update():
     """Update crucible to the latest version.
 
-    Runs all pending database migrations, re-registers in the global
-    registry, and reinstalls the skill files. Safe to run repeatedly.
+    Runs all pending database migrations, adds any missing crucible
+    entries to .gitignore, re-registers in the global registry, and
+    reinstalls the skill files. Safe to run repeatedly.
 
     Use this after upgrading the crucible package to apply schema
     changes and pick up new skill definitions.
@@ -4526,13 +4995,17 @@ def update():
     else:
         click.echo("  Settings: up to date")
 
-    # 3. Global registry
+    # 3. .gitignore: patterns added since the project was initialized
+    gitignore_change = _ensure_gitignore(root)
+    click.echo(f"  Gitignore: {'updated ' + gitignore_change if gitignore_change else 'up to date'}")
+
+    # 4. Global registry
     actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
     if actual_name:
         click.echo(f"  Registry: registered as '{actual_name}'")
 
-    # 4. Reinstall skill
-    _install(root=root, directive=False)
+    # 5. Reinstall skill (registered above, so not again)
+    _install(root=root, directive=False, register=False)
 
 
 if __name__ == "__main__":

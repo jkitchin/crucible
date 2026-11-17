@@ -182,7 +182,21 @@ def _extract_excel(path: Path) -> str:
 
 
 def extract_title(path: Path, text: str) -> str:
-    """Try to extract a title from the source content."""
+    """Try to extract a title from the source content, else use the filename."""
+    return declared_title(path, text) or path.stem.replace("-", " ").replace("_", " ").title()
+
+
+def _title_key(title: str) -> str:
+    """A title reduced to its letters and digits, casefolded, for comparison.
+
+    BibTeX braces, LaTeX accents and punctuation differ between a fetched
+    entry and the title a file declares without making it another paper.
+    """
+    return "".join(ch for ch in title.casefold() if ch.isalnum())
+
+
+def declared_title(path: Path, text: str) -> str | None:
+    """The title the file itself declares (#+TITLE, a # heading, <title>), or None."""
     suffix = path.suffix.lower()
 
     if suffix == ".org":
@@ -202,10 +216,9 @@ def extract_title(path: Path, text: str) -> str:
                        path.read_text(encoding="utf-8", errors="replace"),
                        re.IGNORECASE | re.DOTALL)
         if m:
-            return m.group(1).strip()
+            return m.group(1).strip() or None
 
-    # Fallback to filename
-    return path.stem.replace("-", " ").replace("_", " ").title()
+    return None
 
 
 # Letters NFKD does not decompose into an ASCII base letter.
@@ -817,6 +830,19 @@ def reconcile_sources(root: Path, db) -> int:
             if src["path"].startswith(PLACEHOLDER_PREFIX):
                 db.delete_source(src["id"])
 
+        # 3b. A row whose bib entry and file are both gone would not be
+        # rebuilt, so drop it (its article links go with it) and keep the
+        # table equal to a rebuild's. A moved file keeps its entry's row
+        # (step 2 moved it) or gets a new one from the disk scan below.
+        for src in db.list_sources():
+            if src["path"].startswith(PLACEHOLDER_PREFIX):
+                continue
+            key = _source_metadata(src).get("cite_key")
+            if isinstance(key, str) and key in bib_keys:
+                continue
+            if not (root / src["path"]).exists():
+                db.delete_source(src["id"])
+
     # 4. Committed files no entry claims.
     inserted += upsert_sources_from_disk(root, db)
     return inserted
@@ -1005,23 +1031,35 @@ def _source_metadata(src: dict) -> dict:
     return md if isinstance(md, dict) else {}
 
 
-def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str) -> dict | None:
+def _find_duplicate_source(db: CrucibleDB, root: Path, content_hash: str,
+                           size: int | None = None) -> dict | None:
     """Return an existing source row with the same content, or None.
 
     Matches on the stored ``content_hash`` metadata when present; for sources
     ingested before hashing existed, falls back to hashing the stored file on
     disk so re-ingesting an old source is still recognized as a duplicate.
     """
+    unhashed = []
     for src in db.list_sources():
-        md = _source_metadata(src)
-        stored = md.get("content_hash")
+        stored = _source_metadata(src).get("content_hash")
         if stored is None:
-            src_file = root / src["path"]
-            if src_file.exists():
-                try:
-                    stored = file_sha256(src_file)
-                except OSError:
-                    continue
+            unhashed.append(src)
+        elif stored == content_hash:
+            return src
+    # Rows without a hash (older ingests, disk scans, rebuilt databases) are
+    # compared by hashing their files, but only those of the same size: on a
+    # fresh clone every row lacks a hash, and hashing every stored file on
+    # every ingest would be O(files x sources). (The hash is not saved back
+    # into the row: a content_hash in the metadata marks a row as made by
+    # ingest, see _from_ingest.)
+    for src in unhashed:
+        src_file = root / src["path"]
+        try:
+            if size is not None and src_file.stat().st_size != size:
+                continue
+            stored = file_sha256(src_file)
+        except OSError:
+            continue
         if stored == content_hash:
             return src
     return None
@@ -1102,19 +1140,27 @@ def ingest_source(
         raise FileNotFoundError(f"Source not found: {source_path}")
     # A supplied entry is checked before anything is copied or written: an
     # unclosed one would otherwise reach references.bib unchanged.
-    if bibtex and bibtex.strip().startswith("@") and bibtex_mod.first_entry(bibtex.strip()) is None:
-        raise ValueError("The --bibtex entry is not a complete BibTeX entry "
-                         "(check that its braces are balanced)")
-    if bibtex and len(bibtex_mod.entries(bibtex)) > 1:
-        raise ValueError("The --bibtex value holds more than one BibTeX entry; "
-                         "pass exactly one entry per ingested source")
+    # Text before the entry (a "% Encoding: UTF-8" line from a JabRef or
+    # Zotero export, say) is allowed; text with no entry at all is an error,
+    # not something to ignore silently.
+    supplied_entry = None
+    if bibtex:
+        supplied_entry = bibtex_mod.first_entry(bibtex)
+        if supplied_entry is None:
+            raise ValueError("The --bibtex value is not a complete BibTeX entry "
+                             "(it holds no @type{key, ...} entry, or its braces "
+                             "are not balanced)")
+        if len(bibtex_mod.entries(bibtex)) > 1:
+            raise ValueError("The --bibtex value holds more than one BibTeX entry; "
+                             "pass exactly one entry per ingested source")
     date = validate_date(date)
 
     # If this exact file (same content hash) was already ingested, skip it:
     # don't copy, append bib, or add a duplicate DB row. Return the existing
     # source so callers can report it.
     content_hash = file_sha256(source_path)
-    existing = _find_duplicate_source(db, root, content_hash)
+    existing = _find_duplicate_source(db, root, content_hash,
+                                      size=source_path.stat().st_size)
     if existing is not None:
         md = _source_metadata(existing)
         return {
@@ -1145,7 +1191,11 @@ def ingest_source(
 
     # If no DOI was supplied, try to recover one from the document text so we
     # can fetch a complete, correctly-typed entry instead of a bare @misc.
-    if not doi:
+    # Only a paper (a PDF) or a web page carries its own DOI near the top; a
+    # notebook or data file that mentions a DOI is citing someone else's
+    # paper, and must not become that paper.
+    doi_given = bool(doi)
+    if not doi and source_type in ("pdf", "web"):
         doi = extract_doi_from_text(text)
 
     # The bib entry. Preference order:
@@ -1155,13 +1205,29 @@ def ingest_source(
     # Its key is a placeholder until the real one is chosen under the lock.
     placeholder = "crucible-pending-key"
     bib_entry = None
-    if bibtex and bibtex.strip().startswith("@"):
-        bib_entry = replace_cite_key(bibtex.strip(), placeholder)
+    warnings: list[str] = []
+    if supplied_entry is not None:
+        # Only the entry itself: any comment or preamble before it is dropped.
+        bib_entry = replace_cite_key(supplied_entry.text, placeholder)
     elif doi:
         fetched = fetch_bibtex_from_doi(doi)
         if fetched and bibtex_mod.first_entry(fetched) is not None:
             bib_entry = replace_cite_key(fetched, placeholder)
     known = _parse_bib_fields(bib_entry) if bib_entry else {}
+
+    # A DOI guessed from the text may be one the document cites rather than
+    # its own. When the file declares a title (an org #+TITLE, say) or the
+    # user gave one, and the fetched entry's title is a different one, the
+    # guess named another paper: none of that entry (authors, year, DOI)
+    # describes this file, so it is dropped for a generated one.
+    if bib_entry is not None and supplied_entry is None and not doi_given:
+        declared = title or declared_title(source_path, text)
+        if declared and _title_key(declared) != _title_key(known.get("title", "")):
+            warnings.append(
+                f"Ignored DOI {doi} found in the text: it belongs to "
+                f"\"{known.get('title', '')}\", not \"{declared}\""
+            )
+            bib_entry, known, doi = None, {}, None
 
     # Title, authors and date for the key: what the user gave, else what
     # the entry says, else what the file says (title) or today (date).
@@ -1172,7 +1238,17 @@ def ingest_source(
     entry_year = (known.get("date") or known.get("year") or "")[:4]
     if date is None:
         date = datetime.now().strftime("%Y-%m-%d")
-    key_date = date if date_given or not re.fullmatch(r"\d{4}", entry_year) else entry_year
+    # The key's year is the year the entry ends up with: an entry's own year
+    # wins over a --date that contradicts it (that date is not written).
+    if re.fullmatch(r"\d{4}", entry_year):
+        key_date = entry_year
+        if date_given and date[:4] != entry_year:
+            warnings.append(
+                f"--date {date} disagrees with the BibTeX entry's year "
+                f"{entry_year}; keeping the entry's year"
+            )
+    else:
+        key_date = date
     base_key = generate_cite_key(title, key_authors, key_date)
 
     if bib_entry is None:
@@ -1299,4 +1375,5 @@ def ingest_source(
         "text_length": len(text),
         "date": date,
         "duplicate": False,
+        "warnings": warnings,
     }
