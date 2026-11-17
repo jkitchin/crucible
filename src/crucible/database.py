@@ -463,12 +463,12 @@ class CrucibleDB:
              created_at, updated_at),
         )
         article_id = cur.lastrowid
-        # Index content for FTS
-        if content:
-            self.conn.execute(
-                "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
-                (article_id, path, title, content),
-            )
+        # Index for FTS even when content is empty: sync compares the indexed
+        # row with the file, and a missing row reads as a change.
+        self.conn.execute(
+            "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
+            (article_id, path, title, content),
+        )
         self.conn.commit()
         return article_id
 

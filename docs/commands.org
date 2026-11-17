@@ -120,6 +120,12 @@ under =sources/notebooks/= and =sources/data/=, then a two-pass process:
 1. Register/update all articles and concepts from org file metadata
 2. Process inter-article links, source links, and derivation chains
 
+Finally it regenerates =wiki/MANIFEST.md= and =wiki/index.org=, so they
+always match the database after a sync. An article that cannot be read
+(for example, one that is not valid UTF-8) is skipped and reported on
+stderr rather than aborting the sync. Symlinked directories under the
+wiki, and a wiki directory that is itself a symlink, are followed.
+
 Sources are tied to bibliography entries by the entry's standard =file=
 field, which =crucible ingest= writes with the stored file's path. An
 entry with a =file= field gets one source row for that file, keyed by its
@@ -315,7 +321,10 @@ Regenerate =wiki/index.org= from database state.
 crucible index
 #+END_SRC
 
-Organized by article type and by concept.
+Organized by article type and by concept; articles with an unrecognised
+=:ARTICLE_TYPE:= are listed under "Other". =crucible sync= also
+regenerates the index, so this is only needed on its own after changing
+the database by other means.
 
 ** =crucible lint=
 
@@ -380,7 +389,7 @@ Generate a manifest summarizing the knowledge base.
 crucible manifest
 #+END_SRC
 
-Writes =wiki/MANIFEST.md= with article counts, concept list, and query
+Like =crucible sync=, writes =wiki/MANIFEST.md= with article counts, concept list, and query
 instructions. Used by agents to decide whether to search this crucible.
 
 ** =crucible merge=
