@@ -107,7 +107,10 @@ entry without one gets no source row, and =crucible lint= reports any
 fields from sources ingested earlier, so running it once on a machine that
 has the database upgrades an older =references.bib=. Files under
 =sources/notebooks/= and =sources/data/= that no entry names get a source
-row keyed by file name.
+row keyed by file name. When that name is already a key in
+=references.bib= (or of an ingested source), the file is keyed
+=<name>-<extension>= instead, so it cannot take that key's article links
+from the file the entry names.
 
 A source's type comes from the folder it is stored in. Shareable PDFs and
 web sources are stored in =sources/data/=: a =.pdf= there is a PDF, and an
