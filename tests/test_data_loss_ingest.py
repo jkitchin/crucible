@@ -266,7 +266,10 @@ def test_cli_metadata_still_wins_for_key(kb, tmp_path):
     (tmp_path / "a.org").write_text("x")
     result = run("ingest", str(tmp_path / "a.org"), "-a", "Jane Smith", "--date", "2021",
                  "--bibtex", "@article{orig, author={Doe, J.}, title={T}, year={2019}}")
-    assert cite_key(result) == "smith2021"
+    # The author given wins; the year is the entry's, since a contradicting
+    # --date is not written to it (and is warned about).
+    assert cite_key(result) == "smith2019"
+    assert "disagrees" in result.output
 
 
 # 10. non-ASCII titles and names ----------------------------------------------------
@@ -387,9 +390,10 @@ def test_merge_keeps_strings_and_search_links(kb, tmp_path, registry):
     other = tmp_path / "other"
     other.mkdir()
     run("init", "--root", str(other))
+    # Different articles at the same path, so the incoming one is renamed.
     for root in (kb, other):
         (root / ".crucible/wiki/concepts/foo.org").write_text(
-            ARTICLE.format(title="Foo", body="body"))
+            ARTICLE.format(title="Foo", body=f"body of {root.name}"))
     (other / ".crucible/wiki/concepts/bar.org").write_text(ARTICLE.format(
         title="Bar", body="See [[file:foo.org::*Foo][Foo heading]] and [[file:foo.org][Foo]]."))
     (kb / ".crucible/references.bib").write_text('@string{jcp = "Target JCP"}\n')
