@@ -100,6 +100,15 @@ Two-pass process:
 Parses: =#+TITLE=, =#+FILETAGS=, =:ARTICLE_TYPE:=, =:SOURCE_KEYS:=,
 =:DERIVED_FROM:=, =[[file:...]]= links, and full text for FTS.
 
+Sources are also registered from =references.bib=. An entry becomes a
+source only when its =file= field names the source file; =crucible ingest=
+writes that field, and sync adds it to older entries whose cite key the
+database already maps to a file, so a rebuilt database can recover every
+source. Entries with no =file= field are reported and not registered. A
+source left at a synthetic =.crucible/bib/<key>= path by an older version
+moves to the entry's =file= path, keeping its article links, once the entry
+has one.
+
 Idempotent and safe to run repeatedly.
 
 ** =crucible embed=

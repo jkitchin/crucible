@@ -22,14 +22,16 @@ class OrgMetadata:
 
 
 # Patterns
-TITLE_RE = re.compile(r"^#\+TITLE:\s*(.+)$", re.MULTILINE)
-FILETAGS_RE = re.compile(r"^#\+FILETAGS:\s*(.+)$", re.MULTILINE)
+TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
+FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
+# Org keywords, drawer names and property names are case-insensitive;
+# property names are normalized to uppercase in OrgMetadata.properties.
 PROP_DRAWER_RE = re.compile(
-    r":PROPERTIES:\s*\n(.*?)\n\s*:END:", re.DOTALL
+    r":PROPERTIES:\s*\n(.*?)\n\s*:END:", re.DOTALL | re.IGNORECASE
 )
 # [ \t], not \s: \s matches a newline, so an empty property would take
 # the next property line as its value.
-PROP_LINE_RE = re.compile(r"^[ \t]*:([A-Z_]+):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+PROP_LINE_RE = re.compile(r"^[ \t]*:([A-Za-z_]+):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 FILE_LINK_RE = re.compile(r"\[\[file:([^\]]+?)(?:::.*?)?\](?:\[([^\]]*)\])?\]")
 CITE_RE = re.compile(r"(?:cite[pt]?):([a-zA-Z0-9_,-]+)")
 
@@ -53,7 +55,7 @@ def parse_org(text: str) -> OrgMetadata:
     for drawer in PROP_DRAWER_RE.finditer(text):
         drawer_text = drawer.group(1)
         for m in PROP_LINE_RE.finditer(drawer_text):
-            key = m.group(1)
+            key = m.group(1).upper()
             val = m.group(2).strip()
             # First occurrence wins (top-level heading properties)
             if key not in meta.properties:
