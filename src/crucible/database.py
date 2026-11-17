@@ -684,15 +684,27 @@ class CrucibleDB:
         """, (article_path,))]
 
     def concept_articles(self, concept_name: str) -> list[dict]:
-        """Articles covering a given concept."""
-        return [dict(r) for r in self.conn.execute("""
-            SELECT a.*
+        """Articles covering a given concept.
+
+        The name is matched by _concept_key, ignoring case and punctuation,
+        so "activation energy" finds the tag ``activation_energy``. An
+        article tagged with several spellings of the concept appears once.
+        """
+        key = _concept_key(concept_name)
+        if not key:
+            return []
+        ids = [r["id"] for r in self.conn.execute("SELECT id, name FROM concepts")
+               if _concept_key(r["name"]) == key]
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        return [dict(r) for r in self.conn.execute(f"""
+            SELECT DISTINCT a.*
             FROM article_concepts ac
             JOIN articles a ON a.id = ac.article_id
-            JOIN concepts c ON c.id = ac.concept_id
-            WHERE c.name = ?
+            WHERE ac.concept_id IN ({marks})
             ORDER BY a.title
-        """, (concept_name.lower(),))]
+        """, tuple(ids))]
 
     def orphans(self) -> list[dict]:
         """Articles with no incoming links."""

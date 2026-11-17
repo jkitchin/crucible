@@ -6,8 +6,11 @@
 ** =crucible init=
 
 Initialize a crucible project. Creates =.crucible/= in the project root
-with the wiki and source directories, =references.bib= and the database
-=.crucible/crucible.db=, registers the project in the global registry,
+with the wiki and source directories, an empty =references.bib= and the
+database =.crucible/crucible.db=, plus =CLAUDE.md= and =.gitignore= at the
+project root (an existing =.gitignore= keeps its contents and gets any
+missing crucible entries appended under a marker comment, so copyrighted
+sources and the database stay out of git), registers the project in the global registry,
 installs the skill and writes the manifest. It does not change
 =~/.claude/CLAUDE.md=: run =crucible install= in the project to point agents
 at it.
@@ -56,6 +59,12 @@ crucible uninstall
 Removes only the skill files crucible installed. Files you added to
 =~/.claude/skills/crucible/=, backups, and installed files you have edited
 since are left in place (and named); the directory is removed once empty.
+Without an install record (an install by an old version), a file is
+removed only if it is an unedited copy that some crucible version shipped.
+A skill directory or file that is a symlink is never removed or written
+through, by =uninstall= or by =install=. If =~/.claude/CLAUDE.md= has an
+unpaired =<!-- crucible-knowledge-base -->= marker, =install= and
+=uninstall= leave it unchanged and say so.
 
 * Ingestion Commands
 
@@ -246,7 +255,8 @@ with a warning on stderr.
 may be the database path (relative to the project root, as =--json=
 output gives it, e.g. =.crucible/wiki/concepts/activation-energy.org=), a
 path relative to the current directory (so tab completion works from any
-subdirectory), an absolute path, or a path relative to the wiki
+subdirectory), an absolute path, a path relative to =.crucible/=
+(=wiki/concepts/activation-energy.org=), or a path relative to the wiki
 (=concepts/activation-energy.org=). If no article has that path the
 command exits 1 with an error, rather than reporting no results; run
 =crucible sync= first if the file is new.
@@ -275,7 +285,8 @@ Show everything known about a source.
 crucible source SOURCE_PATH [--json]
 #+END_SRC
 
-SOURCE_PATH is the source's path, or part of its path or title. Shows the
+SOURCE_PATH is the source's path (in any of the forms article paths
+take), or else part of its path or title; an empty one is an error. Shows the
 source's metadata and the articles distilled from it, which is useful
 before asking Claude to reread and resummarize it. Exits 1 if no source
 matches.
@@ -298,8 +309,9 @@ Show articles covering a specific concept.
 crucible concept thermodynamics
 #+END_SRC
 
-Concepts come from =#+FILETAGS:=, which sync lowercases, so the name is
-matched case-insensitively.
+Concepts come from =#+FILETAGS:=. The name is matched ignoring case and
+punctuation, so =crucible concept "activation energy"= finds the tag
+=activation_energy=.
 
 ** =crucible related=
 
@@ -617,7 +629,8 @@ crucible update
 #+END_SRC
 
 Runs pending database migrations, updates the project's
-=.claude/settings.json=, re-registers the project in the global registry
+=.claude/settings.json=, adds any missing crucible entries to =.gitignore=,
+re-registers the project in the global registry
 and reinstalls the skill files and manifest. Like =init=, it does not
 change the =~/.claude/CLAUDE.md= directive. Safe to run repeatedly.
 
@@ -638,7 +651,8 @@ crucible vscode [FILE]
 #+END_SRC
 
 Opens the project root as the workspace and the wiki's =index.org= (or
-=FILE=, a path relative to the wiki such as =concepts/foo.org=). With the
+=FILE=, a path relative to the wiki such as =concepts/foo.org=, or to the
+current directory; a =FILE= that does not exist exits 1). With the
 [[https://github.com/jkitchin/scimax_vscode][scimax]] extension, the Crucible
 panel in the Scimax sidebar then lists this crucible first, with its
 concepts and articles, and has search, back-links and related articles.
@@ -653,7 +667,8 @@ crucible help [TOPIC]
 #+END_SRC
 
 Topics: overview, workflow, ingest, distill, search, sync, maintain,
-org-format, registry. Use =all= for everything. An unknown topic exits 1.
+org-format, registry, and commands (every command and option, generated
+from the CLI itself). Use =all= for everything. An unknown topic exits 1.
 
 * Exit Codes
 

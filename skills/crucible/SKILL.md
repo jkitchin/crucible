@@ -53,6 +53,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Sources for article | `crucible sources .crucible/wiki/concepts/x.org` |
 | Everything about a source | `crucible source .crucible/sources/data/x.csv` |
 | Implied relationships | `crucible related .crucible/wiki/concepts/x.org` |
+| Derivation history | `crucible history .crucible/wiki/comparisons/x.org` |
 | Orphan articles | `crucible orphans` |
 | Undigested sources | `crucible undigested` |
 | Regenerate index | `crucible index` |
@@ -62,15 +63,28 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Database stats | `crucible stats` |
 | Merge another crucible | `crucible merge SOURCE [-n] [-y]` |
 | Delete an article or source | `crucible delete PATH [--file] [-y]` |
+| Browse the wiki in a browser | `crucible browse [-p PORT] [--no-open]` |
+| Interactive knowledge graph | `crucible viz [-o FILE] [--open]` |
+| Install skill + point ~/.claude/CLAUDE.md here | `crucible install` |
+| Apply migrations, refresh skill after upgrading | `crucible update` |
+| Remove skill and directive | `crucible uninstall` |
 | Full help | `crucible help all` |
+| Every command and option | `crucible help commands` |
 | Installed version | `crucible --version` |
 
-Article paths given to `backlinks`, `sources`, `related` and `history` may be
-relative to the project root (as above and in `--json` output), to the
-current directory, or to the wiki (`concepts/x.org`), or absolute. A path
-that names no article, an unknown `source`, or an unknown `help` topic is an
-error (exit 1), not an empty result; run `crucible sync` first if the article
-is new. Concept names are matched case-insensitively.
+Article paths given to `backlinks`, `sources`, `related` and `history` (and
+source paths given to `source`) may be relative to the project root (as above
+and in `--json` output), to the current directory, to `.crucible/`
+(`wiki/concepts/x.org`), or to the wiki (`concepts/x.org`), or absolute. A
+path that names no article, an unknown `source`, or an unknown `help` topic
+is an error (exit 1), not an empty result; run `crucible sync` first if the
+article is new. Concept names ignore case and punctuation, so
+`crucible concept "activation energy"` finds the tag `activation_energy`.
+
+`crucible install` copies the skill and, inside a project, points the global
+`~/.claude/CLAUDE.md` directive at that crucible (replacing one for another
+crucible). `crucible init` and `crucible update` install the skill but never
+change that directive.
 
 ## Working Directory
 

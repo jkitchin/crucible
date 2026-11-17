@@ -14,7 +14,7 @@ from typing import NoReturn
 
 import click
 
-from crucible import DISTRIBUTION, package_version
+from crucible import package_version
 from crucible import registry as registry_module
 from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
@@ -311,7 +311,9 @@ def _emit_json(data) -> None:
 
 
 @click.group()
-@click.version_option(package_name=DISTRIBUTION, prog_name="crucible")
+# version=, not package_name=: click raises RuntimeError when the
+# distribution metadata is missing, where package_version() says "dev".
+@click.version_option(version=package_version(), prog_name="crucible")
 @click.pass_context
 def cli(ctx):
     """Crucible - LLM-compiled knowledge base."""
@@ -380,8 +382,57 @@ def about(json_output):
 
     click.echo()
     click.echo("Help topics: overview, workflow, ingest, distill, search,")
-    click.echo("  sync, maintain, org-format, registry")
+    click.echo("  sync, maintain, org-format, registry, commands")
     click.echo("Run `crucible help <topic>` or `crucible help all`")
+
+
+# What a crucible project keeps out of git, as (comment, patterns) groups.
+_GITIGNORE_GROUPS = [
+    ("# Crucible: external sources (copyrighted, not shareable)",
+     [".crucible/sources/external/"]),
+    ("# Crucible: database (regenerable from wiki via auto-rebuild)",
+     [".crucible/crucible.db",
+      ".crucible/crucible.db-wal",
+      ".crucible/crucible.db-shm",
+      ".crucible/crucible.db-journal",
+      ".crucible/.crucible.db.rebuild-*.tmp"]),
+    ("# Crucible: lock file for references.bib",
+     [".crucible/references.bib.lock"]),
+    ("# Crucible: publish output",
+     [".crucible/wiki/_build/"]),
+    ("# Crucible: left behind only if a merge is killed",
+     [".crucible/.merge-staging-*/"]),
+]
+
+_GITIGNORE_MARKER = "# Crucible: entries added to an existing .gitignore"
+
+
+def _ensure_gitignore(root: Path) -> str | None:
+    """Make root/.gitignore ignore what crucible must keep out of git.
+
+    A missing .gitignore is created. An existing one keeps its contents and
+    gets any missing crucible patterns appended under a marker comment, so
+    copyrighted sources and the database are not committable in a repository
+    that already had a .gitignore. Idempotent. Returns a description of the
+    change for the "Created:" line, or None if nothing changed.
+    """
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        blocks = ["\n".join([comment, *patterns]) for comment, patterns in _GITIGNORE_GROUPS]
+        gitignore.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        return ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8", errors="replace")
+    present = {line.strip() for line in existing.splitlines()}
+    missing = [pattern for _comment, patterns in _GITIGNORE_GROUPS
+               for pattern in patterns if pattern not in present]
+    if not missing:
+        return None
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"\n{_GITIGNORE_MARKER}\n" + "\n".join(missing) + "\n"
+    gitignore.write_text(text, encoding="utf-8")
+    return f".gitignore (added {len(missing)} crucible entr{'y' if len(missing) == 1 else 'ies'})"
 
 
 @cli.command()
@@ -390,9 +441,11 @@ def about(json_output):
 def init(root):
     """Initialize a new crucible project.
 
-    Creates .crucible/ with the full directory structure, CLAUDE.md,
-    .gitignore, and the SQLite database. Everything lives inside
-    .crucible/ to keep the project directory clean.
+    Creates .crucible/ with the full directory structure, an empty
+    references.bib and the SQLite database, plus CLAUDE.md and .gitignore
+    (an existing .gitignore gets any missing crucible entries appended).
+    Registers the project, installs the skill and writes the manifest, but
+    leaves ~/.claude/CLAUDE.md alone (run `crucible install` for that).
 
     Safe to re-run on an existing project (creates only what's missing).
     """
@@ -423,30 +476,15 @@ def init(root):
     created = []
 
     # .gitignore at the project root
-    gitignore = root / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text(
-            "# Crucible: external sources (copyrighted, not shareable)\n"
-            ".crucible/sources/external/\n"
-            "\n"
-            "# Crucible: database (regenerable from wiki via auto-rebuild)\n"
-            ".crucible/crucible.db\n"
-            ".crucible/crucible.db-wal\n"
-            ".crucible/crucible.db-shm\n"
-            ".crucible/crucible.db-journal\n"
-            ".crucible/.crucible.db.rebuild-*.tmp\n"
-            "\n"
-            "# Crucible: lock file for references.bib\n"
-            ".crucible/references.bib.lock\n"
-            "\n"
-            "# Crucible: publish output\n"
-            ".crucible/wiki/_build/\n"
-            "\n"
-            "# Crucible: left behind only if a merge is killed\n"
-            ".crucible/.merge-staging-*/\n",
-            encoding="utf-8",
-        )
-        created.append(".gitignore")
+    gitignore_change = _ensure_gitignore(root)
+    if gitignore_change:
+        created.append(gitignore_change)
+
+    # An empty bibliography, so references.bib exists from the start
+    bib_path = cdir / "references.bib"
+    if not bib_path.exists():
+        bib_path.write_text("", encoding="utf-8")
+        created.append(".crucible/references.bib")
 
     # CLAUDE.md at project root
     claude_md = root / "CLAUDE.md"
@@ -500,8 +538,9 @@ def init(root):
         click.echo(f"  Registered in global registry as '{actual_name}'")
 
     # Install the skill and this project's manifest; the global CLAUDE.md
-    # directive is left to an explicit `crucible install`.
-    _install(root=root, directive=False)
+    # directive is left to an explicit `crucible install`. The project is
+    # registered above, so _install does not register (and report) it again.
+    _install(root=root, directive=False, register=False)
 
 
 @cli.command()
@@ -1477,35 +1516,74 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
             click.echo(f"    (absorbed: {', '.join(absorbed)})")
 
 
+def _project_path_candidates(root: Path, path: str) -> list[str]:
+    """Database paths (relative to the project root) that PATH may name.
+
+    In order: PATH as given (normalized), relative to the current
+    directory or absolute, relative to the wiki (``concepts/x.org``), and
+    relative to ``.crucible/`` (``wiki/concepts/x.org``,
+    ``sources/data/x.csv``). Raises a ClickException for an empty PATH,
+    which would otherwise match everything.
+    """
+    if not path or not path.strip():
+        raise click.ClickException("The path is empty.")
+    candidates: list[str] = []
+
+    def add(candidate: str | None) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(path)
+    given = Path(os.path.expanduser(path))
+    if not given.is_absolute():
+        add(os.path.normpath(given.as_posix()).replace(os.sep, "/"))
+    absolute = given if given.is_absolute() else Path.cwd() / given
+    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
+        for base in (root, root.resolve()):
+            rel = _safe_relative_to(target, base)
+            if rel is not None:
+                add(Path(rel).as_posix())
+    if not given.is_absolute():
+        for base in (Path(CRUCIBLE_DIR) / "wiki", Path(CRUCIBLE_DIR)):
+            normalized = os.path.normpath(base / given)
+            # Never let ../ climb out of the project.
+            if not normalized.startswith(".."):
+                add(Path(normalized).as_posix())
+    return candidates
+
+
+def _lookup_project_path(root: Path, path: str, lookup) -> dict | None:
+    """The row lookup(candidate) returns for the first candidate PATH names.
+
+    lookup is a database getter such as db.get_article_by_path or
+    db.get_source_by_path. See _project_path_candidates for the path forms
+    accepted. Returns None if no candidate matches.
+    """
+    for candidate in _project_path_candidates(root, path):
+        row = lookup(candidate)
+        if row:
+            return row
+    return None
+
+
 def _resolve_article_arg(root: Path, db: CrucibleDB, article_path: str) -> str:
     """Return the database path of the article that ARTICLE_PATH names.
 
     Database paths are relative to the project root
     (``.crucible/wiki/concepts/foo.org``). The argument may also be relative
     to the current directory (``./.crucible/...``, or ``foo.org`` from inside
-    the wiki), absolute, or relative to the wiki directory
-    (``concepts/foo.org``). Raises a ClickException (exit 1) if no article
-    has that path, so a typo is not mistaken for "no results".
+    the wiki), absolute, relative to the wiki directory
+    (``concepts/foo.org``), or relative to ``.crucible/``
+    (``wiki/concepts/foo.org``). Raises a ClickException (exit 1) if no
+    article has that path, so a typo is not mistaken for "no results".
     """
-    if db.get_article_by_path(article_path):
-        return article_path
-    candidates = []
-    given = Path(os.path.expanduser(article_path))
-    absolute = given if given.is_absolute() else Path.cwd() / given
-    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
-        for base in (root, root.resolve()):
-            rel = _safe_relative_to(target, base)
-            if rel is not None:
-                candidates.append(Path(rel).as_posix())
-    if not given.is_absolute():
-        candidates.append((Path(CRUCIBLE_DIR) / "wiki" / given).as_posix())
-    for candidate in candidates:
-        if db.get_article_by_path(candidate):
-            return candidate
+    article = _lookup_project_path(root, article_path, db.get_article_by_path)
+    if article:
+        return article["path"]
     raise click.ClickException(
         f"No article at {article_path} (paths are relative to the current "
-        "directory, the project root, or the wiki; run `crucible sync` if "
-        "the file is new)"
+        "directory, the project root, .crucible/ or the wiki; run "
+        "`crucible sync` if the file is new)"
     )
 
 
@@ -1520,7 +1598,8 @@ def history(article_path, json_output):
     Traces the evolution of knowledge over time.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -1561,7 +1640,8 @@ def backlinks(article_path, json_output):
     """Show articles that link to the given article.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -1592,12 +1672,19 @@ def source_info(source_path, json_output):
 
     Displays the source metadata and all articles distilled from it.
     Useful for resummarization: see what's already been captured before
-    asking Claude to reread the source. Exits 1 if no source matches.
+    asking Claude to reread the source. SOURCE_PATH may be relative to the
+    current directory, the project root or .crucible/, or absolute; failing
+    that, it is matched against source paths and titles. Exits 1 if no
+    source matches.
     """
     root = get_root()
     db = get_db(root)
 
-    src = db.get_source_by_path(source_path)
+    try:
+        src = _lookup_project_path(root, source_path, db.get_source_by_path)
+    except click.ClickException:
+        db.close()
+        raise
     if not src:
         # Try matching by title or partial path
         for s in db.list_sources():
@@ -1641,7 +1728,8 @@ def sources(article_path, json_output):
     """Show primary sources for an article.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -1696,7 +1784,8 @@ def concepts(query_all, json_output):
 def concept(name, json_output):
     """Show articles covering a concept.
 
-    NAME is matched case-insensitively (sync lowercases FILETAGS).
+    NAME is matched ignoring case and punctuation, so "activation energy"
+    finds the tag activation_energy.
     """
     root = get_root()
     db = get_db(root)
@@ -1758,7 +1847,8 @@ def related(article_path, json_output):
     temporal proximity, and explicit links.
 
     ARTICLE_PATH may be relative to the current directory, the project
-    root or the wiki, or absolute. Exits 1 if no article has that path.
+    root, .crucible/ (wiki/concepts/x.org) or the wiki, or absolute.
+    Exits 1 if no article has that path.
     """
     root = get_root()
     db = get_db(root)
@@ -2152,7 +2242,16 @@ def vscode(file):
 
     # Also open a specific file (or index.org by default)
     if file:
-        target = wiki_dir / file
+        # A wiki-relative path, or one relative to the current directory
+        # or absolute. A FILE that does not exist is an error, not a silent
+        # fallback to opening only the project.
+        given = Path(os.path.expanduser(file))
+        target = next((c for c in (wiki_dir / given, given) if c.is_file()), None)
+        if target is None:
+            raise click.ClickException(
+                f"No such file: {file} (give a path relative to the wiki, "
+                "like concepts/foo.org, or to the current directory)"
+            )
     else:
         target = wiki_dir / "index.org"
 
@@ -2214,7 +2313,11 @@ def delete(path, yes, delete_file):
     db = get_db(root)
 
     # Try to find as article
-    article = db.get_article_by_path(path)
+    try:
+        article = _lookup_project_path(root, path, db.get_article_by_path)
+    except click.ClickException:
+        db.close()
+        raise
     if not article:
         for a in db.list_articles():
             if path in a["path"] or path in a["title"]:
@@ -2238,7 +2341,7 @@ def delete(path, yes, delete_file):
         return
 
     # Try to find as source
-    src = db.get_source_by_path(path)
+    src = _lookup_project_path(root, path, db.get_source_by_path)
     if not src:
         for s in db.list_sources():
             if path in s["path"] or path in s["title"]:
@@ -3813,12 +3916,65 @@ def suggest(json_output):
     click.echo(f"\nTotal: {len(suggestions)} suggestions")
 
 
+def _commands_reference() -> str:
+    """Every command, argument and option, generated from the click tree.
+
+    Generated rather than written by hand so `crucible help commands` (and
+    `help all`) cannot fall behind the CLI.
+    """
+    import inspect
+
+    lines = ["COMMAND REFERENCE (every command and option)", ""]
+
+    def option_lines(cmd: click.Command, ctx: click.Context) -> list[str]:
+        out = []
+        for param in cmd.get_params(ctx):
+            if param.name == "help":
+                continue
+            record = param.get_help_record(ctx)
+            if record:
+                opts, text = record
+                out.append(f"      {opts:<34} {text}" if text else f"      {opts}")
+        return out
+
+    def walk(cmd: click.Command, ctx: click.Context) -> None:
+        if isinstance(cmd, click.Group) and ctx.parent is not None:
+            lines.append(f"crucible {ctx.command_path.split(' ', 1)[1]} COMMAND")
+            if cmd.help:
+                lines.append("    " + inspect.cleandoc(cmd.help).splitlines()[0])
+            lines.append("")
+        if isinstance(cmd, click.Group):
+            for name in sorted(cmd.commands):
+                sub = cmd.commands[name]
+                walk(sub, click.Context(sub, info_name=name, parent=ctx))
+            return
+        usage = " ".join(cmd.collect_usage_pieces(ctx))
+        lines.append(f"{ctx.command_path} {usage}".rstrip())
+        for line in inspect.cleandoc(cmd.help or "").splitlines():
+            if line.strip() != "\b":
+                lines.append(f"    {line}".rstrip())
+        opts = option_lines(cmd, ctx)
+        if opts:
+            lines.append("    Options:")
+            lines.extend(opts)
+        lines.append("")
+
+    root_ctx = click.Context(cli, info_name="crucible")
+    lines.append("crucible [--version] [--help] COMMAND ...")
+    lines.extend(option_lines(cli, root_ctx) or [])
+    lines.append("")
+    walk(cli, root_ctx)
+    return "\n".join(lines)
+
+
 @cli.command("help")
 @click.argument("topic", default="overview")
 def help_cmd(topic):
     """Show detailed help for agents and humans.
 
-    TOPIC can be: overview, workflow, ingest, distill, search, sync, maintain, org-format, registry, or all.
+    TOPIC can be: overview, workflow, ingest, distill, search, sync,
+    maintain, org-format, registry, commands, or all. `commands` lists
+    every command and option; `all` prints every topic.
     """
     topics = {
         "overview": """
@@ -3843,7 +3999,8 @@ Directory layout (everything lives in .crucible/ at the project root):
 
 Run `crucible help all` for complete documentation.
 Run `crucible help <topic>` for a specific topic.
-Topics: overview, workflow, ingest, distill, search, sync, maintain, org-format, registry
+Topics: overview, workflow, ingest, distill, search, sync, maintain, org-format,
+  registry, commands (every command and option)
 """,
         "workflow": """
 TYPICAL WORKFLOW
@@ -3981,10 +4138,11 @@ Structured queries:
   crucible orphans                     Articles with no incoming links
   crucible undigested                  Sources not yet distilled
 
-  Article paths may be relative to the project root (as shown), to the
-  current directory, or to the wiki (concepts/x.org), or absolute. A path
-  that names no article, or an unknown source, exits 1 with an error.
-  Concept names are case-insensitive.
+  Article and source paths may be relative to the project root (as
+  shown), to the current directory, to .crucible/ (wiki/concepts/x.org),
+  or to the wiki (concepts/x.org), or absolute. A path that names no
+  article, or an unknown source, exits 1 with an error. Concept names
+  ignore case and punctuation ("activation energy" = activation_energy).
 
 Graph export:
   crucible graph                       DOT format to stdout
@@ -4122,6 +4280,14 @@ during sync.
 CREATED / MODIFIED: the article's dates; update MODIFIED on every edit.
 They are what the database records, so they survive a rebuild.
 
+DERIVED_FROM (optional): space-separated paths of the wiki articles this
+one was synthesized from, e.g. for an article written from a conversation
+that drew on others:
+  :DERIVED_FROM: ../concepts/activation-energy.org ../summaries/smith2024.org
+Paths are relative to the article, or to the wiki (optionally with a
+leading wiki/). Sync records them as derivation links, which
+`crucible history ARTICLE` shows upstream and downstream.
+
 ARTICLE TYPES:
   concept     - A single topic or idea (e.g., activation-energy.org)
   summary     - Summary of one primary source
@@ -4154,8 +4320,11 @@ a numeric suffix (e.g., my-project-2).
 """,
     }
 
+    topics["commands"] = _commands_reference()
+
     if topic == "all":
-        for t in ["overview", "workflow", "ingest", "distill", "search", "sync", "maintain", "org-format", "registry"]:
+        for t in ["overview", "workflow", "ingest", "distill", "search", "sync",
+                  "maintain", "org-format", "registry", "commands"]:
             click.echo(topics[t])
     elif topic in topics:
         click.echo(topics[topic])
@@ -4230,6 +4399,12 @@ def publish(output, init_only):
         raise click.ClickException(
             "'scimax' command not found. Install scimax, or use --init-only "
             "to write the publish config without publishing."
+        )
+    except subprocess.TimeoutExpired:
+        raise click.ClickException(
+            "scimax publish did not finish within 300 seconds; the HTML in "
+            f"{out_dir} may be incomplete. Run `scimax publish` from {wiki_dir} "
+            "to publish without the time limit."
         )
     if result.returncode != 0:
         click.echo(result.stderr, err=True)
@@ -4322,47 +4497,89 @@ def _write_skill_record(skill_dest: Path, record: dict[str, str]) -> None:
     )
 
 
-def _install(root: Path | None, directive: bool) -> None:
+def _install_skill_files(skill_src: Path, skill_dest: Path) -> None:
+    """Copy the packaged skill files into skill_dest.
+
+    Symlinks are never written through: a skill directory or file that is
+    already a link to the packaged skill (a development setup) is reported
+    as linked, and a link to anything else is not crucible's and is left
+    alone. Copying onto a link would overwrite its target, or put the
+    install record in another directory.
+    """
+    if skill_dest.is_symlink():
+        try:
+            linked = skill_dest.exists() and skill_dest.samefile(skill_src)
+        except OSError:
+            linked = False
+        if linked:
+            click.echo(f"  Skill: {skill_dest} already links to {skill_src}")
+        else:
+            click.echo(f"  Skill: {skill_dest} is a symlink, not a crucible install; "
+                       "left it alone (remove it and re-run to install the skill)")
+        return
+
+    skill_dest.mkdir(parents=True, exist_ok=True)
+    record = _read_skill_record(skill_dest)
+
+    for src_file in sorted(skill_src.iterdir()):
+        if not src_file.is_file():
+            continue
+        dest_file = skill_dest / src_file.name
+        try:
+            linked = dest_file.exists() and src_file.samefile(dest_file)
+        except OSError:
+            linked = False
+        if linked:
+            record.pop(src_file.name, None)
+            click.echo(f"  Skill: {dest_file} already links to {src_file}")
+            continue
+        if dest_file.is_symlink():
+            record.pop(src_file.name, None)
+            click.echo(f"  Skill: {dest_file} is a symlink, not a crucible copy; "
+                       "left it alone")
+            continue
+        new_hash = _file_sha256(src_file)
+        if dest_file.is_file():
+            current = _file_sha256(dest_file)
+            shipped = (
+                {record[src_file.name]} if src_file.name in record
+                else _PRE_RECORD_SKILL_HASHES.get(src_file.name, frozenset())
+            )
+            if current != new_hash and current not in shipped:
+                # Not a copy crucible installed: keep the local edits,
+                # in a backup no later install overwrites.
+                backup = dest_file.with_name(dest_file.name + ".bak")
+                n = 1
+                while backup.exists():
+                    n += 1
+                    backup = dest_file.with_name(f"{dest_file.name}.bak{n}")
+                shutil.copy2(str(dest_file), str(backup))
+                click.echo(f"  Skill: {dest_file} had local changes; "
+                           f"saved a copy to {backup}")
+        shutil.copy2(str(src_file), str(dest_file))
+        record[src_file.name] = new_hash
+        click.echo(f"  Skill: {src_file.name} -> {dest_file}")
+    record_path = skill_dest / _SKILL_RECORD
+    if record_path.is_symlink():
+        click.echo(f"  Skill: {record_path} is a symlink; did not write the install record")
+    else:
+        _write_skill_record(skill_dest, record)
+
+
+def _install(root: Path | None, directive: bool, register: bool = True) -> None:
     """Install the skill; for a project, also its manifest and registry entry.
 
     `root` is the project (None: the one containing the current directory).
     Only `crucible install` passes directive=True: init and update must not
     repoint the global ~/.claude/CLAUDE.md at the project they act on.
+    register=False skips registering the project (the caller already did).
     """
     # 1. Install skill files (works from anywhere)
     skill_src = _skill_source()
     if not skill_src.exists():
         raise click.ClickException(f"Skill source not found at {skill_src}")
 
-    skill_dest = _skill_dest()
-    skill_dest.mkdir(parents=True, exist_ok=True)
-    record = _read_skill_record(skill_dest)
-
-    for src_file in sorted(skill_src.iterdir()):
-        if src_file.is_file():
-            dest_file = skill_dest / src_file.name
-            new_hash = _file_sha256(src_file)
-            if dest_file.is_file():
-                current = _file_sha256(dest_file)
-                shipped = (
-                    {record[src_file.name]} if src_file.name in record
-                    else _PRE_RECORD_SKILL_HASHES.get(src_file.name, frozenset())
-                )
-                if current != new_hash and current not in shipped:
-                    # Not a copy crucible installed: keep the local edits,
-                    # in a backup no later install overwrites.
-                    backup = dest_file.with_name(dest_file.name + ".bak")
-                    n = 1
-                    while backup.exists():
-                        n += 1
-                        backup = dest_file.with_name(f"{dest_file.name}.bak{n}")
-                    shutil.copy2(str(dest_file), str(backup))
-                    click.echo(f"  Skill: {dest_file} had local changes; "
-                               f"saved a copy to {backup}")
-            shutil.copy2(str(src_file), str(dest_file))
-            record[src_file.name] = new_hash
-            click.echo(f"  Skill: {src_file.name} -> {dest_file}")
-    _write_skill_record(skill_dest, record)
+    _install_skill_files(skill_src, _skill_dest())
 
     # 2. If inside a project, generate manifest and add CLAUDE.md directive
     if root is None:
@@ -4381,10 +4598,11 @@ def _install(root: Path | None, directive: bool) -> None:
         db.close()
     click.echo(f"  Manifest: {manifest_path}")
 
-    # Auto-register in global registry
-    actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
-    if actual_name:
-        click.echo(f"  Registry: registered as '{actual_name}'")
+    # Auto-register in global registry (init and update have already)
+    if register:
+        actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
+        if actual_name:
+            click.echo(f"  Registry: registered as '{actual_name}'")
 
     if not directive:
         click.echo("  CLAUDE.md: unchanged (run `crucible install` here to point agents at this crucible)")
@@ -4411,18 +4629,25 @@ def _install(root: Path | None, directive: bool) -> None:
     if claude_md.exists():
         existing = claude_md.read_text(encoding="utf-8")
         if marker in existing:
-            # Replace existing directive
-            import re as _re
-            pattern = _re.compile(
-                _re.escape(marker) + r".*?" + _re.escape(marker),
-                _re.DOTALL,
-            )
-            # A function, not a string: the directive holds the project
-            # path, and a string replacement would read its backslashes
-            # (every Windows path) as regex escapes.
-            updated = pattern.sub(lambda _m: directive_text.strip(), existing)
-            claude_md.write_text(updated, encoding="utf-8")
-            click.echo(f"  CLAUDE.md: updated existing directive")
+            if existing.count(marker) % 2:
+                # An unpaired marker: replacing from it to the next one
+                # would delete whatever lies between, and appending a block
+                # would pair the stray marker with the new one next time.
+                _warn(f"  CLAUDE.md: {claude_md} has an unpaired {marker} marker; "
+                      "left it unchanged. Remove the stray marker (or the "
+                      "partial crucible block) and run `crucible install` again.")
+            else:
+                # Replace existing directive
+                pattern = re.compile(
+                    re.escape(marker) + r".*?" + re.escape(marker),
+                    re.DOTALL,
+                )
+                # A function, not a string: the directive holds the project
+                # path, and a string replacement would read its backslashes
+                # (every Windows path) as regex escapes.
+                updated = pattern.sub(lambda _m: directive_text.strip(), existing)
+                claude_md.write_text(updated, encoding="utf-8")
+                click.echo(f"  CLAUDE.md: updated existing directive")
         else:
             claude_md.write_text(existing.rstrip() + "\n" + directive_text, encoding="utf-8")
             click.echo(f"  CLAUDE.md: added directive")
@@ -4445,21 +4670,31 @@ def uninstall():
     """
     # 1. Remove the skill files crucible installed
     skill_dest = _skill_dest()
-    if skill_dest.is_dir():
+    if skill_dest.is_symlink():
+        click.echo(f"  Left {skill_dest} in place: it is a symlink, not a crucible install")
+    elif skill_dest.is_dir():
         record = _read_skill_record(skill_dest)
+        skill_src = _skill_source()
         if record:
             installed = set(record)
         else:
             # Installed by a version that kept no record: only the files
-            # the package ships are crucible's.
-            skill_src = _skill_source()
+            # the package ships are crucible's, and only an unedited copy
+            # of one (a hash crucible shipped) may be removed.
             installed = ({p.name for p in skill_src.iterdir() if p.is_file()}
                          if skill_src.is_dir() else set())
         for name in sorted(installed):
             path = skill_dest / name
             if not path.is_file() or path.is_symlink():
                 continue
-            if name in record and _file_sha256(path) != record[name]:
+            current = _file_sha256(path)
+            if name in record:
+                ours = current == record[name]
+            else:
+                shipped = skill_src / name
+                ours = (current in _PRE_RECORD_SKILL_HASHES.get(name, frozenset())
+                        or (shipped.is_file() and current == _file_sha256(shipped)))
+            if not ours:
                 click.echo(f"  Kept {path}: it has local changes")
                 continue
             path.unlink()
@@ -4485,9 +4720,15 @@ def uninstall():
                 r"\n?" + re.escape(marker) + r".*?" + re.escape(marker) + r"\n?",
                 re.DOTALL,
             )
-            updated = pattern.sub("", existing).rstrip() + "\n"
-            claude_md.write_text(updated, encoding="utf-8")
-            click.echo(f"  Removed directive from CLAUDE.md")
+            updated, count = pattern.subn("", existing)
+            if existing.count(marker) % 2:
+                count = 0  # an unpaired marker: do not guess where the block ends
+            if count:
+                claude_md.write_text(updated.rstrip() + "\n", encoding="utf-8")
+                click.echo(f"  Removed directive from CLAUDE.md")
+            else:
+                _warn(f"  CLAUDE.md: {claude_md} has an unpaired {marker} marker; "
+                      "left it unchanged. Remove the crucible block by hand.")
         else:
             click.echo(f"  No crucible directive found in CLAUDE.md")
     else:
@@ -4500,8 +4741,9 @@ def uninstall():
 def update():
     """Update crucible to the latest version.
 
-    Runs all pending database migrations, re-registers in the global
-    registry, and reinstalls the skill files. Safe to run repeatedly.
+    Runs all pending database migrations, adds any missing crucible
+    entries to .gitignore, re-registers in the global registry, and
+    reinstalls the skill files. Safe to run repeatedly.
 
     Use this after upgrading the crucible package to apply schema
     changes and pick up new skill definitions.
@@ -4526,13 +4768,17 @@ def update():
     else:
         click.echo("  Settings: up to date")
 
-    # 3. Global registry
+    # 3. .gitignore: patterns added since the project was initialized
+    gitignore_change = _ensure_gitignore(root)
+    click.echo(f"  Gitignore: {'updated ' + gitignore_change if gitignore_change else 'up to date'}")
+
+    # 4. Global registry
     actual_name = registry_module.register_or_warn(root.name, str(root), _warn)
     if actual_name:
         click.echo(f"  Registry: registered as '{actual_name}'")
 
-    # 4. Reinstall skill
-    _install(root=root, directive=False)
+    # 5. Reinstall skill (registered above, so not again)
+    _install(root=root, directive=False, register=False)
 
 
 if __name__ == "__main__":
