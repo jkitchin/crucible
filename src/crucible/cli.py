@@ -2460,9 +2460,10 @@ def _bib_attach_problem(
     target_fields = _parse_bib_fields(target_entries[0])
     if target_fields.get("file"):
         return (
-            f"{prefix} but no matching indexed source. Give the target's entry a "
-            "file field naming its source file and run `crucible sync` there, "
-            "or rename one of the keys."
+            f"{prefix}, and it names the file '{target_fields['file']}', but no "
+            "indexed source in the target matches it. Run `crucible sync` in the "
+            "target (correcting the file field if the file has moved), or rename "
+            "one of the keys."
         )
     incoming_fields = _parse_bib_fields(incoming_entry)
     identifying = [

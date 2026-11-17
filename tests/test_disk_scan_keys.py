@@ -133,3 +133,26 @@ def test_unclaimed_file_keeps_its_stem(project):  # noqa: F811
     sync()
     assert keys_by_path(project)[f"{DATA}/run.csv"] == "run"
     assert linked(project) == [f"{DATA}/run.csv"]
+
+
+def test_entry_keyed_like_its_own_file_keeps_its_key(project):  # noqa: F811
+    # An entry whose key is its file's stem owns that file's row; the disk
+    # scan must not take the row back and re-key it.
+    data = project / DATA
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "widget-notes.md").write_text("Notes.\n")
+    sync()
+    (project / ".crucible/references.bib").write_text(
+        f"@misc{{widget-notes,\n  title = {{Widget notes}},\n"
+        f"  file = {{{DATA}/widget-notes.md}},\n}}\n"
+    )
+    cite(project, "widget-notes")
+    for _ in range(2):
+        sync()
+        assert linked(project) == [f"{DATA}/widget-notes.md"]
+        assert keys_by_path(project) == {f"{DATA}/widget-notes.md": "widget-notes"}
+    rebuild(project)
+    assert linked(project) == [f"{DATA}/widget-notes.md"]
+    assert keys_by_path(project) == {f"{DATA}/widget-notes.md": "widget-notes"}
+    issues = json.loads(CliRunner().invoke(cli, ["lint", "--json"]).stdout)
+    assert not [i for i in issues if i["type"] == "unresolved_source_key"]

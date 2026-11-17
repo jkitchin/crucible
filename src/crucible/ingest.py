@@ -482,10 +482,16 @@ def upsert_sources_from_disk(root: Path, db) -> int:
     files = _disk_scan_files(root)
     rows = db.list_sources()
     by_path = {src["path"]: src for src in rows}
-    scanned_rows = {src["path"] for src in rows if _from_disk_scan(src)}
+    entries = parse_bib_file(root / CRUCIBLE_DIR / "references.bib")
+    # A file a bib entry names belongs to that entry, even when its row
+    # looks like a scanned one (an entry keyed by its file's stem does).
+    entry_files = {_bib_file_path(root, e["file"]) for e in entries if e.get("file")}
+    scanned_rows = {
+        src["path"] for src in rows
+        if _from_disk_scan(src) and src["path"] not in entry_files
+    }
 
-    taken = {entry["cite_key"]
-             for entry in parse_bib_file(root / CRUCIBLE_DIR / "references.bib")}
+    taken = {entry["cite_key"] for entry in entries}
     for src in rows:
         key = _source_metadata(src).get("cite_key")
         if isinstance(key, str) and src["path"] not in scanned_rows:
@@ -499,7 +505,9 @@ def upsert_sources_from_disk(root: Path, db) -> int:
             rel_path = str(path)
 
         existing = by_path.get(rel_path)
-        if existing is not None and rel_path not in scanned_rows:
+        if rel_path in entry_files or (
+            existing is not None and rel_path not in scanned_rows
+        ):
             continue  # ingest or a bib entry owns this file
 
         cite_key = _disk_scan_key(path, taken)

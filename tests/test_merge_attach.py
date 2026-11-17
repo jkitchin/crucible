@@ -100,7 +100,8 @@ def test_merge_still_refuses_when_target_entry_names_a_file(project, tmp_path, m
     monkeypatch.chdir(project)
     result = CliRunner().invoke(cli, ["merge", str(source), "--yes"])
     assert result.exit_code != 0
-    assert "Give the target's entry a file field" in result.output
+    assert "names the file '.crucible/sources/data/unsynced.md'" in result.output
+    assert "no indexed source in the target matches it" in result.output
 
 
 def test_attach_refuses_an_entry_that_gained_a_file_since_planning():
