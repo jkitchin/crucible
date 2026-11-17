@@ -349,9 +349,9 @@ def upsert_sources_from_disk(root: Path, db) -> int:
     These directories are committed to git (unlike sources/external/), so a
     fresh clone has the files but no sources table. Scans both directories
     and creates a source row for each file, using the filename stem as the
-    default cite_key in metadata and marking it as inferred. Skips hidden files,
-    extracted text sidecars (*.txt next to a non-txt source), and entries whose
-    path already exists in the sources table.
+    cite_key in metadata. Skips hidden files, extracted text sidecars
+    (*.txt next to a non-txt source), and entries whose path already exists
+    in the sources table.
 
     Returns the number of new sources inserted.
     """
@@ -395,9 +395,10 @@ def upsert_sources_from_disk(root: Path, db) -> int:
                 except Exception:
                     pass
 
-            source_type = default_type
+            detected = detect_source_type(path)
+            source_type = detected if detected != "other" else default_type
 
-            metadata = {"cite_key": cite_key, "cite_key_inferred": True}
+            metadata = {"cite_key": cite_key}
 
             try:
                 mtime_iso = datetime.fromtimestamp(
@@ -406,248 +407,105 @@ def upsert_sources_from_disk(root: Path, db) -> int:
             except OSError:
                 mtime_iso = None
 
-            db.add_source(
-                path=rel_path,
-                title=title,
-                source_type=source_type,
-                shareable=True,
-                url=None,
-                authors=None,
-                date=mtime_iso,
-                metadata=metadata,
-            )
-            existing_paths.add(rel_path)
-            inserted += 1
+            try:
+                db.add_source(
+                    path=rel_path,
+                    title=title,
+                    source_type=source_type,
+                    shareable=True,
+                    url=None,
+                    authors=None,
+                    date=mtime_iso,
+                    metadata=metadata,
+                )
+                existing_paths.add(rel_path)
+                inserted += 1
+            except Exception:
+                continue
 
     return inserted
 
 
-def upsert_sources_from_bib(root: Path, db, on_skip=None) -> int:
-    """Reconcile source rows with entries in .crucible/references.bib.
+def upsert_sources_from_bib(root: Path, db) -> int:
+    """Create sources rows for every entry in .crucible/references.bib.
 
-    Entries with a file field use that path. Entries without one are matched
-    to a unique source in sources/data or sources/notebooks by title; entries
-    without a match are skipped rather than assigned a synthetic path.
-    Safe to call repeatedly. Used by auto-rebuild and `crucible sync`.
+    Safe to call repeatedly: entries whose cite_key already exists in
+    sources.metadata are skipped. Used by auto-rebuild (no DB) and by
+    `crucible sync` so bib edits are picked up without re-ingesting.
 
-    Filename-inferred keys are confirmed or replaced only for the matching
-    source; unmarked keys and existing article associations are preserved.
-
-    Returns the number of new sources inserted. If supplied, on_skip is
-    called with the cite key and reason for each unresolved entry.
+    Returns the number of new sources inserted.
     """
+    import json as _json
+
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     entries = parse_bib_file(bib_path)
     if not entries:
         return 0
 
-    def normalize_title(title: str) -> str:
-        return " ".join(title.casefold().split())
-
-    def bib_file_path(file_field: str) -> tuple[str, Path]:
-        candidate = Path(file_field)
-        abs_path = (root / candidate).resolve() if not candidate.is_absolute() else candidate
+    existing_cite_keys: set[str] = set()
+    for src in db.list_sources():
+        raw = src.get("metadata") or "{}"
         try:
-            rel_path = str(abs_path.relative_to(root.resolve()))
-        except ValueError:
-            rel_path = str(abs_path)
-        return rel_path, abs_path
-
-    bib_title_counts: dict[str, int] = {}
-    bib_entries_by_key: dict[str, list[tuple[int, str | None]]] = {}
-    first_key_by_path: dict[str, str] = {}
-    for index, entry in enumerate(entries):
-        title = normalize_title(entry.get("title", ""))
-        if title:
-            bib_title_counts[title] = bib_title_counts.get(title, 0) + 1
-        file_field = entry.get("file")
-        rel_path = bib_file_path(file_field)[0] if file_field else None
-        bib_entries_by_key.setdefault(entry["cite_key"], []).append((index, rel_path))
-        if rel_path is not None:
-            first_key_by_path.setdefault(rel_path, entry["cite_key"])
-
-    sources = db.list_sources()
-    sources_by_key: dict[str, set[int]] = {}
-    sources_by_id = {src["id"]: src for src in sources}
-    sources_by_path = {src["path"]: src for src in sources}
-    sources_by_title: dict[str, list[dict]] = {}
-    local_prefixes = (
-        f"{CRUCIBLE_DIR}/sources/notebooks/",
-        f"{CRUCIBLE_DIR}/sources/data/",
-    )
-    for src in sources:
-        meta = _source_metadata(src)
+            meta = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (ValueError, TypeError):
+            meta = {}
         key = meta.get("cite_key")
         if key:
-            sources_by_key.setdefault(key, set()).add(src["id"])
-        if src["path"].startswith(local_prefixes):
-            normalized_title = normalize_title(src.get("title", ""))
-            sources_by_title.setdefault(normalized_title, []).append(src)
+            existing_cite_keys.add(key)
 
-    wiki_source_keys: dict[str, list[tuple[str, set[str]]]] | None = None
+    existing_paths: set[str] = {src["path"] for src in db.list_sources()}
+
     inserted = 0
-    for index, entry in enumerate(entries):
+    for entry in entries:
         cite_key = entry["cite_key"]
+        if cite_key in existing_cite_keys:
+            continue
+
         file_field = entry.get("file")
         rel_path: str | None = None
         abs_path: Path | None = None
         if file_field:
-            rel_path, abs_path = bib_file_path(file_field)
+            candidate = Path(file_field)
+            if not candidate.is_absolute():
+                abs_path = (root / candidate).resolve()
+            else:
+                abs_path = candidate
+            try:
+                rel_path = str(abs_path.relative_to(root.resolve()))
+            except ValueError:
+                rel_path = str(abs_path)
 
-        matched_source = sources_by_path.get(rel_path) if rel_path else None
-        if matched_source is None and not file_field:
-            title = normalize_title(entry.get("title", ""))
-            matches = sources_by_title.get(title, [])
-            if len(matches) == 1 and bib_title_counts.get(title) == 1:
-                matched_source = matches[0]
+        if rel_path is None:
+            rel_path = f"{CRUCIBLE_DIR}/bib/{cite_key}"
 
-        if cite_key in sources_by_key:
-            owner_ids = sources_by_key[cite_key]
-            if matched_source and matched_source["id"] in owner_ids:
-                metadata = dict(_source_metadata(matched_source))
-                if metadata.get("cite_key_inferred") is True:
-                    metadata.pop("cite_key_inferred")
-                    db.update_source_metadata(matched_source["id"], metadata)
-                    matched_source["metadata"] = metadata
-            elif on_skip is not None:
-                if matched_source or file_field:
-                    on_skip(
-                        cite_key,
-                        "cite key already belongs to a different source; "
-                        "reconcile the source metadata or bibliography",
-                    )
-                elif any(
-                    _source_metadata(sources_by_id[source_id]).get("cite_key_inferred") is True
-                    for source_id in owner_ids
-                ):
-                    on_skip(
-                        cite_key,
-                        "inferred cite key could not be verified against a unique source title",
-                    )
+        if rel_path in existing_paths:
             continue
 
-        if matched_source:
-            metadata = dict(_source_metadata(matched_source))
-            old_key = metadata.get("cite_key")
-            inferred_key = metadata.get("cite_key_inferred") is True
-            if old_key and not inferred_key:
-                if on_skip is not None:
-                    on_skip(
-                        cite_key,
-                        f"source '{matched_source['path']}' already has cite key '{old_key}'; "
-                        "reconcile its source metadata or bibliography",
-                    )
-                continue
-            linked_articles = db.source_articles(matched_source["id"])
-            if linked_articles:
-                if on_skip is not None:
-                    on_skip(
-                        cite_key,
-                        f"source '{matched_source['path']}' (cite key {old_key!r}) "
-                        f"is already linked to '{linked_articles[0]['path']}'; "
-                        "reconcile its SOURCE_KEYS or bibliography",
-                    )
-                continue
-
-            if old_key and inferred_key:
-                if wiki_source_keys is None:
-                    wiki_source_keys = {}
-                    wiki_dir = root / CRUCIBLE_DIR / "wiki"
-                    for org_path in sorted(wiki_dir.rglob("*.org")):
-                        if org_path == wiki_dir / "index.org":
-                            continue
-                        meta = parse_org_file(org_path)
-                        article_path = str(org_path.relative_to(root))
-                        article_keys = set(meta.properties.get("SOURCE_KEYS", "").split())
-                        for key in article_keys:
-                            wiki_source_keys.setdefault(key, []).append((article_path, article_keys))
-                references = wiki_source_keys.get(old_key, [])
-                old_key_elsewhere = False
-                old_entries = bib_entries_by_key.get(old_key, [])
-                if len(old_entries) == 1:
-                    old_index, other_path = old_entries[0]
-                    if other_path is not None and other_path != matched_source["path"]:
-                        other_source = sources_by_path.get(other_path)
-                        if other_source:
-                            old_key_elsewhere = (
-                                _source_metadata(other_source).get("cite_key") == old_key
-                            )
-                        else:
-                            old_key_elsewhere = (
-                                old_index > index and first_key_by_path[other_path] == old_key
-                            )
-                blocking_references = [
-                    article_path
-                    for article_path, article_keys in references
-                    if not old_key_elsewhere or cite_key not in article_keys
-                ]
-                if blocking_references:
-                    if on_skip is not None:
-                        on_skip(
-                            cite_key,
-                            f"source '{matched_source['path']}' has cite key '{old_key}' "
-                            f"referenced by '{blocking_references[0]}'; "
-                            "reconcile its SOURCE_KEYS or bibliography",
-                        )
-                    continue
-
-            metadata["cite_key"] = cite_key
-            metadata.pop("cite_key_inferred", None)
-            if entry.get("doi"):
-                metadata["doi"] = entry["doi"]
-            db.update_source_metadata(matched_source["id"], metadata)
-            matched_source["metadata"] = metadata
-            if old_key:
-                sources_by_key[old_key].remove(matched_source["id"])
-                if not sources_by_key[old_key]:
-                    del sources_by_key[old_key]
-            sources_by_key.setdefault(cite_key, set()).add(matched_source["id"])
-            continue
-
-        if not file_field:
-            if on_skip is not None:
-                if len(matches) > 1:
-                    reason = "ambiguous title (multiple matching sources)"
-                elif len(matches) == 1 and bib_title_counts.get(title, 0) > 1:
-                    reason = "ambiguous title (multiple bibliography entries)"
-                else:
-                    reason = "no matching data or notebook source"
-                on_skip(cite_key, reason)
-            continue
-
-        assert rel_path is not None
         source_type = _source_type_for_entry(entry["entry_type"], abs_path)
         shareable = not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/")
         authors = _authors_from_bib(entry.get("author", ""))
         date = entry.get("year") or None
 
-        metadata = {"cite_key": cite_key}
+        metadata: dict = {"cite_key": cite_key}
         if entry.get("doi"):
             metadata["doi"] = entry["doi"]
 
-        source_id = db.add_source(
-            path=rel_path,
-            title=entry.get("title", cite_key),
-            source_type=source_type,
-            shareable=shareable,
-            url=entry.get("url"),
-            authors=authors,
-            date=date,
-            metadata=metadata,
-        )
-        source = {
-            "id": source_id,
-            "path": rel_path,
-            "title": entry.get("title", cite_key),
-            "metadata": metadata,
-        }
-        sources_by_path[rel_path] = source
-        sources_by_id[source_id] = source
-        if rel_path.startswith(local_prefixes):
-            title = normalize_title(source["title"])
-            sources_by_title.setdefault(title, []).append(source)
-        sources_by_key.setdefault(cite_key, set()).add(source_id)
-        inserted += 1
+        try:
+            db.add_source(
+                path=rel_path,
+                title=entry.get("title", cite_key),
+                source_type=source_type,
+                shareable=shareable,
+                url=entry.get("url"),
+                authors=authors,
+                date=date,
+                metadata=metadata,
+            )
+            existing_cite_keys.add(cite_key)
+            existing_paths.add(rel_path)
+            inserted += 1
+        except Exception:
+            continue
 
     return inserted
 

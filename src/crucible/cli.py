@@ -557,11 +557,7 @@ def _resolve_source_keys(keys: list[str], sources: list[dict]) -> dict[str, list
     key_to_src = {}
     legacy_sources = []
     for src in sources:
-        raw = src.get("metadata") or "{}"
-        try:
-            md = json.loads(raw) if isinstance(raw, str) else (raw or {})
-        except (ValueError, TypeError):
-            md = {}
+        md = _source_metadata(src)
         if md.get("cite_key"):
             key_to_src[md["cite_key"]] = src["id"]
         else:
@@ -578,16 +574,6 @@ def _resolve_source_keys(keys: list[str], sources: list[dict]) -> dict[str, list
         for key in keys
         if key
     }
-
-
-def _warn_skipped_bib(cite_key: str, reason: str) -> None:
-    ctx = click.get_current_context(silent=True)
-    if ctx is not None:
-        warned = ctx.meta.setdefault("crucible_skipped_bib", set())
-        if (cite_key, reason) in warned:
-            return
-        warned.add((cite_key, reason))
-    click.echo(f"Warning: BibTeX entry '{cite_key}' skipped: {reason}.", err=True)
 
 
 def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
@@ -615,7 +601,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
         "files": len(org_files),
     }
 
-    if not org_files:
+    if not wiki_dir.is_dir():
         return stats
 
     file_mtimes = {p: p.stat().st_mtime for p in org_files}
@@ -724,8 +710,8 @@ def _rebuild_db_from_wiki(root: Path, db: CrucibleDB) -> dict:
         upsert_sources_from_disk,
     )
 
-    sources_added = upsert_sources_from_disk(root, db)
-    sources_added += upsert_sources_from_bib(root, db, on_skip=_warn_skipped_bib)
+    sources_added = upsert_sources_from_bib(root, db)
+    sources_added += upsert_sources_from_disk(root, db)
     sync_stats = _sync_wiki_to_db(root, db)
     _write_manifest(root, db)
     _write_index(root, db)
@@ -740,11 +726,8 @@ def sync():
     links, citations), and updates the articles, concepts, and links
     tables. Also upserts sources from references.bib and from the
     sources/notebooks and sources/data directories so new entries get
-    picked up automatically. Unresolved bibliography entries are reported
-    on stderr. Filename-inferred source keys remain provisional until confirmed
-    by the bibliography; unmarked, linked, and wiki-referenced keys are
-    preserved on conflicts.
-    Run this after Claude writes or updates wiki articles.
+    picked up automatically. Run this after Claude writes or updates
+    wiki articles.
     """
     from crucible.ingest import (
         upsert_sources_from_bib,
@@ -753,24 +736,23 @@ def sync():
 
     root = get_root()
     db = get_db(root)
-    try:
-        # Auto-register in global registry (ensures pre-registry crucibles get registered)
-        from crucible.registry import register as registry_register
-        registry_register(root.name, str(root))
 
-        sources_added = upsert_sources_from_disk(root, db)
-        sources_added += upsert_sources_from_bib(root, db, on_skip=_warn_skipped_bib)
+    # Auto-register in global registry (ensures pre-registry crucibles get registered)
+    from crucible.registry import register as registry_register
+    registry_register(root.name, str(root))
 
-        stats = _sync_wiki_to_db(
-            root, db,
-            on_skip=lambda p: click.echo(
-                f"  Skipping {p.name} (modified during sync)"
-            ),
-        )
-    finally:
-        db.close()
+    sources_added = upsert_sources_from_bib(root, db)
+    sources_added += upsert_sources_from_disk(root, db)
 
-    if stats["files"] == 0 and sources_added == 0:
+    stats = _sync_wiki_to_db(
+        root, db,
+        on_skip=lambda p: click.echo(
+            f"  Skipping {p.name} (modified during sync)"
+        ),
+    )
+    db.close()
+
+    if stats["files"] == 0 and sources_added == 0 and stats["removed"] == 0:
         click.echo("No org files found in wiki/.")
         return
 
@@ -2151,7 +2133,7 @@ def lint(json_output):
     """Check wiki health and report issues.
 
     Finds broken links, orphan articles, missing concept articles,
-    stale sources, unresolved or ambiguous source keys, and other consistency problems.
+    stale sources, unresolved source keys, and other consistency problems.
     """
     root = get_root()
     db = get_db(root)
@@ -2209,30 +2191,8 @@ def lint(json_output):
             "message": f"Concept '{c}' has no dedicated concept article",
         })
 
-    # 5. Source key collisions and article properties
+    # 5. Articles missing required properties or referencing unknown sources
     sources = db.list_sources()
-    source_paths_by_key = {}
-    for source in sources:
-        metadata = _source_metadata(source)
-        if not isinstance(metadata, dict):
-            continue
-        key = metadata.get("cite_key")
-        if isinstance(key, str) and key:
-            source_paths_by_key.setdefault(key, []).append(source["path"])
-    for key, paths in sorted(source_paths_by_key.items()):
-        if len(paths) > 1:
-            paths = sorted(paths)
-            issues.append({
-                "type": "ambiguous_source_key",
-                "severity": "warning",
-                "message": (
-                    f"Ambiguous source key '{key}' is assigned to multiple sources: "
-                    f"{', '.join(paths)}"
-                ),
-                "key": key,
-                "source_paths": paths,
-            })
-
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
