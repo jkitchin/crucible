@@ -597,8 +597,6 @@ def _source_key_index(sources: list[dict]) -> tuple[dict[str, int], list[dict]]:
     legacy_sources = []
     for src in sources:
         md = _source_metadata(src)
-        if not isinstance(md, dict):
-            md = {}
         cite_key = md.get("cite_key")
         if isinstance(cite_key, str) and cite_key:
             key_to_src[cite_key] = src["id"]
@@ -785,13 +783,9 @@ def _rebuild_db_from_wiki(root: Path, db: CrucibleDB) -> dict:
     call on a DB that's already populated. Also regenerates MANIFEST.md
     and wiki/index.org so GitHub-rendered landing pages stay current.
     """
-    from crucible.ingest import (
-        upsert_sources_from_bib,
-        upsert_sources_from_disk,
-    )
+    from crucible.ingest import reconcile_sources
 
-    sources_added = upsert_sources_from_bib(root, db)
-    sources_added += upsert_sources_from_disk(root, db)
+    sources_added = reconcile_sources(root, db)
     sync_stats = _sync_wiki_to_db(root, db)
     _write_manifest(root, db)
     _write_index(root, db)
@@ -809,10 +803,7 @@ def sync():
     picked up automatically. Run this after Claude writes or updates
     wiki articles.
     """
-    from crucible.ingest import (
-        upsert_sources_from_bib,
-        upsert_sources_from_disk,
-    )
+    from crucible.ingest import reconcile_sources
 
     root = get_root()
     db = get_db(root)
@@ -821,8 +812,7 @@ def sync():
         from crucible.registry import register as registry_register
         registry_register(root.name, str(root))
 
-        sources_added = upsert_sources_from_bib(root, db)
-        sources_added += upsert_sources_from_disk(root, db)
+        sources_added = reconcile_sources(root, db)
 
         stats = _sync_wiki_to_db(
             root, db,
@@ -1801,6 +1791,7 @@ def merge(source, dry_run, yes):
     # --- Phase 1: Sources ---
     sources_copied = 0
     sources_skipped = 0
+    source_paths = {}  # source crucible path -> path in this crucible
 
     for src in source_db.list_sources():
         src_file = source_root / src["path"]
@@ -1827,6 +1818,7 @@ def merge(source, dry_run, yes):
                 counter += 1
             new_rel = str(dest_file.relative_to(root))
 
+        source_paths[src["path"]] = new_rel
         if dry_run:
             click.echo(f"  source: {src['title']} -> {new_rel}")
         else:
@@ -1904,12 +1896,17 @@ def merge(source, dry_run, yes):
             target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
         )
 
+        from crucible.ingest import _parse_bib_fields, append_bib_entry, set_bib_field
+
         for cite_key, entry_text in source_entries.items():
             if f"{{{cite_key}," not in target_text:
+                # A source renamed on copy keeps its entry pointing at it.
+                file_field = _parse_bib_fields(entry_text).get("file")
+                if file_field in source_paths and source_paths[file_field] != file_field:
+                    entry_text = set_bib_field(entry_text, "file", source_paths[file_field])
                 if dry_run:
                     click.echo(f"  bib: {cite_key}")
                 else:
-                    from crucible.ingest import append_bib_entry
                     append_bib_entry(root, entry_text, cite_key)
                 bib_added += 1
 
@@ -1917,7 +1914,7 @@ def merge(source, dry_run, yes):
     target_db.close()
 
     # --- Phase 4: Sync ---
-    if not dry_run and articles_copied > 0:
+    if not dry_run and (articles_copied or sources_copied or bib_added):
         click.echo()
         ctx = click.get_current_context()
         ctx.invoke(sync)
@@ -2271,6 +2268,12 @@ def lint(json_output):
 
     # 5. Articles missing required properties or referencing unknown sources
     source_index = _source_key_index(db.list_sources())
+    from crucible.ingest import parse_bib_file
+    bib_without_file = {
+        entry["cite_key"]
+        for entry in parse_bib_file(cdir(root) / "references.bib")
+        if not entry.get("file")
+    }
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
@@ -2294,10 +2297,16 @@ def lint(json_output):
         else:
             for key, source_ids in _resolve_source_keys(source_keys, source_index).items():
                 if not source_ids:
+                    message = f"Unresolved SOURCE_KEYS value '{key}' in {article['path']}"
+                    if key in bib_without_file:
+                        message += (
+                            f" (references.bib has '{key}' but no file field naming"
+                            " its stored file; add file = {.crucible/sources/...})"
+                        )
                     issues.append({
                         "type": "unresolved_source_key",
                         "severity": "warning",
-                        "message": f"Unresolved SOURCE_KEYS value '{key}' in {article['path']}",
+                        "message": message,
                         "path": article['path'],
                         "key": key,
                     })

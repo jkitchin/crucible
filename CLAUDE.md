@@ -24,7 +24,9 @@ A crucible project keeps everything in `.crucible/` at its root:
   - `index.org` - Auto-maintained master index
 - `.crucible/crucible.db` - Wiki graph database (SQLite). Tracks sources, articles,
   concepts, and links between them. Regenerable from wiki content.
-- `.crucible/references.bib` - Bibliography of ingested sources
+- `.crucible/references.bib` - Bibliography of ingested sources. Each entry's
+  `file` field names the stored source file, which is how a rebuilt
+  database ties cite keys back to sources.
 
 `~/.crucible/registry.json` is the global registry of crucibles, so the home
 directory cannot itself be a project.
