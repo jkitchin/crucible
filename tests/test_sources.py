@@ -323,3 +323,45 @@ def test_web_sources_are_online_entries(project, tmp_path):
     [entry] = parse_bib_file(cdir(project) / "references.bib")
     assert entry["entry_type"] == "online"
     assert source_type_for_path(entry["file"], entry["entry_type"]) == "web"
+
+
+def test_duplicate_cite_keys_are_linked_and_flagged(project):
+    """Two sources sharing a cite key are not silently collapsed to one (#11)."""
+    for subdir in ("data", "notebooks"):
+        folder = cdir(project) / "sources" / subdir
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "shared2026.md").write_text(f"Synthetic {subdir} source.")
+    write_article(project, "shared2026")
+
+    result = invoke("sync")
+    assert "more than one source" in result.output
+
+    expected = {
+        ".crucible/sources/data/shared2026.md",
+        ".crucible/sources/notebooks/shared2026.md",
+    }
+    assert [s["metadata"]["cite_key"] for s in sources(project)] == ["shared2026"] * 2
+    assert linked_paths(project) == expected
+
+    issues = json.loads(invoke("lint", "--json").stdout)
+    dup = [i for i in issues if i["type"] == "duplicate_cite_key"]
+    assert len(dup) == 1 and dup[0]["key"] == "shared2026"
+    assert set(dup[0]["sources"]) == expected
+    ambiguous = [i for i in issues if i["type"] == "ambiguous_source_key"]
+    assert len(ambiguous) == 1
+    assert ambiguous[0]["path"] == ".crucible/wiki/concepts/widgets.org"
+    assert set(ambiguous[0]["sources"]) == expected
+
+
+def test_unique_cite_key_is_not_flagged_ambiguous(project):
+    folder = cdir(project) / "sources" / "data"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "solo2026.md").write_text("Synthetic source.")
+    write_article(project, "solo2026")
+
+    assert "more than one source" not in invoke("sync").output
+    issues = json.loads(invoke("lint", "--json").stdout)
+    assert not [
+        i for i in issues
+        if i["type"] in ("duplicate_cite_key", "ambiguous_source_key")
+    ]

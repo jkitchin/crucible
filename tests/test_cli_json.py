@@ -605,6 +605,29 @@ def test_sync_drops_source_keys_removed_from_a_file(project):
     assert run_json("sources", CONCEPT_PATH) == []
 
 
+def test_sync_replaces_source_keys_changed_in_a_file(project):
+    """Issue #10: swapping one SOURCE_KEYS entry for another must leave
+    only the current source linked, not both."""
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    try:
+        for key, title in (("sourcea2026", "Source A"), ("sourceb2026", "Source B")):
+            db.add_source(
+                path=f".crucible/sources/external/pdfs/{key}.pdf",
+                title=title, source_type="pdf",
+                metadata={"cite_key": key},
+            )
+    finally:
+        db.close()
+    path = project / CONCEPT_PATH
+    original = path.read_text()
+    path.write_text(original.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: sourcea2026"))
+    _sync()
+    assert [s["title"] for s in run_json("sources", CONCEPT_PATH)] == ["Source A"]
+    path.write_text(original.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: sourceb2026"))
+    _sync()
+    assert [s["title"] for s in run_json("sources", CONCEPT_PATH)] == ["Source B"]
+
+
 def test_sync_prunes_concepts_no_article_uses(project):
     path = project / CONCEPT_PATH
     path.write_text(path.read_text().replace(":kinetics:", ":kinetics:solo:"))
