@@ -7,6 +7,7 @@ from click.testing import CliRunner
 
 from crucible import registry as registry_module
 from crucible.cli import cli
+from crucible.database import CrucibleDB
 
 CONCEPT = """#+TITLE: Activation energy
 #+FILETAGS: :concept:kinetics:
@@ -127,6 +128,102 @@ def test_lint_json_issues_name_their_file(project):
     # The old flag spelling still works.
     result = CliRunner().invoke(cli, ["lint", "-j"])
     assert json.loads(result.stdout) == issues
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_sync_does_not_invent_a_source_for_an_unmapped_bib_entry(project, caplog, rebuild):
+    cdir = project / ".crucible"
+    bib = cdir / "references.bib"
+    original_bib = "@misc{widget2026,\n  title = {Widget Notes},\n}\n"
+    bib.write_text(original_bib)
+    (cdir / "sources/data/unrelated.md").write_text("Unrelated source.\n")
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: widget2026")
+    )
+    if rebuild:
+        (cdir / "crucible.db").unlink()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        assert [row["path"] for row in db.list_sources()] == [
+            ".crucible/sources/data/unrelated.md"
+        ]
+    finally:
+        db.close()
+    assert run_json("sources", CONCEPT_PATH) == []
+    assert bib.read_text() == original_bib
+    assert "widget2026" in caplog.text
+    assert "no file" in caplog.text.lower()
+
+
+def test_sync_registers_an_explicit_bib_file(project, caplog):
+    cdir = project / ".crucible"
+    (cdir / "sources/data/evidence.md").write_text("Mapped source.\n")
+    (cdir / "references.bib").write_text(
+        "@misc{widget2026,\n"
+        "  title = {Widget Notes},\n"
+        "  file = {.crucible/sources/data/evidence.md},\n"
+        "}\n"
+    )
+    (project / CONCEPT_PATH).write_text(
+        CONCEPT.replace(":SOURCE_KEYS:", ":SOURCE_KEYS: widget2026")
+    )
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert [row["path"] for row in run_json("sources", CONCEPT_PATH)] == [
+        ".crucible/sources/data/evidence.md"
+    ]
+    assert "widget2026" not in caplog.text
+
+
+@pytest.mark.parametrize("with_bib", [False, True])
+def test_sync_warns_about_an_existing_phantom_source_without_deleting_it(
+    project, caplog, with_bib
+):
+    cdir = project / ".crucible"
+    if with_bib:
+        (cdir / "references.bib").write_text("@misc{widget2026,\n  title = {Widget},\n}\n")
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        db.add_source(
+            path=".crucible/bib/widget2026",
+            title="Widget",
+            source_type="other",
+            metadata={"cite_key": "widget2026"},
+        )
+    finally:
+        db.close()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        assert any(row["path"] == ".crucible/bib/widget2026" for row in db.list_sources())
+    finally:
+        db.close()
+    assert "widget2026" in caplog.text
+    assert "synthetic" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("metadata", ["[]", '{"cite_key": ["invalid"]}'])
+def test_sync_handles_invalid_source_metadata_with_no_bibliography(project, caplog, metadata):
+    cdir = project / ".crucible"
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        source_id = db.add_source(
+            path=".crucible/sources/data/legacy.md", title="Legacy", source_type="data"
+        )
+        db.conn.execute("UPDATE sources SET metadata = ? WHERE id = ?", (metadata, source_id))
+        db.conn.commit()
+    finally:
+        db.close()
+
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    assert "invalid" in caplog.text.lower()
 
 
 def test_registry_list_json(project):

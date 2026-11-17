@@ -6,6 +6,7 @@ and registering them in the database.
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,9 @@ from filelock import FileLock
 
 from crucible.database import CrucibleDB
 from crucible.orgparse import parse_org_file
+
+
+logger = logging.getLogger(__name__)
 
 
 def detect_source_type(path: Path) -> str:
@@ -427,11 +431,12 @@ def upsert_sources_from_disk(root: Path, db) -> int:
 
 
 def upsert_sources_from_bib(root: Path, db) -> int:
-    """Create sources rows for every entry in .crucible/references.bib.
+    """Create source rows for bibliography entries with a file path.
 
     Safe to call repeatedly: entries whose cite_key already exists in
     sources.metadata are skipped. Used by auto-rebuild (no DB) and by
     `crucible sync` so bib edits are picked up without re-ingesting.
+    Unmapped entries and existing synthetic paths are reported.
 
     Returns the number of new sources inserted.
     """
@@ -439,21 +444,36 @@ def upsert_sources_from_bib(root: Path, db) -> int:
 
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     entries = parse_bib_file(bib_path)
-    if not entries:
-        return 0
 
     existing_cite_keys: set[str] = set()
-    for src in db.list_sources():
+    sources = db.list_sources()
+    for src in sources:
         raw = src.get("metadata") or "{}"
         try:
             meta = _json.loads(raw) if isinstance(raw, str) else (raw or {})
         except (ValueError, TypeError):
-            meta = {}
+            logger.warning("Source '%s' has invalid metadata.", src["path"])
+            continue
+        if not isinstance(meta, dict):
+            logger.warning("Source '%s' has invalid metadata.", src["path"])
+            continue
         key = meta.get("cite_key")
+        if key is not None and not isinstance(key, str):
+            logger.warning("Source '%s' has an invalid citation key.", src["path"])
+            continue
         if key:
             existing_cite_keys.add(key)
+            if (
+                src["path"] == f"{CRUCIBLE_DIR}/bib/{key}"
+                and not (root / src["path"]).is_file()
+            ):
+                logger.warning(
+                    "Source '%s' has a nonexistent synthetic bibliography path; "
+                    "reconcile it manually.",
+                    key,
+                )
 
-    existing_paths: set[str] = {src["path"] for src in db.list_sources()}
+    existing_paths: set[str] = {src["path"] for src in sources}
 
     inserted = 0
     for entry in entries:
@@ -462,21 +482,21 @@ def upsert_sources_from_bib(root: Path, db) -> int:
             continue
 
         file_field = entry.get("file")
-        rel_path: str | None = None
-        abs_path: Path | None = None
-        if file_field:
-            candidate = Path(file_field)
-            if not candidate.is_absolute():
-                abs_path = (root / candidate).resolve()
-            else:
-                abs_path = candidate
-            try:
-                rel_path = str(abs_path.relative_to(root.resolve()))
-            except ValueError:
-                rel_path = str(abs_path)
-
-        if rel_path is None:
-            rel_path = f"{CRUCIBLE_DIR}/bib/{cite_key}"
+        if not file_field:
+            logger.warning(
+                "Skipping bibliography entry '%s': no file field establishes a source path.",
+                cite_key,
+            )
+            continue
+        candidate = Path(file_field)
+        if not candidate.is_absolute():
+            abs_path = (root / candidate).resolve()
+        else:
+            abs_path = candidate
+        try:
+            rel_path = str(abs_path.relative_to(root.resolve()))
+        except ValueError:
+            rel_path = str(abs_path)
 
         if rel_path in existing_paths:
             continue
