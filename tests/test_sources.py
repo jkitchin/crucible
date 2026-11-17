@@ -265,3 +265,61 @@ def test_a_file_belongs_to_the_first_entry_naming_it(project, tmp_path):
 )
 def test_source_type_comes_from_the_storage_directory(path, source_type):
     assert source_type_for_path(path) == source_type
+
+
+def test_sync_upgrades_sources_ingested_before_content_hashes(project, tmp_path):
+    """Review of #25: rows from before 2026-06 have no content_hash."""
+    key = ingest(project, tmp_path, "note.md", "# Note\n",
+                 "--shareable", "--type", "notebook", "--date", "2026-01-01")
+    db = CrucibleDB(cdir(project) / "crucible.db")
+    try:
+        [row] = db.list_sources()
+        metadata = json.loads(row["metadata"])
+        del metadata["content_hash"]
+        db.update_source(row["id"], metadata=metadata)
+    finally:
+        db.close()
+    bib = cdir(project) / "references.bib"
+    bib.write_text(bib.read_text().replace(
+        "  file = {.crucible/sources/notebooks/note.md},\n", ""))
+    write_article(project, key)
+
+    invoke("sync")
+    assert parse_bib_file(bib)[0]["file"] == ".crucible/sources/notebooks/note.md"
+
+    delete_db(project)
+    invoke("sync")
+    [row] = sources(project)
+    assert (row["path"], row["metadata"]["cite_key"]) == (
+        ".crucible/sources/notebooks/note.md", key)
+    assert linked_paths(project) == {row["path"]}
+
+
+def test_sync_keeps_a_users_edit_to_a_file_field(project):
+    data = cdir(project) / "sources" / "data"
+    (data / "old.csv").write_text("old\n")
+    (data / "new.csv").write_text("new\n")
+    bib = cdir(project) / "references.bib"
+    bib.write_text("@misc{smith2024,\n  title = {Smith data},\n"
+                   "  file = {.crucible/sources/data/old.csv},\n}\n")
+    invoke("sync")
+    bib.write_text(bib.read_text().replace("old.csv", "new.csv"))
+    invoke("sync")
+    assert parse_bib_file(bib)[0]["file"] == ".crucible/sources/data/new.csv"
+    by_path = {r["path"]: r for r in sources(project)}
+    assert by_path[".crucible/sources/data/new.csv"]["metadata"]["cite_key"] == "smith2024"
+
+
+def test_ingest_records_the_file_path_verbatim(project, tmp_path):
+    ingest(project, tmp_path, "long name  notes.csv", "a\n",
+           "--shareable", "--type", "data", "--title", "Spaced")
+    [entry] = parse_bib_file(cdir(project) / "references.bib")
+    assert entry["file"] == ".crucible/sources/data/long name  notes.csv"
+
+
+def test_web_sources_are_online_entries(project, tmp_path):
+    ingest(project, tmp_path, "page.html", "<p>x</p>\n",
+           "--shareable", "--type", "web", "--title", "Page")
+    [entry] = parse_bib_file(cdir(project) / "references.bib")
+    assert entry["entry_type"] == "online"
+    assert source_type_for_path(entry["file"], entry["entry_type"]) == "web"

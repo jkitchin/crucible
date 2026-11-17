@@ -560,6 +560,38 @@ class CrucibleDB:
         )
         self.conn.commit()
 
+    def clear_article_relations(self, article_id: int):
+        """Drop the relations sync derives from an article's own file.
+
+        Removes its concept tags, outgoing links, source links and
+        derivations so sync can re-add them from the file's current
+        contents. Incoming links belong to the articles they come from and
+        are left alone.
+        """
+        for sql in (
+            "DELETE FROM article_concepts WHERE article_id = ?",
+            "DELETE FROM article_links WHERE from_id = ?",
+            "DELETE FROM article_sources WHERE article_id = ?",
+            "DELETE FROM article_derivations WHERE derived_id = ?",
+        ):
+            self.conn.execute(sql, (article_id,))
+        self.conn.commit()
+
+    def prune_unused_concepts(self):
+        """Delete concepts that no article is tagged with.
+
+        Concepts are treated as disposable: they hold nothing but a name
+        derived from FILETAGS. If curated data (e.g. aliases) is ever stored
+        on a concept, this would delete it and must be revisited.
+        """
+        # NOT EXISTS, not NOT IN: a single NULL concept_id would make
+        # NOT IN match nothing and silently skip the prune.
+        self.conn.execute(
+            "DELETE FROM concepts WHERE NOT EXISTS ("
+            "SELECT 1 FROM article_concepts ac WHERE ac.concept_id = concepts.id)"
+        )
+        self.conn.commit()
+
     # -- Queries --
 
     def search(self, query: str, limit: int = 20) -> list[dict]:

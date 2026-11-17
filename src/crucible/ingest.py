@@ -259,7 +259,7 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
 
     entry_type = {
         "pdf": "article",
-        "web": "misc",
+        "web": "online",  # biblatex; lets a rebuild tell web from data
         "notebook": "misc",
         "data": "misc",
     }.get(source_type, "misc")
@@ -279,7 +279,7 @@ def generate_bib_entry(cite_key: str, title: str, authors: list[str] | None,
     if url:
         lines.append(f"  url = {{{_bib_value(url)}}},")
     if file:
-        lines.append(f"  file = {{{_bib_value(file)}}},")
+        lines.append(f"  file = {{{file.replace('{', '').replace('}', '')}}},")
     lines.append("}")
     return "\n".join(lines)
 
@@ -306,7 +306,13 @@ def set_bib_field(bibtex: str, name: str, value: str) -> str:
     if head is None:
         return bibtex
     body = field_re.sub("", bibtex[head.end():])
-    line = f"\n  {name} = {{{_bib_value(value)}}},"
+    # A file path is written verbatim (only braces, which would unbalance the
+    # entry, are dropped): collapsing whitespace would name a different file.
+    if name.lower() == "file":
+        value = value.replace("{", "").replace("}", "")
+    else:
+        value = _bib_value(value)
+    line = f"\n  {name} = {{{value}}},"
     return bibtex[:head.end()] + line + body
 
 
@@ -323,8 +329,23 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     for m in _BIB_FIELD_RE.finditer(body):
         name = m.group(1).lower()
         value = m.group(2) if m.group(2) is not None else m.group(3) or ""
-        fields[name] = " ".join(value.split())
+        fields[name] = value.strip() if name == "file" else " ".join(value.split())
     return fields
+
+
+def _resolve_bib_file(root: Path, value: str) -> Path:
+    """Prefer a literal file path, then try folding wrapped lines."""
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    if candidate.exists() or not re.search(r"[\r\n]", value):
+        return candidate
+
+    unfolded = re.sub(r"[ \t]*(?:\r\n|\r|\n)[ \t]*", " ", value)
+    alternative = Path(unfolded)
+    if not alternative.is_absolute():
+        alternative = root / alternative
+    return alternative if alternative.exists() else candidate
 
 
 def parse_bib_file(bib_path: Path) -> list[dict]:
@@ -360,7 +381,9 @@ def source_type_for_path(rel_path: str, entry_type: str | None = None) -> str:
     destination_dir() files sources by type and shareability, so the
     directory is the reliable record: a markdown notebook in
     sources/notebooks/ is a notebook, not "web" as its extension suggests.
-    Shareable PDFs are stored in sources/data/, so a .pdf there is a pdf.
+    Shareable PDFs and web sources are also stored in sources/data/, so a
+    .pdf there is a pdf, and an entry of type @online (which ingest writes
+    for web sources) is web.
     """
     parts = Path(rel_path).parts
     if len(parts) >= 3 and parts[0] == CRUCIBLE_DIR and parts[1] == "sources":
@@ -373,6 +396,9 @@ def source_type_for_path(rel_path: str, entry_type: str | None = None) -> str:
         if area == "notebooks":
             return "notebook"
         if area == "data":
+            # Shareable web sources and PDFs are stored here too.
+            if entry_type == "online":
+                return "web"
             return "pdf" if Path(rel_path).suffix.lower() == ".pdf" else "data"
     detected = detect_source_type(Path(rel_path))
     if detected != "other":
@@ -472,9 +498,12 @@ PLACEHOLDER_PREFIX = f"{CRUCIBLE_DIR}/bib/"
 
 
 def _bib_file_path(root: Path, file_field: str) -> str:
-    """A bib entry's file field as a path relative to the project root."""
-    candidate = Path(file_field)
-    abs_path = candidate if candidate.is_absolute() else root / candidate
+    """A bib entry's file field as a path relative to the project root.
+
+    _resolve_bib_file handles a path that a BibTeX formatter wrapped across
+    lines.
+    """
+    abs_path = _resolve_bib_file(root, file_field)
     try:
         return str(abs_path.resolve().relative_to(root.resolve()))
     except ValueError:
@@ -488,6 +517,23 @@ def _from_ingest(src: dict) -> bool:
     rebuilt from references.bib or the disk scan do not.
     """
     return "content_hash" in _source_metadata(src)
+
+
+def _knows_its_file(root: Path, src: dict, bib_keys: set[str]) -> bool:
+    """Whether a row can supply the file for its cite key's bib entry.
+
+    Rows from ingest qualify. So do rows ingested before ingest stored a
+    content hash (2026-06): any row whose file exists and whose cite key has
+    a bib entry, unless it is a placeholder or came from the disk scan.
+    """
+    if _from_ingest(src):
+        return True
+    return (
+        not src["path"].startswith(PLACEHOLDER_PREFIX)
+        and not _from_disk_scan(src)
+        and _source_metadata(src).get("cite_key") in bib_keys
+        and (root / src["path"]).is_file()
+    )
 
 
 def _from_disk_scan(src: dict) -> bool:
@@ -525,7 +571,9 @@ def reconcile_sources(root: Path, db) -> int:
 
     1. Rows created by ingest are authoritative. Their paths are written
        into the `file` field of entries that lack one or have a stale one,
-       which upgrades projects ingested before ingest recorded `file`.
+       which upgrades projects ingested before ingest recorded `file`. Rows
+       ingested before content hashes existed fill in a missing field too
+       (see _knows_its_file).
     2. Each entry with a `file` field owns the row at that path: a row the
        disk scan created for the file, or a placeholder or stale row under
        its cite key, takes the entry's metadata (duplicates are merged, and
@@ -552,13 +600,19 @@ def reconcile_sources(root: Path, db) -> int:
             if isinstance(key, str) and (key not in by_key or _from_ingest(src)):
                 by_key[key] = src
 
-        # 1. Record ingested paths in the bibliography.
+        # 1. Record ingested paths in the bibliography: fill in a missing
+        # file field from any row that knows its file, and correct a stale
+        # one (e.g. a source merge renamed) only from ingest's own rows, so a
+        # user's edit to an entry is not undone by a row rebuilt from it.
         file_updates = {}
         for entry in entries:
             src = by_key.get(entry["cite_key"])
-            if src is None or not _from_ingest(src):
+            if src is None:
                 continue
-            if not entry.get("file") or _bib_file_path(root, entry["file"]) != src["path"]:
+            missing = not entry.get("file")
+            stale = (not missing and _from_ingest(src)
+                     and _bib_file_path(root, entry["file"]) != src["path"])
+            if stale or (missing and _knows_its_file(root, src, bib_keys)):
                 file_updates[entry["cite_key"]] = src["path"]
                 entry["file"] = src["path"]
         set_bib_file_fields(root, file_updates)
@@ -655,6 +709,18 @@ def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | Non
     return doi or None
 
 
+def bib_has_key(text: str, cite_key: str) -> bool:
+    """Return True if BibTeX text has an entry whose key is cite_key.
+
+    Matches the entry header ``@type{key,`` rather than ``{key,`` anywhere,
+    so field text such as ``author = {Smith, J}`` is not taken for the key
+    ``Smith``.
+    """
+    return re.search(
+        rf"@\w+\s*\{{\s*{re.escape(cite_key)}\s*,", text
+    ) is not None
+
+
 def append_bib_entry(root: Path, entry: str, cite_key: str):
     """Append a BibTeX entry to .crucible/references.bib if not already present.
 
@@ -667,7 +733,7 @@ def append_bib_entry(root: Path, entry: str, cite_key: str):
     with FileLock(lock_path, timeout=10):
         if bib_path.exists():
             existing = bib_path.read_text(encoding="utf-8")
-            if f"{{{cite_key}," in existing:
+            if bib_has_key(existing, cite_key):
                 return
             new_content = existing.rstrip() + "\n\n" + entry + "\n"
         else:

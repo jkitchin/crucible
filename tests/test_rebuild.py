@@ -21,6 +21,10 @@ SOURCES = [
     ("run.csv", "a,b\n1,2\n",
      ["--shareable", "--type", "data", "--title", "Run data", "--author", "Roe",
       "--date", "2025-01-01"]),
+    # A shareable web source is stored in sources/data/ next to data files.
+    ("page.html", "<p>A web page.</p>\n",
+     ["--shareable", "--type", "web", "--title", "A page", "--author", "Woe",
+      "--date", "2023-01-01", "--url", "https://example.com/page"]),
     ("paper.pdf", "%PDF-1.4 synthetic\n",
      ["--type", "pdf", "--title", "A Paper", "--author", "Poe", "--date", "2024-01-01"]),
 ]
