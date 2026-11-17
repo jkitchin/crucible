@@ -1905,6 +1905,8 @@ def merge(source, dry_run, yes):
                     click.echo(f"  article: {rel_within_wiki}")
             for cite_key, _ in plan.bib_entries:
                 click.echo(f"  bib: {cite_key}")
+            for cite_key, path in plan.bib_file_fields.items():
+                click.echo(f"  bib: {cite_key} (existing entry gets file = {path})")
         else:
             rewrites = _apply_merge(root, plan, target_db)
             if rewrites:
@@ -1934,6 +1936,12 @@ def merge(source, dry_run, yes):
         f"{verb}: {len(plan.sources)} sources, {len(plan.articles)} articles, "
         f"{len(plan.bib_entries)} bib entries"
     )
+    if plan.bib_file_fields:
+        action = "Would attach" if dry_run else "Attached"
+        click.echo(
+            f"  {action} {len(plan.bib_file_fields)} source file(s) to existing "
+            "bibliography entries"
+        )
     if plan.skipped:
         click.echo(f"  Skipped {plan.skipped} existing sources")
     if plan.outside:
@@ -2044,7 +2052,7 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
                 placed.append((staged, dest))
 
             # 3. The bibliography, in one atomic write.
-            if plan.bib_entries:
+            if plan.bib_entries or plan.bib_file_fields:
                 old_bib = bib_path.read_text(encoding="utf-8") if bib_path.exists() else None
                 new_bib = _merged_bib_text(old_bib or "", plan)
                 if new_bib != (old_bib or ""):
@@ -2113,9 +2121,28 @@ def _undo_merge(
 
 
 def _merged_bib_text(text: str, plan: "_MergePlan") -> str:
-    """The target bibliography with the plan's new entries appended."""
-    from crucible.ingest import bib_has_key
+    """The target bibliography with the plan's file fields and new entries."""
+    from crucible.ingest import _BIB_ENTRY_RE, _parse_bib_fields, bib_has_key, set_bib_field
 
+    attached: list[str] = []
+
+    def attach(m: re.Match) -> str:
+        path = plan.bib_file_fields.get(m["key"])
+        if path is None:
+            return m.group(0)
+        if _parse_bib_fields(m["body"]).get("file") or m["key"] in attached:
+            raise click.ClickException(
+                f"the bibliography entry '{m['key']}' changed while merging."
+            )
+        attached.append(m["key"])
+        return set_bib_field(m.group(0), "file", path)
+
+    text = _BIB_ENTRY_RE.sub(attach, text)
+    missing = set(plan.bib_file_fields) - set(attached)
+    if missing:
+        raise click.ClickException(
+            f"the bibliography entry '{sorted(missing)[0]}' changed while merging."
+        )
     for cite_key, entry_text in plan.bib_entries:
         if bib_has_key(text, cite_key):
             continue
@@ -2143,6 +2170,9 @@ class _MergePlan:
     # Sidecars missing beside sources the target already has.
     sidecars: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
     bib_entries: list[tuple[str, str]] = dataclass_field(default_factory=list)
+    # Target entries with no `file` field that get one naming an incoming
+    # source copied for them (cite key -> path relative to the target root).
+    bib_file_fields: dict[str, str] = dataclass_field(default_factory=dict)
     # Incoming wiki articles (source path, destination path), and the
     # wiki-relative renames of those that collide with existing articles.
     articles: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
@@ -2221,7 +2251,7 @@ def _plan_source_merge(
 
     incoming_keys: set[str] = set()
     mapped_keys: set[str] = set()   # keys whose source file is accounted for
-    copied_keys: set[str] = set()   # keys whose source is copied as new
+    copied_keys: dict[str, str] = {}   # key -> new path, for sources copied as new
 
     for src in source_db.list_sources():
         try:
@@ -2323,7 +2353,7 @@ def _plan_source_merge(
                     src, src_file, dest_file, new_rel, metadata, src_text,
                 ))
                 if cite_key:
-                    copied_keys.add(cite_key)
+                    copied_keys[cite_key] = new_rel
         except _MergeConflict as exc:
             problems.append(str(exc))
             continue
@@ -2336,7 +2366,9 @@ def _plan_source_merge(
 
     # Bibliography entries, with `file` fields pointing at the planned paths.
     target_text = target_bib.read_text(encoding="utf-8") if target_bib.exists() else ""
-    target_keys = {m["key"] for m in _BIB_ENTRY_RE.finditer(target_text)}
+    target_entries: dict[str, list[str]] = {}
+    for m in _BIB_ENTRY_RE.finditer(target_text):
+        target_entries.setdefault(m["key"], []).append(m.group(0))
     source_sources = (source_cdir / "sources").resolve()
     for cite_key, entry_text in source_entries.items():
         if not _parse_bib_fields(entry_text).get("file"):
@@ -2350,17 +2382,19 @@ def _plan_source_merge(
                 )
         # bib_has_key also catches entries _BIB_ENTRY_RE misses (a closing
         # brace not on its own line) without matching field text.
-        if cite_key in target_keys or bib_has_key(target_text, cite_key):
+        if cite_key in target_entries or bib_has_key(target_text, cite_key):
             if cite_key in copied_keys:
-                # The target's entry would win on the next rebuild and point
-                # this key at something other than the source being copied.
-                problems.append(
-                    f"Cannot safely merge source with citation key '{cite_key}': "
-                    "the target bibliography already has an entry with this key "
-                    "but no matching indexed source. Give the target's entry a "
-                    "file field naming its source file and run `crucible sync` "
-                    "there, or rename one of the keys."
+                # The target has the reference but no source for it. Attach
+                # the incoming file to the target's entry when it is plainly
+                # the same reference; otherwise the target's entry would win
+                # on the next rebuild and point this key elsewhere.
+                problem = _bib_attach_problem(
+                    cite_key, target_entries.get(cite_key, []), entry_text
                 )
+                if problem:
+                    problems.append(problem)
+                else:
+                    plan.bib_file_fields[cite_key] = copied_keys[cite_key]
             continue
 
         try:
@@ -2401,6 +2435,51 @@ def _plan_source_merge(
     if problems:
         _raise_merge_problems(problems)
     return plan
+
+
+def _bib_attach_problem(
+    cite_key: str, target_entries: list[str], incoming_entry: str
+) -> str | None:
+    """Why an incoming source cannot be attached to the target's entry, if it cannot.
+
+    The target's entry must be the only one with the key, must not already
+    name a file, and must not disagree with the incoming entry on DOI or
+    title, which would mean the two keys name different references.
+    """
+    from crucible.ingest import _parse_bib_fields
+
+    prefix = (
+        f"Cannot safely merge source with citation key '{cite_key}': "
+        "the target bibliography already has an entry with this key"
+    )
+    if len(target_entries) != 1:
+        return (
+            f"{prefix}, but it cannot be read or is not the only one. Fix the "
+            "target's references.bib, or rename one of the keys."
+        )
+    target_fields = _parse_bib_fields(target_entries[0])
+    if target_fields.get("file"):
+        return (
+            f"{prefix} but no matching indexed source. Give the target's entry a "
+            "file field naming its source file and run `crucible sync` there, "
+            "or rename one of the keys."
+        )
+    incoming_fields = _parse_bib_fields(incoming_entry)
+    identifying = [
+        ("doi", "DOIs", lambda v: re.sub(
+            r"^(?:https?://(?:dx\.)?doi\.org/|doi:)", "", v.strip().lower())),
+        # Braces only protect case: {E}vidence is Evidence.
+        ("title", "titles", lambda v: re.sub(
+            r"[\W_]+", " ", v.replace("{", "").replace("}", "").lower()).strip()),
+    ]
+    for name, label, norm in identifying:
+        ours, theirs = target_fields.get(name), incoming_fields.get(name)
+        if ours and theirs and norm(ours) != norm(theirs):
+            return (
+                f"{prefix}, and the two entries have different {label}, so they "
+                "may not be the same reference. Rename one of the keys."
+            )
+    return None
 
 
 def _raise_merge_problems(problems: list[str]) -> NoReturn:

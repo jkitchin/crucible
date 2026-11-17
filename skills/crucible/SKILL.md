@@ -386,6 +386,12 @@ only when the file bytes are identical. If any source cannot be merged safely
 a shareable path), merge stops before copying and lists every problem. Resolve
 them in either crucible and run the merge again.
 
+When the target has a bibliography-only reference (an entry with no `file`
+field) and the incoming crucible has the file for the same key, merge copies
+the file and adds a `file` field naming it to the target's entry, rather than
+appending a second entry. It refuses instead if the two entries have different
+DOIs or titles, since they may then be different references.
+
 Once planned, the merge is all or nothing. Files are copied into a staging
 directory inside `.crucible/` and only then moved into place; the
 bibliography is rewritten in one atomic write and the source rows are added
