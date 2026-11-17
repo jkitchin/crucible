@@ -844,11 +844,13 @@ def reconcile_sources(root: Path, db, on_warning=None) -> int:
     """
     inserted = 0
 
-    with db.conn.transaction():
-        # The bibliography is read inside the write transaction, under the
-        # bib lock. Ingest appends its entry before it adds its row, and the
-        # row cannot be added while this transaction holds the write lock,
-        # so every ingested row seen here has its entry in what is read.
+    # The bib lock is taken before the database write lock, the order merge
+    # uses, so a sync and a merge never each hold one lock while waiting
+    # for the other. The bibliography is read inside the transaction: ingest
+    # appends its entry before it adds its row, and the row cannot be added
+    # while this transaction holds the write lock, so every ingested row
+    # seen here has its entry in what is read.
+    with _bib_lock(root), db.conn.transaction():
         entries, malformed = _read_bib_entries(root)
         bib_keys = {entry["cite_key"] for entry in entries}
         key_counts: dict[str, int] = {}
@@ -1071,9 +1073,26 @@ def bib_has_key(text: str, cite_key: str) -> bool:
     return bibtex_mod.has_key(text, cite_key)
 
 
+_BIB_LOCKS: dict[str, FileLock] = {}
+
+
 def _bib_lock(root: Path) -> FileLock:
-    bib_path = root / CRUCIBLE_DIR / "references.bib"
-    return FileLock(bib_path.with_suffix(".bib.lock"), timeout=10)
+    """The lock on root's references.bib, one object per lock file.
+
+    A FileLock object can be re-acquired by the thread that holds it, but a
+    second object for the same file waits for the first. Handing out one
+    object lets sync hold the lock across its whole transaction while the
+    bib reads and rewrites inside it take it again.
+
+    Lock order: every writer takes this lock before the database write lock
+    (sync's transaction, merge's row inserts). Ingest takes it only to
+    append its entry, and adds its row after releasing it.
+    """
+    lock_path = os.path.abspath(root / CRUCIBLE_DIR / "references.bib.lock")
+    lock = _BIB_LOCKS.get(lock_path)
+    if lock is None:
+        lock = _BIB_LOCKS[lock_path] = FileLock(lock_path, timeout=10)
+    return lock
 
 
 def _append_bib_unlocked(root: Path, entry: str, cite_key: str) -> bool:
@@ -1143,8 +1162,7 @@ def set_bib_fields(root: Path, name: str, values: dict[str, str]) -> None:
 def _rewrite_bib(root: Path, fn) -> None:
     """Replace each references.bib entry with fn(entry), under the bib lock."""
     bib_path = root / CRUCIBLE_DIR / "references.bib"
-    lock_path = bib_path.with_suffix(".bib.lock")
-    with FileLock(lock_path, timeout=10):
+    with _bib_lock(root):
         if not bib_path.exists():
             return
         text = bib_path.read_text(encoding="utf-8")
@@ -1323,7 +1341,7 @@ def _norm_title(title: str | None) -> str:
 
 
 def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str,
-                      title: str | None, doi: str | None) -> str | None:
+                      title: str | None, doi: str | None, text: str) -> str | None:
     """Why source_path may not be the missing file of the row src, or None.
 
     The row was rebuilt from its bib entry, so it has no hash to compare.
@@ -1336,7 +1354,6 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     key = _source_metadata(src).get("cite_key") or src["path"]
     advice = ("If it is that source, run again with --restore; if not, "
               "rename the file before ingesting it.")
-    text = extract_text(source_path)
     row_doi = _norm_doi(_source_metadata(src).get("doi"))
     file_doi = _norm_doi(doi or (extract_doi_from_text(text)
                                  if source_type in ("pdf", "web") else None))
@@ -1363,7 +1380,7 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
 
 
 def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
-                    content_hash: str) -> dict:
+                    content_hash: str, text: str | None = None) -> dict:
     """Put source_path back as the missing stored file of the existing row src.
 
     This is the same source: on a fresh clone the gitignored external copy
@@ -1384,7 +1401,8 @@ def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
         shutil.copystat(source_path, dest)
 
         metadata = _source_metadata(src)
-        text = extract_text(source_path)
+        if text is None:
+            text = extract_text(source_path)
         text_path = dest.with_suffix(".txt")
         wrote_text = False
         if text and text_path != dest and _claim(text_path, created):
@@ -1497,12 +1515,14 @@ def ingest_source(
         # Only the name matches, so the file is checked against the row
         # before it inherits that source's key, title and bib entry: a
         # different paper.pdf must not be filed as the old one.
+        # The text is extracted once, for the check and the sidecar.
+        text = extract_text(source_path)
         if not restore:
             problem = _restore_mismatch(root, holder, source_path, source_type,
-                                        title, doi)
+                                        title, doi, text)
             if problem:
                 raise ValueError(problem)
-        return _restore_source(root, db, holder, source_path, content_hash)
+        return _restore_source(root, db, holder, source_path, content_hash, text)
 
     # Everything that can fail (text extraction, DOI lookup, building the
     # entry) runs before anything is written, from the original file.

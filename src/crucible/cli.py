@@ -2715,9 +2715,7 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
     """
     import tempfile
 
-    from filelock import FileLock
-
-    from crucible.ingest import atomic_write_text
+    from crucible.ingest import _bib_lock, atomic_write_text
 
     target_cdir = cdir(root)
     bib_path = target_cdir / "references.bib"
@@ -2749,7 +2747,8 @@ def _apply_merge(root: Path, plan: "_MergePlan", target_db: CrucibleDB) -> int:
             plan.incoming_articles or None,
         )
 
-        with FileLock(bib_path.with_suffix(".bib.lock"), timeout=10):
+        # Bib lock, then the database write lock (step 4), as sync takes them.
+        with _bib_lock(root):
             # 2. Move the staged files into place.
             for staged, dest in staged_files:
                 missing = []

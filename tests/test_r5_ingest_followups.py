@@ -208,3 +208,64 @@ def test_an_ingest_finishing_before_the_transaction_is_not_released(kb, tmp_path
     finally:
         db.close()
     assert md and "content_hash" in md
+
+
+# -- review of #41 (third): lock order and one text extraction --------------
+
+
+def test_sync_takes_the_bib_lock_before_the_database_write_lock(kb, tmp_path):  # noqa: F811
+    """Merge takes the bib lock, then the write lock; sync must too, so the
+    two can never each hold one lock while waiting for the other."""
+    alpha = tmp_path / "a.md"
+    alpha.write_text("# Alpha\nbody\n")
+    ingest(kb, alpha)
+
+    db = db_of(kb)
+    original = db.conn.transaction
+    held_at_begin = []
+
+    @contextmanager
+    def checked_transaction():
+        held_at_begin.append(ingest_module._bib_lock(kb).is_locked)
+        with original():
+            yield
+
+    db.conn.transaction = checked_transaction
+    try:
+        ingest_module.reconcile_sources(kb, db)
+    finally:
+        db.conn.transaction = original
+        db.close()
+    assert held_at_begin == [True]
+    assert not ingest_module._bib_lock(kb).is_locked
+
+
+def test_the_bib_lock_can_be_taken_again_while_held(kb):  # noqa: F811
+    lock = ingest_module._bib_lock(kb)
+    assert ingest_module._bib_lock(kb) is lock
+    with lock:
+        # A bib rewrite inside sync's locked transaction takes it again.
+        ingest_module.set_bib_fields(kb, "note", {})
+        ingest_module._rewrite_bib(kb, lambda e: e.text)
+        assert lock.is_locked
+    assert not lock.is_locked
+
+
+def test_restore_by_name_extracts_the_text_once(kb, tmp_path, monkeypatch):  # noqa: F811
+    old = tmp_path / "old" / "paper.md"
+    old.parent.mkdir()
+    old.write_text("# Catalysis on Platinum\nbody\n")
+    first = ingest(kb, old)
+    fresh_clone_of(kb, first)
+
+    calls = []
+    real = ingest_module.extract_text
+
+    def counting(path):
+        calls.append(path)
+        return real(path)
+
+    monkeypatch.setattr(ingest_module, "extract_text", counting)
+    again = ingest(kb, old)
+    assert again.get("restored")
+    assert len(calls) == 1
