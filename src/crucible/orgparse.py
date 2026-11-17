@@ -37,19 +37,23 @@ FILE_LINK_RE = re.compile(r"\[\[file:([^\]]+?)(?:::.*?)?\](?:\[([^\]]*)\])?\]")
 # org-ref citations. Both syntaxes are recognized:
 #   v2: cite:key1,key2          (also [[cite:key1,key2]])
 #   v3: cite:&key1;&key2        (also [[cite:prefix;&key1 note;&key2]])
-# The link types are org-ref's natbib/biblatex commands. The lookbehind keeps
-# words such as "excite:" from being read as a citation.
+# The link types are org-ref's natbib and biblatex commands, listed
+# explicitly so prose such as "cites:many" is not read as a citation.
 _CITE_TYPE = (
-    r"(?:[Cc]ite[a-z]*|[Pp]arencite|[Tt]extcite|[Aa]utocite|[Ff]ootcite[a-z]*"
-    r"|[Ss]martcite|[Ss]upercite|fullcite|nocite)"
+    r"(?:[Cc]ite(?:[pt]|al[tp]|author|year(?:par)?|num|text|title|url|date)?\*?"
+    r"|nocite|[Aa]utocite|[Pp]arencite|[Tt]extcite|[Ff]ootcite(?:text)?"
+    r"|[Ss]martcite|[Ss]upercite|fullcite)"
 )
 # BibTeX keys may contain ':', '.', '/', '+' and '-', but a key never ends in
 # '.' or ':', so sentence punctuation after a bare citation is not captured.
 _CITE_KEY = r"[\w+/-](?:[\w:.+/-]*[\w+/-])?"
+# A bare citation must not follow a word character (so "excite:" is not one),
+# '[' (bracketed form), or URL and verbatim delimiters (so
+# https://example.com/cite:foo and =cite:x= are not citations).
 CITATION_RE = re.compile(
     rf"\[\[(?P<btype>{_CITE_TYPE}):(?P<bbody>[^\]]+)\](?:\[[^\]]*\])?\]"
-    rf"|(?<![\w\[])(?P<type>{_CITE_TYPE}):"
-    rf"(?P<body>&?{_CITE_KEY}(?:[;,]&?{_CITE_KEY})*)"
+    rf"|(?<![\w\[/=?&#])(?P<type>{_CITE_TYPE}):"
+    rf"(?P<body>&?{_CITE_KEY}(?:[;,]\s*&{_CITE_KEY}|[;,]{_CITE_KEY})*)"
 )
 _V3_KEY_RE = re.compile(rf"&({_CITE_KEY})")
 
@@ -64,7 +68,7 @@ def citation_keys(m: re.Match) -> list[str]:
     body = m.group("bbody") or m.group("body")
     if "&" in body:
         return _V3_KEY_RE.findall(body)
-    return [k.strip() for k in body.split(",") if k.strip()]
+    return [k.strip() for k in re.split(r"[,;]", body) if k.strip()]
 
 
 def parse_org(text: str) -> OrgMetadata:

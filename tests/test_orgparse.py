@@ -74,8 +74,18 @@ def test_property_drawer_is_case_insensitive():
         # BibTeX keys may contain '.' and ':'; trailing punctuation is not a key
         ("cite:doe.2020.", ["doe.2020"]),
         ("cite:doe:2020, then", ["doe:2020"]),
-        # words ending in "cite" are not citations
+        ("citet*:&a and citeyearpar:&b", ["a", "b"]),
+        # separators: a space before a v3 key, or ';' between v2 keys
+        ("cite:&a, &b", ["a", "b"]),
+        ("cite:a;b", ["a", "b"]),
+        # words that are not org-ref link types are not citations
         ("excite:foo", []),
+        ("cites:many", []),
+        # nor is "cite:" inside a URL or verbatim text
+        ("[[https://example.com/cite:foo][a link]]", []),
+        ("[[https://example.com/cite:foo]]", []),
+        ("https://example.com/?q=cite:foo", []),
+        ("=cite:x=", []),
     ],
 )
 def test_citation_keys(text, keys):
@@ -87,3 +97,9 @@ def test_v3_citations_render_as_citations():
     for key in ("smith2024", "a", "b"):
         assert f'href="/_references#{key}"' in body
     assert "&amp;" not in body
+
+
+def test_urls_containing_cite_render_as_links():
+    _, body, _ = org_to_html("* A\nSee [[https://example.com/cite:foo][a link]].\n")
+    assert '<a href="https://example.com/cite:foo" target="_blank">a link</a>' in body
+    assert "\x01" not in body
