@@ -2191,8 +2191,11 @@ def _is_own_sidecar(root: Path, db, src: dict, disk_path: Path, sidecar: Path) -
             meta = {}
     if isinstance(meta, dict) and meta.get("text_hash"):
         return file_sha256(sidecar) == meta["text_hash"]
+    # Whitespace is ignored: an upgraded extractor (pdftotext, pandoc)
+    # often changes only spacing and line breaks.
     try:
-        return sidecar.read_text(encoding="utf-8") == extract_text(disk_path)
+        return (sidecar.read_text(encoding="utf-8").split()
+                == extract_text(disk_path).split())
     except Exception:
         return False
 
@@ -2266,7 +2269,9 @@ def delete(path, yes, delete_file):
                 sidecar.unlink()
                 click.echo(f"  Deleted text sidecar: {sidecar}")
             elif sidecar != disk_path and sidecar.is_file():
-                click.echo(f"  Kept {sidecar}: it is not this source's extracted text.")
+                click.echo(f"  Kept {sidecar}: it does not match this source's extracted "
+                           "text. If it is an old sidecar, delete it by hand, or the "
+                           "next sync indexes it as a source.")
         # The bibliography is what sync rebuilds sources from, so the entry
         # must stop naming the file or the next sync restores the row.
         from crucible.ingest import drop_bib_file_fields
@@ -3083,8 +3088,8 @@ def _rewrite_article_links(
                 new_link = str(new_target.resolve())
             else:
                 new_link = os.path.relpath(new_target, final_path.parent)
-                prefixed = not match.group(0).startswith("[[file:")
-                if prefixed and not new_link.startswith(("./", "../")):
+                bare_link = not match.group(0).startswith("[[file:")
+                if bare_link and not new_link.startswith(("./", "../")):
                     new_link = "./" + new_link  # keep it a link org reads
             start = match.start(1) - match.start(0)
             end = match.end(1) - match.start(0)
@@ -4266,6 +4271,8 @@ _PRE_RECORD_SKILL_HASHES = {
         "e986a207cfb3f66db9958d781927d39c22d527a97a54c3f34ef7eecf3e577b8e",
         "f37dd608de0522523200c94c0e2627ee61c96d06148ec417861676b137180e7f",
         "f7fa4428132bf1d54eb1f4ee4b5e7183ef21d07f864c9e18d469b04f7ee2b078",
+        "0f581a855e8edf8648b1a30d317f8cd33a440584fa2e739de7fbde09a1130216",
+        "c21dcd26fdf60350e4d6303c5db972c55263185dc1adabeeb0654a80f165f01e",
     }),
 }
 

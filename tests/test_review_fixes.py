@@ -181,3 +181,35 @@ def test_concept_lookup_is_case_insensitive(kb):  # noqa: F811
     result = CliRunner().invoke(cli, ["concept", "KINETICS", "--json"])
     assert result.exit_code == 0, result.output
     assert [a["title"] for a in json.loads(result.stdout)] == ["Kinetics"]
+
+
+# Follow-ups from the re-review of 9b818ae -----------------------------------
+
+def test_failure_right_after_claiming_leaves_no_placeholder(kb, tmp_path, monkeypatch):  # noqa: F811
+    (tmp_path / "paper.md").write_text("# Paper\nbody\n")
+    real = ingest_module.set_bib_field
+
+    def set_bib_field(entry, name, value):
+        if name == "file":  # the first call after the names are claimed
+            raise RuntimeError("boom")
+        return real(entry, name, value)
+    monkeypatch.setattr(ingest_module, "set_bib_field", set_bib_field)
+    result = run("ingest", str(tmp_path / "paper.md"), ok=False)
+    assert result.exit_code != 0
+    web = kb / ".crucible/sources/external/web"
+    assert not web.exists() or list(web.iterdir()) == []
+
+
+def test_delete_file_removes_a_legacy_sidecar_with_changed_spacing(kb, tmp_path):  # noqa: F811
+    (tmp_path / "results.csv").write_text("a,b\n1,2\n")
+    run("ingest", str(tmp_path / "results.csv"))
+    data = kb / ".crucible/sources/data"
+    db = CrucibleDB(kb / ".crucible/crucible.db")
+    try:
+        db.conn.execute("UPDATE sources SET metadata = '{}'")
+        db.conn.commit()
+    finally:
+        db.close()
+    (data / "results.txt").write_text("a,b\r\n1,2  \n\n")  # as an older extractor wrote it
+    run("delete", "results.csv", "--yes", "--file")
+    assert list(data.iterdir()) == []

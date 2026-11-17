@@ -1205,33 +1205,34 @@ def ingest_source(
     # Claim the names by exclusive create: a free name that another ingest
     # takes first raises FileExistsError, and we move on to the next one.
     # A file is never replaced. A .txt source is its own text; any other
-    # file gets a sidecar.
+    # file gets a sidecar. Claiming happens inside the try, so a failure or
+    # interrupt before the copy still removes the empty placeholders.
     created: list[Path] = []
-    write_sidecar = False
-    if in_place:
-        text_path = dest_path.with_suffix(".txt")
-        if text and text_path != dest_path:
-            write_sidecar = _claim(text_path, created)
-    else:
-        stem, suffix = source_path.stem, source_path.suffix
-        counter = 1
-        while True:
-            if not _dest_taken(dest_path) and _claim(dest_path, created):
-                text_path = dest_path.with_suffix(".txt")
-                if not text or text_path == dest_path:
-                    break
-                if _claim(text_path, created):
-                    write_sidecar = True
-                    break
-                created.pop().unlink(missing_ok=True)
-            dest_path = dest_dir / f"{stem}_{counter}{suffix}"
-            counter += 1
-
-    rel_path = str(dest_path.relative_to(root))
-    bib_entry = set_bib_field(bib_entry, "file", rel_path)
-
     cite_key = None
     try:
+        write_sidecar = False
+        if in_place:
+            text_path = dest_path.with_suffix(".txt")
+            if text and text_path != dest_path:
+                write_sidecar = _claim(text_path, created)
+        else:
+            stem, suffix = source_path.stem, source_path.suffix
+            counter = 1
+            while True:
+                if not _dest_taken(dest_path) and _claim(dest_path, created):
+                    text_path = dest_path.with_suffix(".txt")
+                    if not text or text_path == dest_path:
+                        break
+                    if _claim(text_path, created):
+                        write_sidecar = True
+                        break
+                    created.pop().unlink(missing_ok=True)
+                dest_path = dest_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+
+        rel_path = str(dest_path.relative_to(root))
+        bib_entry = set_bib_field(bib_entry, "file", rel_path)
+
         if not in_place:
             with open(source_path, "rb") as src, open(dest_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
