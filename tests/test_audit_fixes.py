@@ -300,3 +300,39 @@ def test_unreadable_created_is_not_also_reported_missing(project):  # noqa: F811
     sync()
     assert [i["path"] for i in lint_types("invalid_date")] == [CONCEPT_PATH]
     assert not [i for i in lint_types("missing_property") if "MODIFIED" in i["message"]]
+
+
+def test_withheld_ingest_day_date_is_linted(project, tmp_path):  # noqa: F811
+    from datetime import datetime
+
+    from crucible import bibtex
+    today = datetime.now().strftime("%Y-%m-%d")
+    src = tmp_path / "nb.csv"
+    src.write_text("n\n")
+    _ingest(project, src, "--title", "Notebook", "--author", "Ann Smith", "--date", today)
+    bib = project / ".crucible/references.bib"
+    bib.write_text(bibtex.remove_field(bib.read_text(), "date"))
+    sync()
+    issues = lint_types("unrecorded_source_date")
+    assert [i["path"] for i in issues] == [f"{DATA}/nb.csv"]
+    assert today in issues[0]["message"]
+    # Once the user records it, the issue goes away.
+    bib.write_text(bibtex.map_entries(
+        bib.read_text(), lambda e: bibtex.set_field(e.text, "date", today)))
+    sync()
+    assert lint_types("unrecorded_source_date") == []
+
+
+def test_ingest_day_date_is_recorded_when_the_entry_has_no_year(project, tmp_path):  # noqa: F811
+    from datetime import datetime
+
+    from crucible import bibtex
+    today = datetime.now().strftime("%Y-%m-%d")
+    src = tmp_path / "ny.csv"
+    src.write_text("y\n")
+    _ingest(project, src, "--title", "No year", "--date", today)
+    bib = project / ".crucible/references.bib"
+    text = bibtex.remove_field(bibtex.remove_field(bib.read_text(), "date"), "year")
+    bib.write_text(text)
+    sync()
+    assert f"date = {{{today}}}" in bib.read_text()

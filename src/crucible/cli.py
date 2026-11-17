@@ -3018,6 +3018,26 @@ def lint(json_output):
                 "line": line,
             })
     bib_without_file = {e.key for e in bib_entries if not e.get("file")}
+    # Ingested rows whose full date sync withheld from the bib (it may be
+    # the day of ingest rather than a publication date): a rebuild keeps
+    # only the entry's year, so say so and let the user decide.
+    from crucible.ingest import _source_metadata
+    dated_keys = {e.key for e in bib_entries if e.get("date")}
+    for src in db.list_sources():
+        src_meta = _source_metadata(src)
+        key, withheld = src_meta.get("cite_key"), src_meta.get("unrecorded_date")
+        if withheld and key not in dated_keys:
+            issues.append({
+                "type": "unrecorded_source_date",
+                "severity": "info",
+                "message": (
+                    f"Source date {withheld} for '{key}' is not in references.bib "
+                    "(it may be the day of ingest); add "
+                    f"date = {{{withheld}}} to the entry if it is the publication date"
+                ),
+                "path": src["path"],
+                "key": key,
+            })
     for article in db.list_articles():
         org_path = root / article["path"]
         if not org_path.exists():
@@ -3538,6 +3558,8 @@ Lint (health checks):
                                - references.bib entries never closed
                                - Committed sources whose file is gone
                                - Citations missing from references.bib
+                               - Source dates not copied to
+                                 references.bib (maybe the ingest day)
                                - Wiki files not in database
   crucible lint -j             JSON output (for agent consumption)
 

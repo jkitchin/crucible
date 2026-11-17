@@ -549,6 +549,29 @@ def _is_ingest_day(row_date: str, ingested_at: str | None) -> bool:
     return abs((day - ingested).days) <= 1
 
 
+def row_date_for_bib(src: dict, entry_date: str | None,
+                     entry_year: str | None) -> tuple[str | None, str | None]:
+    """Whether an ingested row's date belongs in its bib entry.
+
+    Rows ingested before ingest wrote `date` know a full date the entry may
+    lack; recording it lets a rebuild keep it. Returns (date to write, date
+    withheld). A date whose year disagrees with the entry's is not written:
+    the entry wins. Nor is one within a day of the ingest when the entry has
+    a year: a source ingested without --date got the day of ingest, which is
+    not a publication date, and the row cannot say which it was. That date is
+    returned as withheld so lint can report it.
+    """
+    row_date = src.get("date") or ""
+    if (not _from_ingest(src) or entry_date
+            or not re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", row_date)):
+        return None, None
+    if entry_year and entry_year != row_date[:4]:
+        return None, None
+    if entry_year and _is_ingest_day(row_date, src.get("ingested_at")):
+        return None, row_date
+    return row_date, None
+
+
 def _from_ingest(src: dict) -> bool:
     """Whether a source row was created by ingest (or copied by merge).
 
@@ -653,6 +676,7 @@ def reconcile_sources(root: Path, db) -> int:
         # user's edit to an entry is not undone by a row rebuilt from it.
         file_updates = {}
         date_updates = {}
+        withheld: dict[str, str] = {}
         for entry in entries:
             src = by_key.get(entry["cite_key"])
             # A repeated key is ambiguous: lint reports it, and which entry
@@ -668,14 +692,10 @@ def reconcile_sources(root: Path, db) -> int:
             # Rows ingested before ingest wrote `date` know a full date the
             # entry lacks; record it so a rebuild keeps it. A date whose
             # year disagrees with the entry's is not written: the entry wins.
-            # Before ingest wrote `date`, a source ingested without --date
-            # got the day of ingest; that is not a publication date, so a
-            # row date within a day of ingested_at is not written.
-            row_date = src.get("date") or ""
-            if (_from_ingest(src) and not entry.get("date")
-                    and re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", row_date)
-                    and entry.get("year", row_date[:4]) == row_date[:4]
-                    and not _is_ingest_day(row_date, src.get("ingested_at"))):
+            row_date, held = row_date_for_bib(src, entry.get("date"), entry.get("year"))
+            if held:
+                withheld[entry["cite_key"]] = held
+            if row_date:
                 date_updates[entry["cite_key"]] = row_date
                 entry["date"] = row_date
         set_bib_file_fields(root, file_updates)
@@ -705,6 +725,13 @@ def reconcile_sources(root: Path, db) -> int:
                     if row_key["path"] == rel_path:
                         fields = _fields_from_bib(entry, rel_path)
                         fields["metadata"] = {**_source_metadata(row_key), **fields["metadata"]}
+                        # The row's date becomes the entry's; a full date
+                        # sync would not write to the bib is kept here so
+                        # lint can report it, until the entry has a date.
+                        if key in withheld:
+                            fields["metadata"]["unrecorded_date"] = withheld[key]
+                        elif entry.get("date"):
+                            fields["metadata"].pop("unrecorded_date", None)
                         del fields["path"]
                         db.update_source(row_key["id"], **fields)
                     continue

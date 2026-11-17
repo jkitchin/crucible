@@ -345,6 +345,7 @@ Each issue has a type and a severity (error, warning or info):
 | =missing_tags= | warning | The article has no =#+FILETAGS:= |
 | =untracked= | warning | A wiki file is not in the database (run =crucible sync=) |
 | =missing_citation= | warning | A =cite:= key is not in =references.bib= |
+| =unrecorded_source_date= | info | An ingested source's full date was not written to =references.bib= because it may be the day of ingest; the source now has the entry's year. Add =date = {...}= to the entry if it is the publication date |
 
 =--json= outputs a list of issues, each with =type=, =severity=,
 =message= and, where it applies, the =path= it concerns, plus =link= for
