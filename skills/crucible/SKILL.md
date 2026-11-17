@@ -138,7 +138,8 @@ When a new source adds information to an existing concept:
 
 `:CREATED:` and `:MODIFIED:` are the article's dates in the database, so
 they survive a rebuild. Search prefers recently modified articles, so keep
-`:MODIFIED:` current: sync uses it as is, even when the file changed.
+`:MODIFIED:` current: sync uses it as is, even when the file changed, and
+an article without it counts as last modified on its `:CREATED:` date.
 
 ### Capturing Conversation Insights
 

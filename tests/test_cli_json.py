@@ -722,14 +722,13 @@ def _embedded_paths(project):
 
 
 def _seed(project):
-    """Give every article an embedding and an old updated_at."""
+    """Give every article an embedding, as a marker that sync kept it."""
     def seed(db, ids):
         for i in ids.values():
             db.conn.execute(
                 "INSERT INTO embeddings (article_id, model, dimensions) VALUES (?, 'm', 768)",
                 (i,),
             )
-        db.conn.execute("UPDATE articles SET updated_at = '2000-01-01 00:00:00'")
         db.conn.commit()
     _with_embeddings(project, seed)
 
@@ -745,7 +744,7 @@ def _updated_at(project, path):
 def test_sync_leaves_unchanged_articles_alone(project):
     _seed(project)
     assert "0 added, 0 updated, 2 unchanged" in _sync_output()
-    assert _updated_at(project, CONCEPT_PATH) == "2000-01-01 00:00:00"
+    assert _updated_at(project, CONCEPT_PATH) == "2026-01-01 00:00:00"
     assert _embedded_paths(project) == {CONCEPT_PATH, SUMMARY_PATH}
 
 
@@ -754,8 +753,6 @@ def test_sync_rewrites_only_changed_articles(project):
     path = project / CONCEPT_PATH
     path.write_text(path.read_text().replace("energy barrier", "zeolite barrier"))
     assert "0 added, 1 updated, 1 unchanged" in _sync_output()
-    assert _updated_at(project, CONCEPT_PATH) != "2000-01-01 00:00:00"
-    assert _updated_at(project, SUMMARY_PATH) == "2000-01-01 00:00:00"
     # The edited article's embedding is stale, so it is dropped for re-embedding.
     assert _embedded_paths(project) == {SUMMARY_PATH}
     assert [r["path"] for r in run_json("search", "zeolite", "--mode", "fts")] == [CONCEPT_PATH]
@@ -832,19 +829,52 @@ def test_modified_is_used_as_is_even_when_the_file_changed(project):
     assert _dates(_db(project), CONCEPT_PATH)[1] == "2026-03-05 00:00:00"
 
 
-def test_without_modified_an_edit_uses_sync_time(project):
+def test_without_modified_an_edit_keeps_the_created_date(project):
+    """With :CREATED: only, the file still decides: an edit that doesn't
+    add :MODIFIED: leaves updated_at at the :CREATED: date."""
     path = project / CONCEPT_PATH
     path.write_text(path.read_text().replace("energy barrier", "zeolite barrier"))
+    assert "1 updated" in _sync_output()
+    assert _dates(_db(project), CONCEPT_PATH) == ("2026-01-01 00:00:00",) * 2
+
+
+def test_without_any_date_property_an_edit_uses_sync_time(project):
+    path = project / CONCEPT_PATH
+    path.write_text(path.read_text().replace(":CREATED: 2026-01-01\n", ""))
     _sync()
-    created, updated = _dates(_db(project), CONCEPT_PATH)
-    assert created == "2026-01-01 00:00:00"
-    assert updated > "2026-01-01 00:00:00"
+    path.write_text(path.read_text().replace("energy barrier", "zeolite barrier"))
+    _sync()
+    assert _dates(_db(project), CONCEPT_PATH)[1] > "2026-01-01 00:00:00"
+
+
+def test_upgraded_created_only_db_matches_a_fresh_rebuild(project, tmp_path):
+    """A wiki written before :MODIFIED: existed (every article has :CREATED:
+    only) and a DB whose dates are sync times, as older versions left it:
+    after one sync it must hold the same dates as a fresh rebuild."""
+    db = CrucibleDB(_db(project))
+    try:
+        db.conn.execute("UPDATE articles SET created_at = '2030-05-06 10:53:19', "
+                        "updated_at = '2030-05-06 10:53:19'")
+        db.conn.commit()
+    finally:
+        db.close()
+    _sync()
+    fresh_path = tmp_path / "fresh.db"
+    fresh = CrucibleDB(fresh_path)
+    fresh.initialize()
+    try:
+        _sync_wiki_to_db(project, fresh)
+    finally:
+        fresh.close()
+    for path in (CONCEPT_PATH, SUMMARY_PATH):
+        assert _dates(_db(project), path) == _dates(fresh_path, path)
+    assert _dates(fresh_path, SUMMARY_PATH) == ("2026-01-02 00:00:00",) * 2
 
 
 def test_dates_from_an_older_db_are_corrected_without_dropping_embeddings(project):
     """Upgrading: rows written before dates came from properties are fixed
     on the next sync, but the content is unchanged so embeddings are kept."""
-    _seed(project)  # embeddings for both articles, updated_at in 2000
+    _seed(project)  # embeddings for both articles
     db = CrucibleDB(_db(project))
     try:
         db.conn.execute("UPDATE articles SET created_at = '2030-01-01 00:00:00'")

@@ -773,8 +773,12 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
             status = meta.properties.get("STATUS") or "draft"
             # :CREATED: and :MODIFIED: make an article's dates part of its
             # file, so they survive a rebuild; without them sync time is used.
+            # :MODIFIED: falls back to :CREATED:, by the same rule for new and
+            # existing rows, so incremental sync and a rebuild agree. Property
+            # dates have no zone and count as midnight; the sync-time fallback
+            # (datetime('now')) is UTC. Ordering is only meaningful by day.
             created = _org_date(meta.properties.get("CREATED"))
-            modified = _org_date(meta.properties.get("MODIFIED"))
+            modified = _org_date(meta.properties.get("MODIFIED")) or created
 
             existing = db.get_article_by_path(rel_path)
             if existing:
@@ -829,7 +833,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None) -> dict:
                     content=meta.content,
                     status=status,
                     created_at=created,
-                    updated_at=modified or created,
+                    updated_at=modified,
                 )
                 stats["added"] += 1
 
