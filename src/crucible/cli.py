@@ -2396,7 +2396,11 @@ def merge(source, dry_run, yes):
     try:
         src_stats = source_db.stats()
         # Counted on disk: the source database may predate its articles.
-        src_articles = len(_wiki_article_files(source_wiki)) if source_wiki.is_dir() else 0
+        try:
+            src_articles = (len(_wiki_article_files(source_wiki))
+                            if source_wiki.is_dir() else 0)
+        except OSError as exc:
+            raise click.ClickException(f"Cannot read {source_wiki}: {exc}") from exc
         click.echo(
             f"  {src_stats['sources']} sources, {src_articles} articles, "
             f"{src_stats['concepts']} concepts"
