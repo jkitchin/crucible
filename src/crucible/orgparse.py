@@ -108,6 +108,18 @@ _VERBATIM_RE = re.compile(
 )
 
 
+# Any drawer (:PROPERTIES:, :LOGBOOK:, ...) up to its :END: line. Like org,
+# a drawer cannot span a heading, so a stray ":note:" line followed later by
+# some other drawer's :END: does not swallow the prose between them. Shared
+# by browse and embeddings.embedding_text.
+DRAWER_RE = re.compile(
+    r"^[ \t]*:(?!END:)([A-Za-z][\w-]*):[ \t]*\n"
+    r"((?:(?![ \t]*:END:[ \t]*$)(?!\*+[ \t]).*\n)*?)"
+    r"[ \t]*:END:[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
 def citation_type(m: re.Match) -> str:
     """The link type (cite, citep, ...) of a CITATION_RE match."""
     return m.group("btype") or m.group("type")

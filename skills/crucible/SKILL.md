@@ -78,7 +78,8 @@ and in `--json` output), to the current directory, to `.crucible/`
 (`wiki/concepts/x.org`), or to the wiki (`concepts/x.org`), or absolute. A
 path that names no article, an unknown `source`, or an unknown `help` topic
 is an error (exit 1), not an empty result; run `crucible sync` first if the
-article is new. Concept names ignore case and punctuation, so
+article is new. Concept names ignore case, spaces, underscores, dashes and
+apostrophes, so
 `crucible concept "activation energy"` finds the tag `activation_energy`.
 
 `crucible install` copies the skill and, inside a project, points the global

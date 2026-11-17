@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 
 from crucible import bibtex
 from crucible.orgparse import CITATION_RE, citation_keys, citation_type
+from crucible.orgparse import DRAWER_RE as _DRAWER_RE
 
 
 # ---------------------------------------------------------------------------
@@ -73,16 +74,7 @@ def format_citation(entry: dict[str, str]) -> str:
 _TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _KEYWORD_RE = re.compile(r"^#\+\w+:.*$", re.MULTILINE)
-# Any drawer (:PROPERTIES:, :LOGBOOK:, ...) up to its :END: line. Like org,
-# a drawer cannot span a heading, so a stray ":note:" line followed later by
-# some other drawer's :END: does not swallow the prose between them. Shared
-# with embeddings.embedding_text.
-DRAWER_RE = _DRAWER_RE = re.compile(
-    r"^[ \t]*:(?!END:)([A-Za-z][\w-]*):[ \t]*\n"
-    r"((?:(?![ \t]*:END:[ \t]*$)(?!\*+[ \t]).*\n)*?)"
-    r"[ \t]*:END:[ \t]*$",
-    re.MULTILINE | re.IGNORECASE,
-)
+DRAWER_RE = _DRAWER_RE  # imported from orgparse; kept for callers of browse
 _PROP_LINE_RE = re.compile(r"^\s*:([A-Za-z_]+):\s+(.+?)\s*$", re.MULTILINE)
 # Org block names are case-insensitive and blocks may be indented. The
 # language is matched with [ \t] so a src block with none does not take its
@@ -1227,14 +1219,20 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/_graph":
             # Built from the database on every request, so it is never stale,
             # with node clicks opening browse pages rather than VS Code.
-            from crucible.cli import viz_html  # cli imports this module
             from crucible.database import CrucibleDB
-            db = CrucibleDB(self.db_path)
+            from crucible.viz import viz_html
             try:
-                body, _, _ = viz_html(self.wiki_dir.parent.parent, db,
-                                      link_mode="browse")
-            finally:
-                db.close()
+                db = CrucibleDB(self.db_path)
+                try:
+                    body, _, _ = viz_html(self.wiki_dir.parent.parent, db,
+                                          link_mode="browse")
+                finally:
+                    db.close()
+            except Exception as exc:  # a locked or broken database, say
+                self._send_response(
+                    500, "text/plain; charset=utf-8",
+                    f"Could not build the graph: {exc}\n".encode("utf-8"))
+                return
             self._send_response(200, "text/html; charset=utf-8",
                                 body.encode("utf-8"))
         elif path == "/_static/style.css":

@@ -107,13 +107,25 @@ def test_explicit_doi_still_applies_to_a_notebook(kb, tmp_path, doi_lookup):  # 
     assert DOI in (kb / ".crucible/references.bib").read_text()
 
 
-def test_web_page_doi_is_used_but_its_declared_title_wins(kb, tmp_path, doi_lookup):  # noqa: F811
+def test_guessed_doi_of_another_paper_is_dropped_entirely(kb, tmp_path, doi_lookup):  # noqa: F811
     (tmp_path / "page.md").write_text(f"# My summary of it\n\ndoi: {DOI}\n")
-    result = run("ingest", str(tmp_path / "page.md"))
+    result = run("ingest", str(tmp_path / "page.md"), "--date", "2024-05-01")
     assert doi_lookup == [DOI]
     assert "Ingested: My summary of it" in result.output
+    assert "Ignored DOI" in result.output
     bib = (kb / ".crucible/references.bib").read_text()
-    assert DOI in bib and "My summary of it" in bib and "Some Catalysis Paper" not in bib
+    assert "My summary of it" in bib
+    for leaked in (DOI, "Some Catalysis Paper", "Smith", "2015", "ACS Catal"):
+        assert leaked not in bib
+    assert "2024" in bib
+
+
+def test_guessed_doi_whose_title_matches_is_kept(kb, tmp_path, doi_lookup):  # noqa: F811
+    (tmp_path / "page.md").write_text(f"# Some catalysis paper.\n\ndoi: {DOI}\n")
+    result = run("ingest", str(tmp_path / "page.md"))
+    assert "Ignored DOI" not in result.output
+    bib = (kb / ".crucible/references.bib").read_text()
+    assert DOI in bib and "Smith" in bib
 
 
 def test_web_page_without_a_title_takes_the_fetched_one(kb, tmp_path, doi_lookup):  # noqa: F811

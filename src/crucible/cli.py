@@ -20,6 +20,7 @@ from crucible.database import CrucibleDB
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
+from crucible.viz import _VIZ_TEMPLATE, _script_json, viz_html  # noqa: F401
 
 
 CRUCIBLE_DIR = ".crucible"
@@ -1759,23 +1760,31 @@ def source_info(source_path, json_output):
     Useful for resummarization: see what's already been captured before
     asking Claude to reread the source. SOURCE_PATH may be relative to the
     current directory, the project root or .crucible/, or absolute; failing
-    that, it is matched against source paths and titles. Exits 1 if no
-    source matches.
+    that, it may be a cite key, or a fragment of exactly one source's path
+    or title. Exits 1 if no source matches, or if a fragment matches
+    several (they are listed).
     """
     root = get_root()
     db = get_db(root)
 
+    # Exact path, then cite key, then a fragment that must match exactly
+    # one source (as for delete): never the first of several by row order.
     try:
         src = _lookup_project_path(root, source_path, db.get_source_by_path)
+        if not src:
+            src = _source_by_cite_key(db, source_path)
+        if not src:
+            found = [s for s in db.list_sources()
+                     if source_path in s["path"] or source_path in (s["title"] or "")]
+            if len(found) > 1:
+                lines = [f"  {s['path']} ({s['title']})" for s in found]
+                raise click.ClickException(
+                    f"'{source_path}' matches {len(found)} sources. Give the exact "
+                    "path or cite key of one:\n" + "\n".join(lines))
+            src = found[0] if found else None
     except click.ClickException:
         db.close()
         raise
-    if not src:
-        # Try matching by title or partial path
-        for s in db.list_sources():
-            if source_path in s["path"] or source_path in s["title"]:
-                src = s
-                break
     if not src:
         db.close()
         raise click.ClickException(f"Source not found: {source_path}")
@@ -1872,8 +1881,8 @@ def concepts(query_all, json_output):
 def concept(name, json_output):
     """Show articles covering a concept.
 
-    NAME is matched ignoring case and punctuation, so "activation energy"
-    finds the tag activation_energy.
+    NAME is matched ignoring case, spaces, underscores, dashes and
+    apostrophes, so "activation energy" finds the tag activation_energy.
     """
     root = get_root()
     db = get_db(root)
@@ -1976,97 +1985,6 @@ def graph(output):
         click.echo(dot)
 
 
-def _script_json(value) -> str:
-    """JSON for embedding in an HTML <script> element.
-
-    "</script>" in a title would end the script element, and "<!--" can
-    change how it is parsed, so <, > and & are written as \\u escapes (still
-    the same JSON string), as are U+2028/U+2029.
-    """
-    return (json.dumps(value)
-            .replace("<", "\\u003c").replace(">", "\\u003e")
-            .replace("&", "\\u0026")
-            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
-
-
-_VIZ_SLOT_RE = re.compile(r"/\*(GRAPH_DATA|ROOT_PATH|LINK_MODE)\*/")
-
-
-def viz_html(root: Path, db: CrucibleDB, link_mode: str = "vscode") -> tuple[str, int, int]:
-    """The knowledge-graph page; return (html, node count, edge count).
-
-    link_mode "vscode" makes a click on an article open it in VS Code;
-    "browse" (the page served by `crucible browse`) opens its browse page.
-    """
-    # Build graph data
-    nodes = []
-    node_ids = {}  # path -> index
-
-    # Article nodes
-    for a in db.list_articles():
-        idx = len(nodes)
-        node_ids[a["path"]] = idx
-        nodes.append({
-            "id": idx,
-            "label": a["title"],
-            "path": a["path"],
-            "type": a["article_type"],
-            "status": a.get("status", "draft"),
-            "group": a["article_type"],
-        })
-
-    # Concept nodes
-    for c in db.list_concepts():
-        idx = len(nodes)
-        node_ids[f"concept:{c['name']}"] = idx
-        nodes.append({
-            "id": idx,
-            "label": c["name"],
-            "type": "topic",
-            "group": "topic",
-        })
-
-    edges = []
-
-    # Article-to-article links
-    for link in db.all_article_links():
-        src = node_ids.get(link["from_path"])
-        tgt = node_ids.get(link["to_path"])
-        if src is not None and tgt is not None:
-            edges.append({"source": src, "target": tgt, "type": "link"})
-
-    # Article-to-concept links
-    by_concept = db.articles_by_concept()
-    for concept_name, articles in by_concept.items():
-        concept_key = f"concept:{concept_name}"
-        if concept_key not in node_ids:
-            continue
-        concept_idx = node_ids[concept_key]
-        for a in articles:
-            article_idx = node_ids.get(a["path"])
-            if article_idx is not None:
-                edges.append({"source": article_idx, "target": concept_idx,
-                              "type": "concept"})
-
-    # Derivation links
-    for a in db.list_articles():
-        for d in db.derivatives(a["path"]):
-            src = node_ids.get(a["path"])
-            tgt = node_ids.get(d["path"])
-            if src is not None and tgt is not None:
-                edges.append({"source": src, "target": tgt, "type": "derivation"})
-
-    # One pass over the template, so a title that reads "/*ROOT_PATH*/" is
-    # not itself replaced.
-    slots = {
-        "GRAPH_DATA": _script_json({"nodes": nodes, "edges": edges}),
-        "ROOT_PATH": _script_json(str(root.resolve())),
-        "LINK_MODE": _script_json(link_mode),
-    }
-    html = _VIZ_SLOT_RE.sub(lambda m: slots[m.group(1)], _VIZ_TEMPLATE)
-    return html, len(nodes), len(edges)
-
-
 def _write_viz(root: Path, db: CrucibleDB,
                output: Path | None = None) -> tuple[Path, int, int]:
     """Write the knowledge-graph HTML; return (path, node count, edge count)."""
@@ -2102,162 +2020,6 @@ def viz(output, open_browser):
         webbrowser.open(f"file://{output.resolve()}")
 
 
-_VIZ_TEMPLATE = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Crucible Knowledge Graph</title>
-<style>
-  body { margin: 0; background: #1a1a2e; font-family: system-ui, sans-serif; }
-  svg { width: 100vw; height: 100vh; }
-  .node text { font-size: 11px; pointer-events: none; }
-  .link { stroke-opacity: 0.4; }
-  .link.link-type-link { stroke: #888; }
-  .link.link-type-concept { stroke: #444; stroke-dasharray: 3,3; }
-  .link.link-type-derivation { stroke: #e94560; }
-  #tooltip {
-    position: absolute; padding: 8px 12px; background: #16213e;
-    color: #eee; border-radius: 6px; font-size: 13px;
-    pointer-events: none; display: none; max-width: 300px;
-    border: 1px solid #0f3460;
-  }
-  #legend {
-    position: absolute; top: 12px; left: 12px; background: #16213e;
-    color: #eee; padding: 12px; border-radius: 6px; font-size: 12px;
-    border: 1px solid #0f3460;
-  }
-  #legend div { margin: 4px 0; }
-  #legend span { display: inline-block; width: 12px; height: 12px;
-    border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-  #search {
-    position: absolute; top: 12px; right: 12px;
-    padding: 8px 12px; border-radius: 6px; border: 1px solid #0f3460;
-    background: #16213e; color: #eee; font-size: 14px; width: 220px;
-  }
-  #search::placeholder { color: #666; }
-</style>
-</head>
-<body>
-<div id="tooltip"></div>
-<div id="legend">
-  <strong>Crucible Knowledge Graph</strong>
-  <div><span style="background:#e94560"></span>Concept article</div>
-  <div><span style="background:#0f3460"></span>Summary</div>
-  <div><span style="background:#533483"></span>Comparison</div>
-  <div><span style="background:#1a8a5c"></span>Method</div>
-  <div><span style="background:#e9a045"></span>Topic tag</div>
-  <div style="margin-top:8px; color:#888">Drag to rearrange. Scroll to zoom.</div>
-</div>
-<input id="search" type="text" placeholder="Search nodes...">
-<svg></svg>
-<script src="https://d3js.org/d3.v7.min.js"></script>
-<script>
-const data = /*GRAPH_DATA*/;
-
-const rootPath = /*ROOT_PATH*/;
-const linkMode = /*LINK_MODE*/;
-
-// Article types, and "topic" for concept (tag) nodes; matches the legend.
-const colors = {
-  concept: "#e94560", summary: "#0f3460", comparison: "#533483",
-  method: "#1a8a5c", topic: "#e9a045"
-};
-function nodeColor(d) {
-  return colors[d.group] || "#888";
-}
-function nodeRadius(d) {
-  return d.path ? 10 : 6;
-}
-// Browse URL of a wiki article (path relative to .crucible/wiki/).
-function browseHref(path) {
-  const prefix = ".crucible/wiki/";
-  if (path.startsWith(prefix)) path = path.slice(prefix.length);
-  return "/" + path.split("/").map(encodeURIComponent).join("/");
-}
-
-const svg = d3.select("svg");
-const width = window.innerWidth, height = window.innerHeight;
-const g = svg.append("g");
-
-svg.call(d3.zoom().scaleExtent([0.1, 8]).on("zoom", (e) => {
-  g.attr("transform", e.transform);
-}));
-
-const sim = d3.forceSimulation(data.nodes)
-  .force("link", d3.forceLink(data.edges).id(d => d.id).distance(80))
-  .force("charge", d3.forceManyBody().strength(-200))
-  .force("center", d3.forceCenter(width / 2, height / 2))
-  .force("collision", d3.forceCollide().radius(20));
-
-const link = g.append("g").selectAll("line")
-  .data(data.edges).join("line")
-  .attr("class", d => "link link-type-" + d.type)
-  .attr("stroke-width", d => d.type === "derivation" ? 2 : 1);
-
-const node = g.append("g").selectAll("g")
-  .data(data.nodes).join("g")
-  .call(d3.drag()
-    .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-    .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
-    .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
-
-node.append("circle")
-  .attr("r", nodeRadius)
-  .attr("fill", nodeColor)
-  .attr("stroke", "#fff")
-  .attr("stroke-width", 1.5);
-
-node.append("text")
-  .text(d => d.label.length > 25 ? d.label.slice(0, 23) + "..." : d.label)
-  .attr("dx", 14).attr("dy", 4)
-  .attr("fill", "#ccc");
-
-const tooltip = d3.select("#tooltip");
-node.on("mouseover", (e, d) => {
-  // Built from text nodes: titles and paths are data, never markup.
-  tooltip.text("");
-  tooltip.append("strong").text(d.label);
-  const line = (s) => { tooltip.append("br"); tooltip.append("span").text(s); };
-  if (d.type) line("Type: " + d.type);
-  if (d.status) line("Status: " + d.status);
-  if (d.path) line(d.path);
-  tooltip.style("display", "block");
-}).on("mousemove", (e) => {
-  tooltip.style("left", (e.pageX + 12) + "px").style("top", (e.pageY - 12) + "px");
-}).on("mouseout", () => tooltip.style("display", "none"))
-.on("click", (e, d) => {
-  if (linkMode === "browse") {
-    window.location.href = d.path ? browseHref(d.path)
-      : "/_topics#" + encodeURIComponent(d.label);
-  } else if (d.path) {
-    window.location.href = "vscode://file/" + rootPath + "/" + d.path;
-  }
-});
-node.style("cursor", d => d.path || linkMode === "browse" ? "pointer" : "default");
-
-sim.on("tick", () => {
-  link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-      .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-  node.attr("transform", d => "translate(" + d.x + "," + d.y + ")");
-});
-
-d3.select("#search").on("input", function() {
-  const q = this.value.toLowerCase();
-  node.select("circle").attr("opacity", d =>
-    !q || d.label.toLowerCase().includes(q) ? 1 : 0.15);
-  node.select("text").attr("opacity", d =>
-    !q || d.label.toLowerCase().includes(q) ? 1 : 0.1);
-  link.attr("opacity", d => {
-    if (!q) return 1;
-    const sn = data.nodes[typeof d.source === "object" ? d.source.id : d.source];
-    const tn = data.nodes[typeof d.target === "object" ? d.target.id : d.target];
-    return (sn.label.toLowerCase().includes(q) || tn.label.toLowerCase().includes(q)) ? 1 : 0.05;
-  });
-});
-</script>
-</body>
-</html>
-"""
 
 
 @cli.command()
@@ -2693,64 +2455,140 @@ def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path
     """Add the incoming wiki files to plan, renaming any that collide.
 
     Articles (.org) and the other files beside them (figures, data) follow
-    the same rules: an incoming file whose destination, or one of the
-    renamed copies an earlier merge made of it, already holds the same
-    bytes is not copied again, so merging a crucible twice adds nothing;
-    any other collision gets a free name (``name_1.org``) and links to it
-    are rewritten.
+    the same rules. An incoming file is not copied again when its
+    destination, or one of the renamed copies an earlier merge made of it
+    (``name_1.org``...), already holds it: the same bytes, or for an
+    article the same text once its links are rewritten the way this merge
+    would rewrite them. A file found under another name is recorded in
+    ``plan.wiki_aliases``, so links to it from copied articles follow it.
+    Any other collision gets a free name and links to it are rewritten.
+
+    Whether an article matches depends on where the files it links to
+    land, which depends on which other articles match, so matching is
+    repeated until it settles: articles are first paired with a copy whose
+    text agrees apart from link targets, and a pair is dropped when its
+    rewritten text differs. Pairs are only ever dropped, so this ends.
     """
     if not source_wiki.exists():
         return
-    planned: set[Path] = set()
     target_cdir = target_wiki.parent
 
-    def free(path: Path) -> bool:
-        return not (path.exists() or path.is_symlink() or path in planned)
+    # The same walk sync uses: only the top-level index.org is generated.
+    try:
+        articles = _wiki_article_files(source_wiki)
+    except OSError as exc:
+        raise click.ClickException(f"Cannot read {source_wiki}: {exc}") from exc
+    incoming = [(p, True) for p in articles]
+    incoming += [(p, False) for p in _wiki_other_files(source_wiki)]
 
-    def already_there(src: Path, dest: Path, is_article: bool) -> bool:
-        """Whether dest, or a renamed copy of it, already has src's content."""
-        data = src.read_bytes()
-        stem, suffix = dest.stem, dest.suffix
-        candidate, counter = dest, 1
+    def existing_copies(dest: Path) -> list[Path]:
+        """dest and the renamed copies of it that exist, in order."""
+        found, candidate, counter = [], dest, 1
         while candidate.exists() or candidate.is_symlink():
             if candidate.is_file() and not candidate.is_symlink():
-                existing = candidate.read_bytes()
-                if existing == data:
-                    return True
-                if is_article and plan.path_renames:
-                    # An earlier merge may have rewritten its source links.
-                    text = data.decode("utf-8", errors="surrogateescape")
-                    rewritten = _rewrite_links_in_text(
-                        text, candidate, target_cdir, plan.path_renames)
-                    if rewritten.encode("utf-8", errors="surrogateescape") == existing:
-                        return True
-            candidate = dest.parent / f"{stem}_{counter}{suffix}"
+                found.append(candidate)
+            candidate = dest.parent / f"{dest.stem}_{counter}{dest.suffix}"
             counter += 1
-        return False
+        return found
 
-    # The same walk sync uses: only the top-level index.org is generated.
-    incoming = [(p, True) for p in _wiki_article_files(source_wiki)]
-    incoming += [(p, False) for p in _wiki_other_files(source_wiki)]
+    def decode(data: bytes) -> str:
+        return data.decode("utf-8", errors="surrogateescape")
+
+    data: dict[Path, bytes] = {}
+    dests: dict[Path, Path] = {}
+    matches: dict[Path, Path] = {}   # incoming file -> existing copy of it
+    used: set[Path] = set()
     for src_path, is_article in incoming:
-        rel_within_wiki = src_path.relative_to(source_wiki)
-        dest_path = target_wiki / rel_within_wiki
-        if dest_path.is_file() and already_there(src_path, dest_path, is_article):
-            plan.wiki_unchanged += 1
-            continue
-        if not free(dest_path):
-            stem, suffix = dest_path.stem, dest_path.suffix
+        dest = target_wiki / src_path.relative_to(source_wiki)
+        dests[src_path] = dest
+        try:
+            data[src_path] = src_path.read_bytes()
+        except OSError as exc:
+            raise click.ClickException(f"Cannot read {src_path}: {exc}") from exc
+        copies = [c for c in existing_copies(dest) if c not in used]
+        contents = {}
+        for copy in copies:
+            try:
+                contents[copy] = copy.read_bytes()
+            except OSError:
+                continue
+        exact = [c for c in contents if contents[c] == data[src_path]]
+        loose = []
+        if is_article and not exact:
+            masked = _mask_link_targets(decode(data[src_path]))
+            loose = [c for c in contents
+                     if _mask_link_targets(decode(contents[c])) == masked]
+        match = (exact or loose or [None])[0]
+        if match is not None:
+            matches[src_path] = match
+            used.add(match)
+
+    while True:
+        # Free names for the files that will be copied.
+        planned: set[Path] = set()
+        placed: dict[Path, Path] = {}
+        for src_path, _ in incoming:
+            if src_path in matches:
+                continue
+            dest = dests[src_path]
             counter = 1
-            while not free(dest_path):
-                dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
+            while dest.exists() or dest.is_symlink() or dest in planned:
+                base = dests[src_path]
+                dest = base.parent / f"{base.stem}_{counter}{base.suffix}"
                 counter += 1
-            plan.wiki_renames[str(rel_within_wiki)] = str(
-                dest_path.relative_to(target_wiki)
-            )
-        planned.add(dest_path)
+            planned.add(dest)
+            placed[src_path] = dest
+        renames = dict(plan.path_renames)
+        for src_path, final in list(matches.items()) + list(placed.items()):
+            if final != dests[src_path]:
+                renames[str(dests[src_path].relative_to(target_cdir))] = str(
+                    final.relative_to(target_cdir))
+        dropped = False
+        for src_path, is_article in incoming:
+            match = matches.get(src_path)
+            if match is None or not is_article:
+                continue
+            existing = match.read_bytes()
+            if existing == data[src_path]:
+                continue
+            rewritten = _rewrite_links_in_text(
+                decode(data[src_path]), match, target_cdir, renames)
+            if rewritten.encode("utf-8", errors="surrogateescape") != existing:
+                del matches[src_path]
+                dropped = True
+        if not dropped:
+            break
+
+    for src_path, is_article in incoming:
+        rel_within_wiki = str(src_path.relative_to(source_wiki))
+        if src_path in matches:
+            plan.wiki_unchanged += 1
+            if matches[src_path] != dests[src_path]:
+                plan.wiki_aliases[rel_within_wiki] = str(
+                    matches[src_path].relative_to(target_wiki))
+            continue
+        dest_path = placed[src_path]
+        if dest_path != dests[src_path]:
+            plan.wiki_renames[rel_within_wiki] = str(dest_path.relative_to(target_wiki))
         if is_article:
             plan.articles.append((src_path, dest_path))
         else:
             plan.wiki_files.append((src_path, dest_path))
+
+
+def _mask_link_targets(text: str) -> str:
+    """text with the path of every file link blanked out.
+
+    Two versions of an article that differ only in where their links point
+    compare equal, as a renamed copy made by an earlier merge does.
+    """
+    def repl(match: re.Match) -> str:
+        start = match.start(1) - match.start(0)
+        end = match.end(1) - match.start(0)
+        whole = match.group(0)
+        return whole[:start] + "\0" + whole[end:]
+
+    return FILE_LINK_RE.sub(repl, text)
 
 
 def _wiki_other_files(wiki_dir: Path) -> list[Path]:
@@ -2762,20 +2600,27 @@ def _wiki_other_files(wiki_dir: Path) -> list[Path]:
     """
     found: list[Path] = []
     seen: set[tuple[int, int]] = set()
+    wiki_resolved = wiki_dir.resolve()
 
     def walk(directory: Path, top: bool) -> None:
         try:
             st = directory.stat()
-        except OSError:
-            return
+            with os.scandir(directory) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as exc:
+            raise click.ClickException(f"Cannot read {directory}: {exc}") from exc
         if (st.st_dev, st.st_ino) in seen:
             return
         seen.add((st.st_dev, st.st_ino))
-        for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+        for entry in entries:
             name = entry.name
             if name.startswith((".", "#")) or name.endswith("~"):
                 continue
             path = Path(entry.path)
+            # A symlink may point anywhere (~/.ssh, sources/external/);
+            # only what lies inside the wiki is copied into the target.
+            if entry.is_symlink() and not path.resolve().is_relative_to(wiki_resolved):
+                continue
             if entry.is_dir():
                 if not (top and name == "_build"):
                     walk(path, False)
@@ -3003,6 +2848,9 @@ class _MergePlan:
     # Other incoming wiki files (figures, data), (source path, destination).
     wiki_files: list[tuple[Path, Path]] = dataclass_field(default_factory=list)
     wiki_unchanged: int = 0   # incoming wiki files the target already has
+    # Of those, the ones an earlier merge stored under another name
+    # (wiki-relative), so links from copied articles follow them.
+    wiki_aliases: dict[str, str] = dataclass_field(default_factory=dict)
     # Incoming sources (and sidecars) stored under another path in the
     # target, relative to .crucible/, so article links can follow them.
     path_renames: dict[str, str] = dataclass_field(default_factory=dict)
@@ -3471,7 +3319,7 @@ def _merge_renames(plan: "_MergePlan") -> dict[str, str]:
     under another name, and renamed wiki files.
     """
     renames = dict(plan.path_renames)
-    for old, new in plan.wiki_renames.items():
+    for old, new in {**plan.wiki_aliases, **plan.wiki_renames}.items():
         renames[str(Path("wiki") / old)] = str(Path("wiki") / new)
     return renames
 
@@ -4517,7 +4365,8 @@ Structured queries:
   shown), to the current directory, to .crucible/ (wiki/concepts/x.org),
   or to the wiki (concepts/x.org), or absolute. A path that names no
   article, or an unknown source, exits 1 with an error. Concept names
-  ignore case and punctuation ("activation energy" = activation_energy).
+  ignore case, spaces, underscores, dashes and apostrophes
+  ("activation energy" = activation_energy).
 
 Graph export:
   crucible graph                       DOT format to stdout

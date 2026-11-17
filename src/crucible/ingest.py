@@ -186,6 +186,15 @@ def extract_title(path: Path, text: str) -> str:
     return declared_title(path, text) or path.stem.replace("-", " ").replace("_", " ").title()
 
 
+def _title_key(title: str) -> str:
+    """A title reduced to its letters and digits, casefolded, for comparison.
+
+    BibTeX braces, LaTeX accents and punctuation differ between a fetched
+    entry and the title a file declares without making it another paper.
+    """
+    return "".join(ch for ch in title.casefold() if ch.isalnum())
+
+
 def declared_title(path: Path, text: str) -> str | None:
     """The title the file itself declares (#+TITLE, a # heading, <title>), or None."""
     suffix = path.suffix.lower()
@@ -1206,14 +1215,19 @@ def ingest_source(
             bib_entry = replace_cite_key(fetched, placeholder)
     known = _parse_bib_fields(bib_entry) if bib_entry else {}
 
-    # A title the file declares (an org #+TITLE, say) or the user gave wins
-    # over one fetched for a DOI guessed from the text: the guess may be a
-    # DOI the document cites rather than its own.
+    # A DOI guessed from the text may be one the document cites rather than
+    # its own. When the file declares a title (an org #+TITLE, say) or the
+    # user gave one, and the fetched entry's title is a different one, the
+    # guess named another paper: none of that entry (authors, year, DOI)
+    # describes this file, so it is dropped for a generated one.
     if bib_entry is not None and supplied_entry is None and not doi_given:
         declared = title or declared_title(source_path, text)
-        if declared and declared != known.get("title"):
-            bib_entry = set_bib_field(bib_entry, "title", declared)
-            known = _parse_bib_fields(bib_entry)
+        if declared and _title_key(declared) != _title_key(known.get("title", "")):
+            warnings.append(
+                f"Ignored DOI {doi} found in the text: it belongs to "
+                f"\"{known.get('title', '')}\", not \"{declared}\""
+            )
+            bib_entry, known, doi = None, {}, None
 
     # Title, authors and date for the key: what the user gave, else what
     # the entry says, else what the file says (title) or today (date).

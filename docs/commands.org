@@ -245,8 +245,8 @@ Modes:
 Keyword search matches article titles and text (not paths). Each word is
 matched literally, so FTS5 operators such as =AND=, =NOT= or quotes are
 plain text. A trailing =*= makes a word a prefix: =catal*= matches
-catalysis and catalyst. Prefixes are stemmed like other words, so the
-prefix one letter shorter is matched as well.
+catalysis and catalyst. A prefix matches only words that
+start with it: =cats*= finds cats but not catalysis.
 - *semantic*: vector similarity only
 - *hybrid*: FTS + semantic combined with Reciprocal Rank Fusion
 
@@ -317,8 +317,8 @@ Show articles covering a specific concept.
 crucible concept thermodynamics
 #+END_SRC
 
-Concepts come from =#+FILETAGS:=. The name is matched ignoring case and
-punctuation, so =crucible concept "activation energy"= finds the tag
+Concepts come from =#+FILETAGS:=. The name is matched ignoring case, spaces,
+underscores, dashes and apostrophes, so =crucible concept "activation energy"= finds the tag
 =activation_energy=.
 
 ** =crucible related=
