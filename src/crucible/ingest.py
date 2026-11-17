@@ -305,57 +305,77 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     return fields
 
 
-def add_bib_file_field(entry: str, rel_path: str) -> str:
-    """Return a BibTeX entry with a ``file`` field naming ``rel_path``.
+# Name of the BibTeX field recording a source type the file path alone would
+# not reproduce (see _source_type_hint). BibTeX and biblatex ignore it.
+BIB_TYPE_FIELD = "crucible_type"
+SOURCE_TYPES = ("pdf", "web", "notebook", "data", "other")
 
-    The ``file`` field (the org-ref/BibTeX convention for a local copy) is
-    what lets `crucible sync` map a cite key back to its source file when
-    the database is rebuilt. An entry that already has one is returned
-    unchanged. The entry is closed with ``\\n}`` so parse_bib_file can read
-    it even when it arrived on a single line (as doi.org entries do).
 
-    The path is written verbatim: unlike titles, it must not have its
-    whitespace collapsed. A path containing braces or a line break cannot
-    be written safely, so the entry is returned unchanged.
+def add_bib_fields(entry: str, fields: dict[str, str]) -> str:
+    """Return a BibTeX entry with ``fields`` added where it lacks them.
+
+    Fields the entry already has are left as they are. Values are written
+    verbatim (a file path must not have its whitespace collapsed); a value
+    containing braces or a line break cannot be written safely and is
+    skipped. When anything is added, the entry is closed with ``\\n}`` so
+    parse_bib_file can read it even if it arrived on a single line (as
+    doi.org entries do).
     """
-    if re.search(r"[{}\r\n]", rel_path):
-        return entry
     text = entry.rstrip()
     if not text.endswith("}"):
         return entry
     head = text[:-1].rstrip()
     _, sep, body = head.partition(",")
-    if not sep or "file" in _parse_bib_fields(body):
+    if not sep:
+        return entry
+    present = _parse_bib_fields(body)
+    new = [
+        (name, value) for name, value in fields.items()
+        if name not in present and value and not re.search(r"[{}\r\n]", value)
+    ]
+    if not new:
         return entry
     if not head.endswith(","):
         head += ","
-    return f"{head}\n  file = {{{rel_path}}},\n}}"
+    added = "".join(f"\n  {name} = {{{value}}}," for name, value in new)
+    return f"{head}{added}\n}}"
 
 
-def record_bib_file_fields(root: Path, paths: dict[str, str]) -> list[str]:
-    """Add ``file`` fields to references.bib entries that lack one.
+def add_bib_file_field(entry: str, rel_path: str) -> str:
+    """Return a BibTeX entry with a ``file`` field naming ``rel_path``.
 
-    ``paths`` maps cite keys to project-relative source paths. Entries that
-    already have a ``file`` field are left alone. Returns the cite keys
-    that were updated.
+    The ``file`` field (the org-ref/BibTeX convention for a local copy) is
+    what lets `crucible sync` map a cite key back to its source file when
+    the database is rebuilt. See add_bib_fields.
+    """
+    return add_bib_fields(entry, {"file": rel_path})
+
+
+def record_bib_fields(root: Path, fields_by_key: dict[str, dict[str, str]]) -> list[str]:
+    """Add fields to references.bib entries that lack them.
+
+    ``fields_by_key`` maps cite keys to the fields to add. Fields an entry
+    already has are left alone. Returns the cite keys whose entries changed.
     """
     bib_path = root / CRUCIBLE_DIR / "references.bib"
     lock_path = bib_path.with_suffix(".bib.lock")
-    if not paths or not bib_path.exists():
+    if not fields_by_key or not bib_path.exists():
         return []
 
     updated: list[str] = []
 
-    def add_field(m: re.Match) -> str:
+    def add_fields(m: re.Match) -> str:
         key = m.group(2)
-        if key not in paths or "file" in _parse_bib_fields(m.group(3)):
+        if key not in fields_by_key:
             return m.group(0)
-        updated.append(key)
-        return add_bib_file_field(m.group(0), paths[key])
+        new = add_bib_fields(m.group(0), fields_by_key[key])
+        if new != m.group(0):
+            updated.append(key)
+        return new
 
     with FileLock(lock_path, timeout=10):
         text = bib_path.read_text(encoding="utf-8")
-        new_text = _BIB_ENTRY_RE.sub(add_field, text)
+        new_text = _BIB_ENTRY_RE.sub(add_fields, text)
         if updated:
             atomic_write_text(bib_path, new_text)
     return updated
@@ -403,32 +423,25 @@ def _authors_from_bib(author_field: str) -> list[str]:
     return [a.strip() for a in re.split(r"\s+and\s+", author_field) if a.strip()]
 
 
-def _committed_source_type(rel_path: str, path: Path) -> str | None:
-    """The source type implied by a committed source directory, if any.
-
-    Ingest stores notebooks in sources/notebooks/ and every other shareable
-    source in sources/data/ (see destination_dir), so the directory says
-    more than the extension does: a Markdown notebook or data file is not a
-    web page. Shareable PDFs also land in data/ and keep their type.
-    Returns None outside those directories.
-    """
+def _in_sources_dir(rel_path: str | None, name: str) -> bool:
+    """Whether a project-relative path lies in .crucible/sources/<name>/."""
+    if not rel_path:
+        return False
     parts = Path(rel_path).parts
-    if parts[:2] != (CRUCIBLE_DIR, "sources") or len(parts) < 4:
-        return None
-    if parts[2] == "notebooks":
-        return "notebook"
-    if parts[2] == "data":
-        return "pdf" if detect_source_type(path) == "pdf" else "data"
-    return None
+    return len(parts) >= 4 and parts[:3] == (CRUCIBLE_DIR, "sources", name)
 
 
 def _source_type_for_entry(entry_type: str, path: Path | None,
                            rel_path: str | None = None) -> str:
-    """Best-effort source_type for a bibtex entry."""
-    if path is not None and rel_path is not None:
-        committed = _committed_source_type(rel_path, path)
-        if committed:
-            return committed
+    """The source type ingest would give a file by default.
+
+    Notebooks are the only type with a directory of their own; every other
+    shareable type shares sources/data/, so elsewhere the extension decides
+    (as it does at ingest), then the BibTeX entry type. A type that differs
+    from this is recorded in the entry's crucible_type field.
+    """
+    if _in_sources_dir(rel_path, "notebooks"):
+        return "notebook"
     if path is not None:
         t = detect_source_type(path)
         if t != "other":
@@ -440,6 +453,24 @@ def _source_type_for_entry(entry_type: str, path: Path | None,
         "phdthesis": "pdf",
         "mastersthesis": "pdf",
     }.get(entry_type, "other")
+
+
+def _source_type_hint(source_type: str, entry_type: str, rel_path: str,
+                      path: Path) -> dict[str, str]:
+    """The bib fields needed for a rebuild to reproduce ``source_type``."""
+    if source_type not in SOURCE_TYPES:
+        return {}
+    if source_type == _source_type_for_entry(entry_type, path, rel_path):
+        return {}
+    return {BIB_TYPE_FIELD: source_type}
+
+
+def _bib_entry_source_type(entry: dict, path: Path, rel_path: str) -> str:
+    """A bib entry's source type: its crucible_type field, else the default."""
+    recorded = entry.get(BIB_TYPE_FIELD)
+    if recorded in SOURCE_TYPES:
+        return recorded
+    return _source_type_for_entry(entry["entry_type"], path, rel_path)
 
 
 def upsert_sources_from_disk(root: Path, db) -> int:
@@ -494,10 +525,13 @@ def upsert_sources_from_disk(root: Path, db) -> int:
                 except Exception:
                     pass
 
-            source_type = _committed_source_type(rel_path, path)
-            if source_type is None:
-                detected = detect_source_type(path)
-                source_type = detected if detected != "other" else default_type
+            # These files have no bibliography entry to say what they are,
+            # so the directory decides: data/ holds data (a PDF stays a PDF).
+            detected = detect_source_type(path)
+            if default_type == "notebook":
+                source_type = "notebook"
+            else:
+                source_type = "pdf" if detected == "pdf" else "data"
 
             metadata = {"cite_key": cite_key}
 
@@ -587,18 +621,27 @@ def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> in
     def is_synthetic(src: dict, key: str) -> bool:
         return src["path"] == f"{CRUCIBLE_DIR}/bib/{key}"
 
-    # Record known paths in references.bib so a rebuild can recover them.
-    backfill = {
-        entry["cite_key"]: rows_by_key[entry["cite_key"]]["path"]
-        for entry in entries
-        if not entry.get("file")
-        and entry["cite_key"] in rows_by_key
-        and not is_synthetic(rows_by_key[entry["cite_key"]], entry["cite_key"])
-    }
-    recorded = record_bib_file_fields(root, backfill)
+    # Record known paths (and types the path would not reproduce) in
+    # references.bib so a rebuild can recover them.
+    backfill: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        src = rows_by_key.get(entry["cite_key"])
+        if src is None or is_synthetic(src, entry["cite_key"]):
+            continue
+        fields: dict[str, str] = {}
+        if not entry.get("file"):
+            fields["file"] = src["path"]
+        if BIB_TYPE_FIELD not in entry:
+            fields.update(_source_type_hint(
+                src["source_type"], entry["entry_type"], src["path"], root / src["path"]
+            ))
+        if fields:
+            backfill[entry["cite_key"]] = fields
+    recorded = record_bib_fields(root, backfill)
     for key in recorded:
         entry = next(e for e in entries if e["cite_key"] == key)
-        entry["file"] = backfill[key]
+        for name, value in backfill[key].items():
+            entry.setdefault(name, value)
 
     inserted = 0
     unmapped: list[str] = []
@@ -622,7 +665,7 @@ def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> in
             db.update_source_location(
                 existing["id"],
                 rel_path,
-                _source_type_for_entry(entry["entry_type"], abs_path, rel_path),
+                _bib_entry_source_type(entry, abs_path, rel_path),
                 not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/"),
             )
             existing_paths.add(rel_path)
@@ -637,7 +680,7 @@ def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> in
         if rel_path in existing_paths:
             continue
 
-        source_type = _source_type_for_entry(entry["entry_type"], abs_path, rel_path)
+        source_type = _bib_entry_source_type(entry, abs_path, rel_path)
         shareable = not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/")
         authors = _authors_from_bib(entry.get("author", ""))
         date = entry.get("year") or None
@@ -672,8 +715,8 @@ def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> in
 
     if recorded:
         note(
-            f"Recorded source file paths for {len(recorded)} bibliography "
-            f"entries in references.bib: {_summarize_keys(recorded)}"
+            f"Recorded source file paths or types for {len(recorded)} "
+            f"bibliography entries in references.bib: {_summarize_keys(recorded)}"
         )
     if relocated:
         note(
@@ -969,7 +1012,11 @@ def ingest_source(
         )
     # The file field maps the cite key back to this file when the database
     # is rebuilt (e.g. on a fresh clone).
-    bib_entry = add_bib_file_field(bib_entry, rel_path)
+    entry_type = (re.match(r"\s*@(\w+)", bib_entry) or [None, ""])[1].lower()
+    bib_entry = add_bib_fields(bib_entry, {
+        "file": rel_path,
+        **_source_type_hint(source_type, entry_type, rel_path, dest_path),
+    })
     append_bib_entry(root, bib_entry, cite_key)
 
     # Register in database (store cite_key and content hash in metadata)

@@ -317,8 +317,10 @@ def test_sync_records_known_paths_in_the_bibliography(project):
 
     result = CliRunner().invoke(cli, ["sync"])
     assert result.exit_code == 0, result.output
-    assert "Recorded source file paths for 1 bibliography entries" in result.stdout
+    assert "Recorded source file paths or types for 1 bibliography entries" in result.stdout
     assert "file = {.crucible/sources/data/evidence.md}" in bib.read_text()
+    # A .md file defaults to web, so the data type is recorded too.
+    assert "crucible_type = {data}" in bib.read_text()
     assert "@misc{other2025,\n  title = {Other},\n}" in bib.read_text()
 
     (cdir / "crucible.db").unlink()

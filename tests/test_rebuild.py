@@ -23,6 +23,16 @@ SOURCES = [
       "--date", "2025-01-01"]),
     ("paper.pdf", "%PDF-1.4 synthetic\n",
      ["--type", "pdf", "--title", "A Paper", "--author", "Poe", "--date", "2024-01-01"]),
+    # Shareable non-notebook sources all share sources/data/, so the
+    # directory alone cannot say what these are.
+    ("page.html", "<html><title>A Page</title></html>\n",
+     ["--shareable", "--type", "web", "--title", "A Page", "--author", "Hoe",
+      "--date", "2023-01-01"]),
+    ("note.md", "# A Note\n\nText.\n",
+     ["--shareable", "--title", "A Note", "--author", "Moe", "--date", "2022-01-01"]),
+    ("readings.md", "# Readings\n\n1, 2\n",
+     ["--shareable", "--type", "data", "--title", "Readings", "--author", "Loe",
+      "--date", "2021-01-01"]),
 ]
 
 CONCEPT = """#+TITLE: Widgets

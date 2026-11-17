@@ -2154,8 +2154,9 @@ def _plan_source_merge(
                 problems.append(
                     f"Cannot safely merge source with citation key '{cite_key}': "
                     "the target bibliography already has an entry with this key "
-                    "but no matching indexed source. Run `crucible sync` in the "
-                    "target or rename one of the keys."
+                    "but no matching indexed source. Add a `file` field naming "
+                    "the source's file to the target's entry and run "
+                    "`crucible sync` in the target, or rename one of the keys."
                 )
             continue
 

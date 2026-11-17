@@ -101,13 +101,34 @@ Parses: =#+TITLE=, =#+FILETAGS=, =:ARTICLE_TYPE:=, =:SOURCE_KEYS:=,
 =:DERIVED_FROM:=, =[[file:...]]= links, and full text for FTS.
 
 Sources are also registered from =references.bib=. An entry becomes a
-source only when its =file= field names the source file; =crucible ingest=
-writes that field, and sync adds it to older entries whose cite key the
-database already maps to a file, so a rebuilt database can recover every
-source. Entries with no =file= field are reported and not registered. A
-source left at a synthetic =.crucible/bib/<key>= path by an older version
-moves to the entry's =file= path, keeping its article links, once the entry
-has one.
+source only when its =file= field names the source file. =crucible ingest=
+writes that field, so a rebuilt database (a fresh clone, or a deleted
+=crucible.db=) recovers every ingested source and its article links.
+
+The source type comes from the file: =sources/notebooks/= holds notebooks,
+and elsewhere the extension decides, as at ingest (=.md= and =.html= are
+=web=, =.csv= is =data=, and so on). When a source's type differs from that,
+for example a Markdown file ingested with =--type data=, ingest also writes a
+=crucible_type= field (=pdf=, =web=, =notebook=, =data= or =other=) to record
+it. BibTeX and biblatex ignore the field.
+
+*Sync writes to =references.bib=.* For an entry whose cite key the database
+already maps to a source file, sync adds the missing =file= field, plus
+=crucible_type= when needed, and lists the entries it changed. This upgrades
+bibliographies written by older versions so they can be rebuilt. The edit
+takes the bibliography lock and is written atomically. Fields already in an
+entry are never changed.
+
+An entry with no =file= field and no source in the database (a reference
+added by hand, or with org-ref) is not a source: sync lists such entries in
+one warning, and articles citing them in =:SOURCE_KEYS:= are not linked to a
+source. To register one, add a =file= field naming its file (relative to the
+project root) and sync again. The warning is informational; bibliography-only
+references need no action.
+
+A source left at a synthetic =.crucible/bib/<key>= path by an older version
+is listed in a warning until its entry gets a =file= field; sync then moves
+the source to that path and keeps its article links.
 
 Idempotent and safe to run repeatedly.
 
