@@ -3048,7 +3048,7 @@ def lint(json_output):
                 "type": "missing_property",
                 "severity": "info",
                 "message": (
-                    f"Missing CREATED property: {article['path']} "
+                    f"Missing CREATED and MODIFIED properties: {article['path']} "
                     "(its dates are sync time, which a rebuild cannot reproduce)"
                 ),
                 "path": article['path'],

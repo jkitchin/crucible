@@ -369,8 +369,8 @@ crucible index         # regenerate .crucible/wiki/index.org
   (`malformed_bib_entry`), committed sources whose file is gone
   (`missing_source_file`), and citations missing from `references.bib`
 - **info**: orphan articles, concepts without dedicated articles, articles
-  without `:CREATED:` (their dates are sync time, which a rebuild cannot
-  reproduce)
+  with neither `:CREATED:` nor `:MODIFIED:` (their dates are sync time,
+  which a rebuild cannot reproduce)
 
 Fix a duplicate key by giving each entry or file its own key and updating
 the `SOURCE_KEYS` and citations that meant the other one.
