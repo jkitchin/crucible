@@ -243,6 +243,25 @@ def test_source_cite_key_accepts_only_nonempty_strings():
     assert _source_metadata({"metadata": "[]"}) == {}
 
 
+def test_committed_sources_take_their_type_from_their_directory(project):
+    cdir = project / ".crucible"
+    (cdir / "sources/data/readings.md").write_text("Data notes.\n")
+    (cdir / "sources/data/paper.pdf").write_text("%PDF-1.4\n")
+    (cdir / "sources/notebooks/day1.md").write_text("Lab notes.\n")
+    result = CliRunner().invoke(cli, ["sync"])
+    assert result.exit_code == 0, result.output
+    db = CrucibleDB(cdir / "crucible.db")
+    try:
+        types = {row["path"].split("/", 2)[-1]: row["source_type"] for row in db.list_sources()}
+    finally:
+        db.close()
+    assert types == {
+        "data/readings.md": "data",
+        "data/paper.pdf": "pdf",
+        "notebooks/day1.md": "notebook",
+    }
+
+
 def _bib_key_for(bib_text, title):
     from crucible.ingest import _BIB_ENTRY_RE
 

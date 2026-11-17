@@ -69,8 +69,8 @@ QUERIES = {
                shareable, json_extract(metadata, '$.cite_key') AS cite_key
         FROM sources
     """,
-    # By path: after #6's rebuild the phantom rows carry the right cite keys,
-    # but point at files that do not exist.
+    # By path, so a source row at a nonexistent path (as #6's synthetic
+    # .crucible/bib/<key> rows were) does not count as the same source.
     "provenance": """
         SELECT a.path AS article, s.path AS source FROM article_sources x
         JOIN articles a ON a.id = x.article_id JOIN sources s ON s.id = x.source_id
@@ -141,12 +141,6 @@ def test_rebuild_reproduces_wiki_tables(rebuilt, table):
     assert after[table] == before[table]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#6: rebuild duplicates sources, links articles to phantom "
-    ".crucible/bib/ paths, and loses titles, types and the shareable flag",
-)
 @pytest.mark.parametrize("table", ["sources", "provenance"])
 def test_rebuild_reproduces_sources_and_provenance(rebuilt, table):
     before, after = rebuilt

@@ -382,8 +382,32 @@ def _authors_from_bib(author_field: str) -> list[str]:
     return [a.strip() for a in re.split(r"\s+and\s+", author_field) if a.strip()]
 
 
-def _source_type_for_entry(entry_type: str, path: Path | None) -> str:
+def _committed_source_type(rel_path: str, path: Path) -> str | None:
+    """The source type implied by a committed source directory, if any.
+
+    Ingest stores notebooks in sources/notebooks/ and every other shareable
+    source in sources/data/ (see destination_dir), so the directory says
+    more than the extension does: a Markdown notebook or data file is not a
+    web page. Shareable PDFs also land in data/ and keep their type.
+    Returns None outside those directories.
+    """
+    parts = Path(rel_path).parts
+    if parts[:2] != (CRUCIBLE_DIR, "sources") or len(parts) < 4:
+        return None
+    if parts[2] == "notebooks":
+        return "notebook"
+    if parts[2] == "data":
+        return "pdf" if detect_source_type(path) == "pdf" else "data"
+    return None
+
+
+def _source_type_for_entry(entry_type: str, path: Path | None,
+                           rel_path: str | None = None) -> str:
     """Best-effort source_type for a bibtex entry."""
+    if path is not None and rel_path is not None:
+        committed = _committed_source_type(rel_path, path)
+        if committed:
+            return committed
     if path is not None:
         t = detect_source_type(path)
         if t != "other":
@@ -449,8 +473,10 @@ def upsert_sources_from_disk(root: Path, db) -> int:
                 except Exception:
                     pass
 
-            detected = detect_source_type(path)
-            source_type = detected if detected != "other" else default_type
+            source_type = _committed_source_type(rel_path, path)
+            if source_type is None:
+                detected = detect_source_type(path)
+                source_type = detected if detected != "other" else default_type
 
             metadata = {"cite_key": cite_key}
 
@@ -575,7 +601,7 @@ def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> in
             db.update_source_location(
                 existing["id"],
                 rel_path,
-                _source_type_for_entry(entry["entry_type"], abs_path),
+                _source_type_for_entry(entry["entry_type"], abs_path, rel_path),
                 not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/"),
             )
             existing_paths.add(rel_path)
@@ -589,7 +615,7 @@ def upsert_sources_from_bib(root: Path, db, on_warning=None, on_note=None) -> in
         if rel_path in existing_paths:
             continue
 
-        source_type = _source_type_for_entry(entry["entry_type"], abs_path)
+        source_type = _source_type_for_entry(entry["entry_type"], abs_path, rel_path)
         shareable = not rel_path.startswith(f"{CRUCIBLE_DIR}/sources/external/")
         authors = _authors_from_bib(entry.get("author", ""))
         date = entry.get("year") or None
