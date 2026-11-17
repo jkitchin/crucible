@@ -1743,7 +1743,12 @@ def browse(port, no_open):
     viz_path = wiki_dir / "viz.html"
     if not viz_path.exists():
         click.echo("Generating knowledge graph...")
-        subprocess.run(["crucible", "viz"], cwd=str(root), capture_output=True)
+        # In-process: a `crucible` subprocess depends on PATH and its
+        # failure went unnoticed.
+        try:
+            click.get_current_context().invoke(viz, output=None, open_browser=False)
+        except Exception as e:
+            click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
 
     articles = db.list_articles()
     db_path = cdir(root) / "crucible.db"
@@ -1770,9 +1775,15 @@ def browse(port, no_open):
     except (OSError, subprocess.TimeoutExpired):
         pass
 
-    server = start_server(wiki_dir, db_path, articles, port=port,
-                          project_name=project_name,
-                          github_url=github_url)
+    try:
+        server = start_server(wiki_dir, db_path, articles, port=port,
+                              project_name=project_name,
+                              github_url=github_url)
+    except OSError as e:
+        raise click.ClickException(
+            f"Cannot serve on port {port}: {e.strerror or e}. "
+            "Is another server using it? Pick another with --port."
+        )
     url = f"http://localhost:{port}"
     click.echo(f"Serving {project_name} wiki at {url}  (Ctrl+C to stop)")
 

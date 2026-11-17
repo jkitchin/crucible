@@ -73,8 +73,10 @@ def format_citation(entry: dict[str, str]) -> str:
 _TITLE_RE = re.compile(r"^#\+TITLE:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _FILETAGS_RE = re.compile(r"^#\+FILETAGS:[ \t]*(.+)$", re.MULTILINE | re.IGNORECASE)
 _KEYWORD_RE = re.compile(r"^#\+\w+:.*$", re.MULTILINE)
+# Any drawer (:PROPERTIES:, :LOGBOOK:, ...) up to its :END: line.
 _DRAWER_RE = re.compile(
-    r"^\s*:PROPERTIES:\s*\n(.*?)\n\s*:END:\s*$", re.MULTILINE | re.DOTALL | re.IGNORECASE
+    r"^[ \t]*:(?!END:)([A-Za-z][\w-]*):[ \t]*\n(.*?)^[ \t]*:END:[ \t]*$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _PROP_LINE_RE = re.compile(r"^\s*:([A-Za-z_]+):\s+(.+?)\s*$", re.MULTILINE)
 # Org block names are case-insensitive and blocks may be indented. The
@@ -93,7 +95,7 @@ _QUOTE_BLOCK_RE = re.compile(
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _HEADING_RE = re.compile(r"^(\*{1,4})\s+(.+)$", re.MULTILINE)
-_TABLE_BLOCK_RE = re.compile(r"((?:^\|.*$\n?)+)", re.MULTILINE)
+_TABLE_BLOCK_RE = re.compile(r"((?:^[ \t]*\|.*$\n?)+)", re.MULTILINE)
 
 # Inline patterns
 _FILE_LINK_RE = re.compile(
@@ -137,8 +139,7 @@ def _rewrite_file_link(match: re.Match, current_path: str) -> str:
                 parts.pop()
         elif part and part != ".":
             parts.append(part)
-    url = "/" + "/".join(parts)
-    return f'<a href="{html.escape(url)}">{display}</a>'
+    return f'<a href="{_href("/".join(parts))}">{display}</a>'
 
 
 def _external_link(url: str, display: str | None = None) -> str:
@@ -275,6 +276,94 @@ def _convert_table(table_text: str) -> str:
     return "\n".join(out)
 
 
+_LIST_ITEM_RE = re.compile(r"^([ \t]*)([-+]|\d+[.)])(?:[ \t]+(.*))?$")
+_CHECKBOX_RE = re.compile(r"^\[([ xX-])\][ \t]+")
+
+
+def _list_item_html(text: str, current_path: str,
+                    bib: dict[str, dict[str, str]] | None) -> str:
+    """Inline HTML of one list item, with checkboxes and `term :: desc`."""
+    box = ""
+    m = _CHECKBOX_RE.match(text)
+    if m:
+        box = "&#9745; " if m.group(1) in "xX" else "&#9744; "
+        text = text[m.end():]
+    if " :: " in text:
+        term, desc = text.split(" :: ", 1)
+        return (f"{box}<strong>{_process_inline(term, current_path, bib)}</strong>: "
+                f"{_process_inline(desc, current_path, bib)}")
+    return box + _process_inline(text, current_path, bib)
+
+
+def _list_html(items: list[list], current_path: str,
+               bib: dict[str, dict[str, str]] | None) -> str:
+    """Nested <ul>/<ol> from [indent, ordered, text] items."""
+    out = []
+    stack: list[tuple[int, str]] = []  # (indent, tag) of the open lists
+    for indent, ordered, text in items:
+        tag = "ol" if ordered else "ul"
+        while stack and indent < stack[-1][0]:
+            out.append(f"</li></{stack.pop()[1]}>")
+        if stack and indent == stack[-1][0]:
+            out.append("</li>")
+        else:
+            out.append(f"<{tag}>")
+            stack.append((indent, tag))
+        out.append("<li>" + _list_item_html(text, current_path, bib))
+    while stack:
+        out.append(f"</li></{stack.pop()[1]}>")
+    return "".join(out)
+
+
+def _render_chunk(chunk: str, placeholders: dict[str, str], current_path: str,
+                  bib: dict[str, dict[str, str]] | None) -> list[str]:
+    """HTML parts of a blank-line separated chunk: paragraphs, plain lists
+    and block placeholders (which always stand on lines of their own)."""
+    lines = chunk.split("\n")
+    parts: list[str] = []
+    para: list[str] = []
+
+    def flush():
+        text = "\n".join(para).strip()
+        if text:
+            parts.append(f"<p>{_process_inline(text, current_path, bib)}</p>")
+        para.clear()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() in placeholders:
+            flush()
+            parts.append(line.strip())
+            i += 1
+            continue
+        m = _LIST_ITEM_RE.match(line)
+        if not m:
+            para.append(line)
+            i += 1
+            continue
+        flush()
+        base = len(m.group(1).expandtabs())
+        items: list[list] = []
+        while i < len(lines):
+            line = lines[i]
+            if line.strip() in placeholders:
+                break
+            indent = len(line) - len(line.lstrip(" \t"))
+            m = _LIST_ITEM_RE.match(line)
+            if m and len(m.group(1).expandtabs()) >= base:
+                items.append([len(m.group(1).expandtabs()), m.group(2)[0].isdigit(),
+                              m.group(3) or ""])
+            elif items and indent > base and line.strip():
+                items[-1][2] += " " + line.strip()  # continuation line
+            else:
+                break
+            i += 1
+        parts.append(_list_html(items, current_path, bib))
+    flush()
+    return parts
+
+
 def org_to_html(text: str, current_path: str = "",
                 bib: dict[str, dict[str, str]] | None = None) -> tuple[str, str, list[str]]:
     """Convert org-mode text to an HTML fragment.
@@ -287,20 +376,6 @@ def org_to_html(text: str, current_path: str = "",
     title = ""
     filetags = []
 
-    # Extract title
-    m = _TITLE_RE.search(text)
-    if m:
-        title = m.group(1).strip()
-
-    # Extract filetags
-    m = _FILETAGS_RE.search(text)
-    if m:
-        raw = m.group(1).strip()
-        filetags = [t for t in raw.strip(":").split(":") if t]
-
-    # Remove keyword lines (#+TITLE, #+FILETAGS, #+SOURCE, etc.)
-    text = _KEYWORD_RE.sub("", text)
-
     # Replace blocks with placeholders to protect them from inline processing
     placeholders = {}
     counter = [0]
@@ -311,7 +386,8 @@ def org_to_html(text: str, current_path: str = "",
         placeholders[key] = content
         return key
 
-    # Source blocks
+    # Blocks come out first, so #+ lines inside them (a src block of org
+    # code) are neither read as the title nor removed as keywords.
     def _src_repl(m: re.Match) -> str:
         lang = html.escape(m.group(1).strip()) if m.group(1).strip() else ""
         code = html.escape(m.group(2))
@@ -333,25 +409,48 @@ def org_to_html(text: str, current_path: str = "",
         text,
     )
 
-    # Property drawers
+    # Extract title
+    m = _TITLE_RE.search(text)
+    if m:
+        title = m.group(1).strip()
+
+    # Extract filetags
+    m = _FILETAGS_RE.search(text)
+    if m:
+        raw = m.group(1).strip()
+        filetags = [t for t in raw.strip(":").split(":") if t]
+
+    # Remove keyword lines (#+TITLE, #+FILETAGS, #+SOURCE, etc.)
+    text = _KEYWORD_RE.sub("", text)
+
+    # Drawers: PROPERTIES as a table, others (LOGBOOK, ...) collapsed.
     def _drawer_repl(m: re.Match) -> str:
-        props = _PROP_LINE_RE.findall(m.group(1))
-        if not props:
+        name = m.group(1)
+        body = m.group(2)
+        if name.upper() == "PROPERTIES":
+            props = _PROP_LINE_RE.findall(body)
+            if not props:
+                return ""
+            rows = "".join(
+                f"<tr><td>{html.escape(k)}</td><td>{html.escape(v)}</td></tr>"
+                for k, v in props
+            )
+            return _placeholder(
+                '<details class="properties"><summary>Properties</summary>'
+                f"<table>{rows}</table></details>"
+            )
+        if not body.strip():
             return ""
-        rows = "".join(
-            f"<tr><td>{html.escape(k)}</td><td>{html.escape(v)}</td></tr>"
-            for k, v in props
-        )
         return _placeholder(
-            '<details class="properties"><summary>Properties</summary>'
-            f"<table>{rows}</table></details>"
+            f'<details class="properties"><summary>{html.escape(name.title())}</summary>'
+            f"<pre>{html.escape(body.rstrip())}</pre></details>"
         )
 
     text = _DRAWER_RE.sub(_drawer_repl, text)
 
-    # Tables
+    # Tables (org allows them to be indented)
     text = _TABLE_BLOCK_RE.sub(
-        lambda m: _placeholder(_convert_table(m.group(1))), text
+        lambda m: _placeholder(_convert_table(m.group(1))) + "\n", text
     )
 
     # Headings
@@ -363,24 +462,10 @@ def org_to_html(text: str, current_path: str = "",
 
     text = _HEADING_RE.sub(_heading_repl, text)
 
-    # Process remaining text as paragraphs with inline markup
-    paragraphs = re.split(r"\n\s*\n", text)
+    # Remaining text: paragraphs and plain lists with inline markup
     parts = []
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        # Check if it's just a placeholder
-        if para in placeholders:
-            parts.append(para)
-            continue
-        # It might contain mixed placeholders and text
-        processed = _process_inline(para, current_path, bib)
-        # Don't wrap placeholders in <p>
-        if "\x00BLOCK" in processed:
-            parts.append(processed)
-        else:
-            parts.append(f"<p>{processed}</p>")
+    for chunk in re.split(r"\n\s*\n", text):
+        parts.extend(_render_chunk(chunk, placeholders, current_path, bib))
 
     content = "\n".join(parts)
 
@@ -672,6 +757,20 @@ def _url_path(db_path: str) -> str:
     return db_path
 
 
+def _href(url_path: str) -> str:
+    """An href attribute value for a wiki-relative path.
+
+    Percent-encodes characters such as # and ? that would otherwise end the
+    path, then HTML-escapes the result for the attribute.
+    """
+    return html.escape("/" + urllib.parse.quote(url_path.lstrip("/")))
+
+
+def _safe_url(url: str) -> bool:
+    """Whether url is an http(s) URL that may be used as a link."""
+    return urllib.parse.urlparse(url.strip()).scheme.lower() in ("http", "https")
+
+
 def _build_nav_html(articles: list[dict]) -> str:
     """Build the sidebar navigation HTML from article list."""
     groups: dict[str, list[dict]] = {}
@@ -707,7 +806,7 @@ def _build_nav_html(articles: list[dict]) -> str:
         for a in items:
             path = _url_path(a["path"])
             title = html.escape(a["title"])
-            parts.append(f'<li><a href="/{path}">{title}</a></li>')
+            parts.append(f'<li><a href="{_href(path)}">{title}</a></li>')
         parts.append("</ul>")
 
     # Catch any other types
@@ -720,7 +819,7 @@ def _build_nav_html(articles: list[dict]) -> str:
         for a in items:
             path = _url_path(a["path"])
             title = html.escape(a["title"])
-            parts.append(f'<li><a href="/{path}">{title}</a></li>')
+            parts.append(f'<li><a href="{_href(path)}">{title}</a></li>')
         parts.append("</ul>")
 
     return "\n".join(parts)
@@ -756,7 +855,7 @@ def _build_index_html(articles: list[dict]) -> str:
             title = html.escape(a["title"])
             status = a.get("status", "")
             meta = f'<span class="meta">{status}</span>' if status else ""
-            parts.append(f'<li><a href="/{path}">{title}</a>{meta}</li>')
+            parts.append(f'<li><a href="{_href(path)}">{title}</a>{meta}</li>')
         parts.append("</ul></div>")
 
     # Other types
@@ -768,7 +867,7 @@ def _build_index_html(articles: list[dict]) -> str:
         for a in items:
             path = _url_path(a["path"])
             title = html.escape(a["title"])
-            parts.append(f'<li><a href="/{path}">{title}</a></li>')
+            parts.append(f'<li><a href="{_href(path)}">{title}</a></li>')
         parts.append("</ul></div>")
 
     return "\n".join(parts)
@@ -786,7 +885,7 @@ def _build_search_html(query: str, results: list[dict]) -> str:
             path = _url_path(r.get("path", ""))
             parts.append(
                 f'<div class="search-result">'
-                f'<h3><a href="/{path}">{title}</a></h3>'
+                f'<h3><a href="{_href(path)}">{title}</a></h3>'
                 f'<span class="path">{html.escape(path)}</span>'
                 f"</div>"
             )
@@ -821,10 +920,15 @@ def _build_references_html(bib: dict[str, dict[str, str]]) -> str:
         parts.append(f'<p>{", ".join(lines)}</p>' if lines else "")
 
         if doi:
-            doi_url = f"https://doi.org/{doi}" if not doi.startswith("http") else doi
+            doi_url = doi if _safe_url(doi) else f"https://doi.org/{doi}"
             parts.append(f'<p class="ref-link">DOI: <a href="{html.escape(doi_url)}" target="_blank">{html.escape(doi)}</a></p>')
         if url:
-            parts.append(f'<p class="ref-link">URL: <a href="{html.escape(url)}" target="_blank">{html.escape(url)}</a></p>')
+            # Only http(s) URLs become links: a javascript: URL would run
+            # in the page when clicked.
+            if _safe_url(url):
+                parts.append(f'<p class="ref-link">URL: <a href="{html.escape(url)}" target="_blank">{html.escape(url)}</a></p>')
+            else:
+                parts.append(f'<p class="ref-link">URL: {html.escape(url)}</p>')
 
         bibtex_str = html.escape(reconstruct_bibtex(key, entry))
         parts.append(
@@ -854,7 +958,7 @@ def _build_topics_html(concepts: list[dict],
                 title = html.escape(a["title"])
                 atype = a.get("article_type", "")
                 meta = f' <span class="meta">{atype}</span>' if atype else ""
-                parts.append(f'<li><a href="/{path}">{title}</a>{meta}</li>')
+                parts.append(f'<li><a href="{_href(path)}">{title}</a>{meta}</li>')
             parts.append("</ul>")
         else:
             parts.append(f'<p class="meta">No articles yet</p>')
@@ -921,6 +1025,22 @@ def _build_about_html(wiki_dir: Path, db_path: Path, articles: list[dict],
     return "\n".join(parts)
 
 
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "[::1]")
+
+
+def _host_allowed(host: str | None) -> bool:
+    """Whether a Host header names this machine (guards DNS rebinding)."""
+    if not host:
+        return False
+    host = host.strip().lower()
+    for name in _LOCAL_HOSTS:
+        if host == name:
+            return True
+        if host.startswith(name + ":") and host[len(name) + 1:].isdigit():
+            return True
+    return False
+
+
 class CrucibleHandler(http.server.BaseHTTPRequestHandler):
     """Request handler for the Crucible wiki browser."""
 
@@ -932,8 +1052,70 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
     bib: dict[str, dict[str, str]]
     project_name: str
     github_url: str
+    # mtimes of the database files and references.bib when articles, nav
+    # and bib were last loaded; see _refresh.
+    _state_stamp: tuple = ()
+
+    @classmethod
+    def _stamp(cls) -> tuple:
+        stamp = []
+        for p in (cls.db_path, Path(str(cls.db_path) + "-wal"),
+                  cls.db_path.parent / "references.bib"):
+            try:
+                st = p.stat()
+                stamp.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                stamp.append(None)
+        return tuple(stamp)
+
+    @classmethod
+    def _refresh(cls, force: bool = False):
+        """Reload articles, sidebar and bibliography if they changed on disk.
+
+        `crucible sync` may run while the server is up; the database and
+        references.bib mtimes tell when to reload.
+        """
+        stamp = cls._stamp()
+        if not force and stamp == cls._state_stamp:
+            return
+        if cls.db_path.exists():
+            from crucible.database import CrucibleDB
+            try:
+                db = CrucibleDB(cls.db_path)
+                try:
+                    cls.articles = db.list_articles()
+                finally:
+                    db.close()
+            except Exception:
+                pass  # keep the last good list if the DB is mid-write
+        cls.nav_html = _build_nav_html(cls.articles)
+        cls._load_bib()
+        cls._state_stamp = stamp
+
+    @classmethod
+    def _load_bib(cls):
+        bib_path = cls.db_path.parent / "references.bib"
+        if bib_path.exists():
+            cls.bib = parse_bibtex(
+                bib_path.read_text(encoding="utf-8", errors="replace"))
+        else:
+            cls.bib = {}
 
     def do_GET(self):  # noqa: N802
+        if not _host_allowed(self.headers.get("Host")):
+            self._send_response(403, "text/plain; charset=utf-8",
+                                b"Forbidden: unexpected Host header\n")
+            return
+        try:
+            self._refresh()
+        except Exception:
+            pass
+        try:
+            self._route()
+        except Exception as e:  # always answer, never drop the connection
+            self._send_error(500, f"Internal error: {type(e).__name__}: {e}")
+
+    def _route(self):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
         query = urllib.parse.parse_qs(parsed.query)
@@ -986,24 +1168,27 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
             self._serve_org(path)
 
     def _serve_org(self, url_path: str):
-        """Convert and serve an org file."""
+        """Convert and serve an org file from the wiki directory."""
         # Strip leading slash
         rel = url_path.lstrip("/")
-        # Security: prevent path traversal
+        # Security: only .org files inside the wiki directory. Compare
+        # resolved paths, not string prefixes, which would admit a sibling
+        # such as wiki-old/.
         try:
-            file_path = (self.wiki_dir / rel).resolve()
-            if not str(file_path).startswith(str(self.wiki_dir.resolve())):
+            wiki = self.wiki_dir.resolve()
+            file_path = (wiki / rel).resolve()
+            if not file_path.is_relative_to(wiki) or file_path.suffix != ".org":
                 self._send_error(403, "Forbidden")
                 return
         except (ValueError, OSError):
             self._send_error(400, "Bad request")
             return
 
-        if not file_path.exists() or not file_path.is_file():
+        if not file_path.is_file():
             self._send_error(404, f"Not found: {rel}")
             return
 
-        text = file_path.read_text(encoding="utf-8")
+        text = file_path.read_text(encoding="utf-8", errors="replace")
         title, content_html, filetags = org_to_html(text, rel, bib=self.bib)
 
         # Build page content with title, tags, and VS Code link
@@ -1022,10 +1207,10 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
 
         self._serve_page(title or rel, "\n".join(parts))
 
-    def _serve_page(self, title: str, content: str):
+    def _serve_page(self, title: str, content: str, code: int = 200):
         """Wrap content in the page template and serve it."""
         github_link = ""
-        if self.github_url:
+        if self.github_url and _safe_url(self.github_url):
             github_link = (
                 f'<a class="github-link" href="{html.escape(self.github_url)}" '
                 f'target="_blank">GitHub</a>'
@@ -1038,10 +1223,11 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
             project_name=html.escape(self.project_name),
             github_link=github_link,
         )
-        self._send_response(200, "text/html; charset=utf-8", page.encode("utf-8"))
+        self._send_response(code, "text/html; charset=utf-8", page.encode("utf-8"))
 
     def _send_error(self, code: int, message: str):
-        self._serve_page(f"Error {code}", f"<h1>{code}</h1><p>{html.escape(message)}</p>")
+        self._serve_page(f"Error {code}", f"<h1>{code}</h1><p>{html.escape(message)}</p>",
+                         code=code)
 
     def _send_response(self, code: int, content_type: str, body: bytes):
         self.send_response(code)
@@ -1059,20 +1245,22 @@ def start_server(wiki_dir: Path, db_path: Path, articles: list[dict],
                  port: int = 8088,
                  project_name: str = "",
                  github_url: str = "") -> http.server.HTTPServer:
-    """Create and return the HTTP server (does not start serving)."""
+    """Create and return the HTTP server (does not start serving).
+
+    articles is the initial article list; it, the sidebar and the
+    bibliography are reloaded whenever the database or references.bib
+    changes. Raises OSError if the port cannot be bound.
+    """
     CrucibleHandler.wiki_dir = wiki_dir
-    CrucibleHandler.nav_html = _build_nav_html(articles)
     CrucibleHandler.articles = articles
     CrucibleHandler.db_path = db_path
     CrucibleHandler.project_name = project_name
     CrucibleHandler.github_url = github_url
-
-    # Load references.bib for citation tooltips
-    bib_path = db_path.parent / "references.bib"
-    if bib_path.exists():
-        CrucibleHandler.bib = parse_bibtex(bib_path.read_text(encoding="utf-8"))
-    else:
-        CrucibleHandler.bib = {}
+    CrucibleHandler.nav_html = _build_nav_html(articles)
+    # Load references.bib now; later requests reload it, the articles and
+    # the sidebar when the database or the bib file changes.
+    CrucibleHandler._load_bib()
+    CrucibleHandler._state_stamp = CrucibleHandler._stamp()
 
     server = http.server.HTTPServer(("127.0.0.1", port), CrucibleHandler)
     return server
