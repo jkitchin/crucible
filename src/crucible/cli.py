@@ -192,6 +192,10 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     Symlinked directories are followed (a wiki kept in Dropbox is often
     linked in), each real directory once, so a symlink loop cannot recurse
     forever. Paths are returned under `wiki_dir` as spelled, not resolved.
+    A symlink to a directory inside the wiki is an alias of articles that
+    already have a path, so it is skipped: otherwise which spelling an
+    article got would depend on scan order. Entries are visited in name
+    order, so the result never depends on the order scandir returns them.
 
     Errors are raised rather than suppressed, so an incomplete scan can never
     be mistaken for deleted articles. That is why this walks with scandir:
@@ -199,6 +203,7 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
     is an entry that vanishes during the scan, which really is gone.
     """
     index_path = wiki_dir / "index.org"
+    wiki_real = wiki_dir.resolve()
     org_files = []
     seen_dirs = set()
     pending = [wiki_dir]
@@ -214,9 +219,11 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
         seen_dirs.add(dir_key)
         try:
             with os.scandir(directory) as it:
-                entries = list(it)
+                entries = sorted(it, key=lambda e: e.name)
         except FileNotFoundError:
             continue
+        # Pushed in reverse so the stack visits directories in name order.
+        subdirs = []
         for entry in entries:
             path = Path(entry.path)
             try:
@@ -224,23 +231,26 @@ def _wiki_article_files(wiki_dir: Path) -> list[Path]:
                 if stat.S_ISLNK(mode):
                     # A dangling link, such as an Emacs `.#name.org` lock,
                     # or a link to itself is skipped; a link to a directory
-                    # is followed.
+                    # is followed, unless it points back into the wiki.
                     try:
                         mode = entry.stat(follow_symlinks=True).st_mode
                     except OSError as exc:
                         if isinstance(exc, FileNotFoundError) or exc.errno == errno.ELOOP:
                             continue
                         raise
+                    if stat.S_ISDIR(mode) and path.resolve().is_relative_to(wiki_real):
+                        continue
             except FileNotFoundError:
                 continue
             if stat.S_ISDIR(mode):
-                pending.append(path)
+                subdirs.append(path)
             elif (
                 entry.name.endswith(".org")
                 and path != index_path
                 and stat.S_ISREG(mode)
             ):
                 org_files.append(path)
+        pending.extend(reversed(subdirs))
     return sorted(org_files)
 
 
@@ -978,6 +988,38 @@ def _normalize_article_type(value: str | None) -> str:
     return (value or "").strip().lower() or "concept"
 
 
+ARTICLE_STATUSES = ("draft", "reviewed", "verified")
+
+
+def _normalize_status(value: str | None) -> str:
+    """A :STATUS: value as stored: lowercase, defaulting to draft."""
+    return (value or "").strip().lower() or "draft"
+
+
+def _utc_now() -> str:
+    """The current UTC time in SQLite's datetime('now') format."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _resolve_derived_from(db: CrucibleDB, root: Path, org_path: Path, ref: str) -> dict | None:
+    """The article a DERIVED_FROM entry names, or None.
+
+    Paths are relative to the article, or to the wiki directory
+    (optionally written with a leading wiki/).
+    """
+    article = _find_linked_article(db, root, _link_target_rel(root, org_path, ref))
+    if article is None and not Path(ref).is_absolute():
+        within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
+        article = _find_linked_article(
+            db, root,
+            _safe_relative_to(
+                Path(os.path.normpath(cdir(root) / "wiki" / within)), root
+            ),
+        )
+    return article
+
+
 def _report_unreadable(path: Path, exc: Exception) -> None:
     """Tell the user on stderr that an article could not be read."""
     if isinstance(exc, UnicodeDecodeError):
@@ -1060,7 +1102,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                 continue
             rel_path = str(org_path.relative_to(root))
             article_type = _normalize_article_type(meta.properties.get("ARTICLE_TYPE"))
-            status = meta.properties.get("STATUS") or "draft"
+            status = _normalize_status(meta.properties.get("STATUS"))
             # :CREATED: and :MODIFIED: make an article's dates part of its
             # file, so they survive a rebuild; without them sync time is used.
             # :MODIFIED: falls back to :CREATED:, by the same rule for new and
@@ -1103,6 +1145,17 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                 dates = {}
                 if created and existing["created_at"] != created:
                     dates["created_at"] = created
+                elif (created is None and changed and indexed
+                      and "CREATED" not in meta.properties
+                      and "MODIFIED" not in meta.properties):
+                    # The file's dates were removed: its creation date is
+                    # now sync time, as a rebuild would make it, rather
+                    # than the old property date. (An unreadable date is
+                    # left as it was; lint reports it.)
+                    from crucible.orgparse import parse_org
+                    old = parse_org(indexed["content"]).properties
+                    if _org_date(old.get("CREATED")) or _org_date(old.get("MODIFIED")):
+                        dates["created_at"] = _utc_now()
                 if modified and (changed or existing["updated_at"] != modified):
                     dates["updated_at"] = modified
                 if dates:
@@ -1159,8 +1212,10 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                 target_article = _find_linked_article(
                     db, root, _link_target_rel(root, org_path, link_target)
                 )
-                if target_article:
-                    db.add_article_link(article_id, target_article["id"])
+                # A link to a heading in the same file is not an edge in the
+                # wiki graph; a repeated link is stored once.
+                if (target_article and target_article["id"] != article_id
+                        and db.add_article_link(article_id, target_article["id"])):
                     stats["article_links"] += 1
 
             source_keys = meta.properties.get("SOURCE_KEYS", "").split()
@@ -1171,23 +1226,14 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                     for sid in source_ids:
                         db.link_article_source(article_id, sid)
 
-            # DERIVED_FROM paths are relative to the article, or to the wiki
-            # directory (optionally written with a leading wiki/).
-            wiki_rel = cdir(root) / "wiki"
+            # Existing derivations are kept, so derived_at records when each
+            # first appeared rather than the last sync.
+            derived = set()
             for ref in meta.properties.get("DERIVED_FROM", "").split():
-                source_article = _find_linked_article(
-                    db, root, _link_target_rel(root, org_path, ref)
-                )
-                if source_article is None and not Path(ref).is_absolute():
-                    within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
-                    source_article = _find_linked_article(
-                        db, root,
-                        _safe_relative_to(
-                            Path(os.path.normpath(wiki_rel / within)), root
-                        ),
-                    )
+                source_article = _resolve_derived_from(db, root, org_path, ref)
                 if source_article:
-                    db.add_derivation(article_id, source_article["id"])
+                    derived.add(source_article["id"])
+            db.set_derivations(article_id, derived)
 
         # Tags dropped from files, or deleted articles, can leave concepts
         # that no article uses any more.
@@ -3900,6 +3946,39 @@ def lint(strict, json_output):
                 "message": f"Missing ARTICLE_TYPE property: {article['path']}",
                 "path": article['path'],
             })
+        elif _normalize_article_type(meta.properties["ARTICLE_TYPE"]) not in ARTICLE_TYPES:
+            issues.append({
+                "type": "invalid_article_type",
+                "severity": "warning",
+                "message": (
+                    f"Unknown ARTICLE_TYPE '{meta.properties['ARTICLE_TYPE']}' in "
+                    f"{article['path']} (use one of {', '.join(ARTICLE_TYPES)})"
+                ),
+                "path": article['path'],
+            })
+        raw_status = meta.properties.get("STATUS")
+        if raw_status and _normalize_status(raw_status) not in ARTICLE_STATUSES:
+            issues.append({
+                "type": "invalid_status",
+                "severity": "warning",
+                "message": (
+                    f"Unknown STATUS '{raw_status}' in {article['path']} "
+                    f"(use one of {', '.join(ARTICLE_STATUSES)})"
+                ),
+                "path": article['path'],
+            })
+        for ref in meta.properties.get("DERIVED_FROM", "").split():
+            if _resolve_derived_from(db, root, org_path, ref) is None:
+                issues.append({
+                    "type": "unresolved_derived_from",
+                    "severity": "warning",
+                    "message": (
+                        f"DERIVED_FROM entry '{ref}' in {article['path']} "
+                        "does not name a wiki article"
+                    ),
+                    "path": article['path'],
+                    "ref": ref,
+                })
         dates = {}
         for prop in ("CREATED", "MODIFIED"):
             raw = meta.properties.get(prop)
@@ -3991,8 +4070,9 @@ def lint(strict, json_output):
                 "path": rel,
             })
 
-    # 7. Citation keys not in references.bib
-    bib_keys = {e.key for e in bib_entries}
+    # 7. Citation keys not in references.bib. A source with no bib entry
+    # (a disk-scanned notebook or data file) is cited by its own key.
+    known_keys = {e.key for e in bib_entries} | set(source_index[0])
 
     for article in db.list_articles():
         org_path = root / article["path"]
@@ -4003,11 +4083,14 @@ def lint(strict, json_output):
         except (UnicodeDecodeError, OSError):
             continue  # reported above as unreadable_file
         for key in meta.cite_keys:
-            if key not in bib_keys:
+            if key not in known_keys:
                 issues.append({
                     "type": "missing_citation",
                     "severity": "warning",
-                    "message": f"Citation key '{key}' in {article['path']} not found in references.bib",
+                    "message": (
+                        f"Citation key '{key}' in {article['path']} not found in "
+                        "references.bib or the sources"
+                    ),
                     "path": article['path'],
                     "key": key,
                 })
@@ -4379,8 +4462,10 @@ LINKING TO SOURCES:
   In the :PROPERTIES: drawer, set SOURCE_KEYS to the space-separated
   cite keys of the article's sources: the keys in references.bib that
   `crucible ingest` printed. A file in sources/notebooks/ or sources/data/
-  that no bib entry claims is keyed <stem>-<ext> (results.csv ->
-  results-csv). Sync uses these keys to link articles to their sources;
+  that no bib entry claims is keyed <stem> (results.csv -> results), or
+  <stem>-<ext> (results-csv, then -2, -3...) when the stem is already a
+  bib key or another source's key; `crucible source <file> --json`
+  shows it. Sync uses these keys to link articles to their sources;
   `crucible lint` reports keys that resolve to no source or to several.
 
 UPDATING EXISTING ARTICLES:
@@ -4447,7 +4532,8 @@ It also reconciles the sources table with .crucible/references.bib:
   - An entry with a `file` field owns the row for that file
   - An entry without one gets no row (lint reports keys cited this way)
   - A file in sources/notebooks/ or sources/data/ that no entry claims gets
-    a row keyed <stem>-<ext> from a disk scan
+    a row from a disk scan, keyed <stem>, or <stem>-<ext> (then -2, -3...)
+    when the stem is already a bib key or another source's key
 
 The database is regenerable: delete .crucible/crucible.db and the next
 command rebuilds it from the wiki, references.bib and the source files,
@@ -4549,8 +4635,10 @@ FILETAGS: include the article type (concept, summary, etc.) and
 all relevant topic tags. Tags become concepts in the database.
 
 SOURCE_KEYS: space-separated cite keys from references.bib (the key
-`crucible ingest` printed), or <stem>-<ext> for a file in sources/notebooks/
-or sources/data/ with no bib entry. These create article-to-source links
+`crucible ingest` printed). A file in sources/notebooks/ or sources/data/
+with no bib entry is keyed <stem>, or <stem>-<ext> (then -2, -3...) when
+the stem is already a bib key or another source's key; `crucible
+source <file> --json` shows it. These create article-to-source links
 during sync.
 
 CREATED / MODIFIED: the article's dates; update MODIFIED on every edit.

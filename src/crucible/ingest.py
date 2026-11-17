@@ -821,6 +821,19 @@ def reconcile_sources(root: Path, db) -> int:
             if src["path"].startswith(PLACEHOLDER_PREFIX):
                 db.delete_source(src["id"])
 
+        # 3b. A row whose bib entry and file are both gone would not be
+        # rebuilt, so drop it (its article links go with it) and keep the
+        # table equal to a rebuild's. A moved file keeps its entry's row
+        # (step 2 moved it) or gets a new one from the disk scan below.
+        for src in db.list_sources():
+            if src["path"].startswith(PLACEHOLDER_PREFIX):
+                continue
+            key = _source_metadata(src).get("cite_key")
+            if isinstance(key, str) and key in bib_keys:
+                continue
+            if not (root / src["path"]).exists():
+                db.delete_source(src["id"])
+
     # 4. Committed files no entry claims.
     inserted += upsert_sources_from_disk(root, db)
     return inserted

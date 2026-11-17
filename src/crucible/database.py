@@ -620,26 +620,53 @@ class CrucibleDB:
         )
         self.conn.commit()
 
-    def add_article_link(self, from_id: int, to_id: int, context: str | None = None):
+    def add_article_link(self, from_id: int, to_id: int, context: str | None = None) -> bool:
+        """Record a link; returns whether it was new (not a duplicate)."""
         self.conn.execute(
             "INSERT OR IGNORE INTO article_links (from_id, to_id, context) VALUES (?, ?, ?)",
             (from_id, to_id, context),
         )
+        inserted = self.conn.execute("SELECT changes() AS n").fetchone()["n"] > 0
+        self.conn.commit()
+        return inserted
+
+    def set_derivations(self, derived_id: int, source_ids):
+        """Make derived_id's derivations exactly source_ids.
+
+        Rows that are still wanted are kept, so derived_at stays the time
+        each derivation first appeared; new ones are added and the rest
+        removed.
+        """
+        wanted = set(source_ids)
+        current = {r["source_id"] for r in self.conn.execute(
+            "SELECT source_id FROM article_derivations WHERE derived_id = ?",
+            (derived_id,),
+        )}
+        for sid in current - wanted:
+            self.conn.execute(
+                "DELETE FROM article_derivations WHERE derived_id = ? AND source_id = ?",
+                (derived_id, sid),
+            )
+        for sid in sorted(wanted - current):
+            self.conn.execute(
+                "INSERT OR IGNORE INTO article_derivations (derived_id, source_id) VALUES (?, ?)",
+                (derived_id, sid),
+            )
         self.conn.commit()
 
     def clear_article_relations(self, article_id: int):
         """Drop the relations sync derives from an article's own file.
 
-        Removes its concept tags, outgoing links, source links and
-        derivations so sync can re-add them from the file's current
-        contents. Incoming links belong to the articles they come from and
-        are left alone.
+        Removes its concept tags, outgoing links and source links so sync
+        can re-add them from the file's current contents. Incoming links
+        belong to the articles they come from and are left alone.
+        Derivations are not cleared: sync updates them with
+        set_derivations, which keeps each one's derived_at.
         """
         for sql in (
             "DELETE FROM article_concepts WHERE article_id = ?",
             "DELETE FROM article_links WHERE from_id = ?",
             "DELETE FROM article_sources WHERE article_id = ?",
-            "DELETE FROM article_derivations WHERE derived_id = ?",
         ):
             self.conn.execute(sql, (article_id,))
         self.conn.commit()

@@ -306,6 +306,8 @@ def test_sync_prunes_last_article_after_index_generation(project):
     assert result.exit_code == 0, result.output
 
     cdir = project / ".crucible"
+    # A row with neither a file nor a bib entry is dropped by sync.
+    _touch(project / ".crucible/sources/external/pdfs/registered.pdf")
     db = CrucibleDB(cdir / "crucible.db")
     try:
         article_id = db.get_article_by_path(CONCEPT_PATH)["id"]
@@ -585,7 +587,14 @@ def test_sync_drops_links_and_derivations_removed_from_a_file(project):
     assert run_json("history", SUMMARY_PATH)["derived_from"] == []
 
 
+def _touch(path):
+    """Create a source file, so sync keeps a row that has no bib entry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("Synthetic source.")
+
+
 def test_sync_drops_source_keys_removed_from_a_file(project):
+    _touch(project / ".crucible/sources/external/pdfs/paper.pdf")
     db = CrucibleDB(project / ".crucible" / "crucible.db")
     try:
         db.add_source(
@@ -611,6 +620,7 @@ def test_sync_replaces_source_keys_changed_in_a_file(project):
     db = CrucibleDB(project / ".crucible" / "crucible.db")
     try:
         for key, title in (("sourcea2026", "Source A"), ("sourceb2026", "Source B")):
+            _touch(project / f".crucible/sources/external/pdfs/{key}.pdf")
             db.add_source(
                 path=f".crucible/sources/external/pdfs/{key}.pdf",
                 title=title, source_type="pdf",
