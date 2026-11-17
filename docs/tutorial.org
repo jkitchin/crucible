@@ -213,6 +213,7 @@ crucible index
 #+END_SRC
 
 Rebuilds =wiki/index.org= with all articles organized by type and concept.
+=crucible sync= does this too, along with =wiki/MANIFEST.md=.
 
 ** Publishing as HTML
 

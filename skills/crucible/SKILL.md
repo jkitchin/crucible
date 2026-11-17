@@ -133,11 +133,12 @@ Wait for user approval before proceeding.
 2. **Always** sync the database after writing:
    ```bash
    crucible sync
-   crucible manifest
    ```
-   The database and MANIFEST.md are not updated automatically when wiki files
-   change on disk. Without `crucible sync`, the database will be stale and
-   MANIFEST.md will show incorrect counts (e.g. 0 articles even when files exist).
+   The database, MANIFEST.md and index.org are not updated automatically when
+   wiki files change on disk; `crucible sync` updates the database and
+   regenerates MANIFEST.md and index.org. Without it, the database will be
+   stale and MANIFEST.md will show incorrect counts (e.g. 0 articles even when
+   files exist).
 3. Report what was created/updated
 
 ### Updating Existing Articles
@@ -351,10 +352,9 @@ When the user asks a question about the knowledge base:
 Run the maintenance cycle regularly, especially after distilling new sources:
 
 ```bash
-crucible sync          # pick up any file changes
+crucible sync          # pick up file changes; regenerates MANIFEST.md and index.org
 crucible lint          # find problems (broken links, missing properties, orphans)
 crucible suggest       # find opportunities (new articles, missing links, comparisons)
-crucible index         # regenerate .crucible/wiki/index.org
 ```
 
 ### Lint
@@ -393,8 +393,9 @@ Use `crucible suggest -j` for JSON output when processing programmatically.
 
 ### Index
 
-`crucible index` regenerates `.crucible/wiki/index.org` with all articles organized by type
-and by concept. Always run this after adding or updating articles.
+`crucible sync` regenerates `.crucible/wiki/index.org` with all articles organized by type
+and by concept (`crucible index` regenerates it on its own). Articles with an
+unrecognised `:ARTICLE_TYPE:` are listed under "Other".
 
 ## Common Patterns
 
@@ -455,7 +456,7 @@ it (`crucible lint` then reports their `SOURCE_KEYS` as unresolved). Without
 again by the next sync's disk scan.
 
 ### Generating an index
-After syncing, run `crucible index` to regenerate .crucible/wiki/index.org with
-categorized links to all articles, organized by type and concept. The index
-is generated output: do not edit it by hand, since `crucible sync` does not
-treat it as an article and the next `crucible index` overwrites it.
+`crucible sync` regenerates .crucible/wiki/index.org with categorized links to
+all articles, organized by type and concept (`crucible index` does the same on
+its own). The index is generated output: do not edit it by hand, since
+`crucible sync` does not treat it as an article and overwrites it.

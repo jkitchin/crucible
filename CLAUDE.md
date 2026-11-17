@@ -64,12 +64,13 @@ Ingestion is a two-step process:
 
 ### Sync After Writing
 
-The database and MANIFEST.md are not updated automatically when wiki files are
-created or modified. You must run `crucible sync` after writing or editing any
-wiki articles. Without this, the database will be stale and MANIFEST.md will
-show incorrect counts (e.g. 0 articles even when article files exist on disk).
-Always sync before running `crucible search`, `crucible stats`, `crucible index`,
-or `crucible manifest`.
+The database, MANIFEST.md and index.org are not updated automatically when
+wiki files are created or modified. You must run `crucible sync` after writing
+or editing any wiki articles; it updates the database and regenerates
+`wiki/MANIFEST.md` and `wiki/index.org`. Without this, the database will be
+stale and MANIFEST.md will show incorrect counts (e.g. 0 articles even when
+article files exist on disk). Always sync before running `crucible search`,
+`crucible stats`, `crucible lint` or `crucible suggest`.
 
 ### Search
 
