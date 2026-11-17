@@ -203,13 +203,15 @@ crucible embed [OPTIONS]
 
 | Option | Description |
 |--------------------+-----------------------------------------------|
-| =-m=, =--model= | Ollama model (default: nomic-embed-text) |
+| =-m=, =--model= | Ollama model (default: the model of the stored embeddings, else nomic-embed-text) |
 | =--url= | Ollama embed API URL (default: =$CRUCIBLE_OLLAMA_URL=, else localhost:11434) |
 | =--force= | Re-embed every article |
 
-Only embeds articles that have no embedding from the chosen model
-(incremental), so switching models re-embeds everything with the new
-one. Articles are sent to ollama in batches. The org header and drawers
+Without =--model= the model of the stored embeddings is used, as
+=crucible search= does, so a plain =crucible embed= keeps using whatever
+model the crucible was embedded with. Only embeds articles that have no
+embedding from that model (incremental), so switching models with
+=--model= re-embeds everything with the new one. Articles are sent to ollama in batches. The org header and drawers
 are stripped and the first 8000 characters of the rest are embedded.
 Re-run after adding new articles.
 
@@ -239,6 +241,12 @@ Modes:
 - *auto*: hybrid if embeddings from the model exist, FTS otherwise; falls
   back to FTS with a warning when the embedding service is unavailable
 - *fts*: keyword search only (FTS5 with porter stemming)
+
+Keyword search matches article titles and text (not paths). Each word is
+matched literally, so FTS5 operators such as =AND=, =NOT= or quotes are
+plain text. A trailing =*= makes a word a prefix: =catal*= matches
+catalysis and catalyst. Prefixes are stemmed like other words, so the
+prefix one letter shorter is matched as well.
 - *semantic*: vector similarity only
 - *hybrid*: FTS + semantic combined with Reciprocal Rank Fusion
 

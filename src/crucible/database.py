@@ -184,21 +184,48 @@ CREATE INDEX IF NOT EXISTS idx_article_links_to ON article_links(to_id);
 """
 
 
+def _fts_literal(token: str) -> str:
+    """An FTS5 string literal for token (double quotes doubled)."""
+    return '"' + token.replace('"', '""') + '"'
+
+
 def _fts_query(raw: str) -> str:
     """Turn a raw user query into a safe FTS5 MATCH expression.
 
     Each whitespace-separated token is wrapped as a quoted string literal so
-    FTS5 query operators in user input (-, :, *, parentheses, the bare keywords
+    FTS5 query operators in user input (-, :, parentheses, the bare keywords
     AND/OR/NOT/NEAR) are treated as ordinary text rather than crashing the
-    parser. Returns "" when the query has no usable tokens, in which case
-    callers should skip the search and return no results.
+    parser. A token ending in * is a prefix query (catal* matches catalysis).
+    Prefixes are stemmed like every other word (porter turns "cataly" into
+    "catali"), so the prefix one character shorter is matched too.
+
+    The match is limited to the title and content columns: the path column
+    holds ".crucible/wiki/concepts/x.org", whose words would otherwise match
+    every article. A column filter rather than an UNINDEXED schema keeps
+    this working against peers whose index predates the change.
+
+    Returns "" when the query has no usable tokens, in which case callers
+    should skip the search and return no results.
     """
     # Drop NUL and other control characters first: a NUL terminates the string
     # at the SQLite C layer ("unterminated string"), and other control chars
     # contribute nothing to a text search. Tab/newline/CR are left for split().
     cleaned = "".join(ch for ch in raw if ch >= " " or ch in "\t\n\r")
-    tokens = cleaned.split()
-    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+    terms = []
+    for token in cleaned.split():
+        stem = token.rstrip("*")
+        if not stem:
+            continue  # a bare "*" means nothing
+        if stem == token:
+            terms.append(_fts_literal(token))
+        elif len(stem) > 3:
+            terms.append(f"({_fts_literal(stem)}* OR {_fts_literal(stem[:-1])}*)")
+        else:
+            terms.append(f"{_fts_literal(stem)}*")
+    if not terms:
+        return ""
+    # Explicit AND: FTS5 allows implicit AND only between plain phrases.
+    return "{title content} : (" + " AND ".join(terms) + ")"
 
 
 class CrucibleDB:

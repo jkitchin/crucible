@@ -115,7 +115,9 @@ A, B, C at a given time. Extracted from the =:DERIVED_FROM:= property.
 ** Full-Text Search
 
 The =article_fts= virtual table uses SQLite FTS5 with porter stemming
-tokenization. It indexes article path, title, and full text content.
+tokenization. It stores article path, title, and full text content;
+queries match only title and content (a column filter), since the words
+of a path such as =.crucible/wiki/concepts/x.org= are in every article.
 Populated by =crucible sync=.
 
 ** Embeddings
@@ -146,7 +148,9 @@ articles are therefore represented by their opening sections only.
 ** FTS5 Keyword Search
 
 Standard SQLite full-text search with porter stemming. The query is
-matched against article path, title, and content. Results are ranked
+matched against article title and content. Each word is quoted, so FTS5
+syntax in a query is literal text, except that a trailing =*= makes a
+word a prefix query. Results are ranked
 by BM25 (SQLite's default FTS5 ranking).
 
 ** Semantic Vector Search

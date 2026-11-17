@@ -1256,7 +1256,9 @@ def sync():
 
 
 @cli.command()
-@click.option("--model", "-m", default="nomic-embed-text", help="Ollama embedding model")
+@click.option("--model", "-m", default=None,
+              help="Ollama embedding model (default: the model of the stored"
+                   " embeddings, else nomic-embed-text)")
 @click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
               default="http://localhost:11434/api/embed", show_envvar=True,
               help="Ollama embed API URL")
@@ -1265,8 +1267,10 @@ def embed(model, url, force):
     """Generate embeddings for all wiki articles.
 
     Uses ollama to create vector embeddings for semantic search.
-    Only embeds articles that have no embedding from MODEL, so switching
-    models re-embeds everything with the new one. `crucible sync` drops
+    Without --model, the model of the stored embeddings is used (as
+    `crucible search` does), else nomic-embed-text. Only embeds articles
+    that have no embedding from that model, so switching models with
+    --model re-embeds everything with the new one. `crucible sync` drops
     the embedding of any article whose file changed, so edited articles
     are re-embedded here. The org header and drawers are stripped and the
     first 8000 characters of the rest are embedded.
@@ -1287,6 +1291,7 @@ def embed(model, url, force):
                 a["content"] = org_path.read_text(encoding="utf-8", errors="replace")
             articles.append(a)
 
+        model = idx.model  # resolved: --model, else the stored model
         click.echo(f"Embedding with {model}...")
         try:
             count = idx.embed_missing(articles, force=force)
@@ -1421,7 +1426,9 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
       auto      Hybrid if embeddings exist, FTS otherwise (default).
                 Falls back to FTS with a warning if the embedding
                 service cannot be used.
-      fts       Keyword search only (FTS5 with porter stemming)
+      fts       Keyword search only (FTS5 with porter stemming) over
+                titles and text; a trailing * makes a word a prefix
+                (catal* matches catalysis)
       semantic  Vector similarity only (requires `crucible embed`)
       hybrid    Combines FTS + semantic with reciprocal rank fusion
     """
@@ -1888,9 +1895,28 @@ def graph(output):
         click.echo(dot)
 
 
-def _write_viz(root: Path, db: CrucibleDB,
-               output: Path | None = None) -> tuple[Path, int, int]:
-    """Write the knowledge-graph HTML; return (path, node count, edge count)."""
+def _script_json(value) -> str:
+    """JSON for embedding in an HTML <script> element.
+
+    "</script>" in a title would end the script element, and "<!--" can
+    change how it is parsed, so <, > and & are written as \\u escapes (still
+    the same JSON string), as are U+2028/U+2029.
+    """
+    return (json.dumps(value)
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+_VIZ_SLOT_RE = re.compile(r"/\*(GRAPH_DATA|ROOT_PATH|LINK_MODE)\*/")
+
+
+def viz_html(root: Path, db: CrucibleDB, link_mode: str = "vscode") -> tuple[str, int, int]:
+    """The knowledge-graph page; return (html, node count, edge count).
+
+    link_mode "vscode" makes a click on an article open it in VS Code;
+    "browse" (the page served by `crucible browse`) opens its browse page.
+    """
     # Build graph data
     nodes = []
     node_ids = {}  # path -> index
@@ -1915,8 +1941,8 @@ def _write_viz(root: Path, db: CrucibleDB,
         nodes.append({
             "id": idx,
             "label": c["name"],
-            "type": "concept",
-            "group": "concept",
+            "type": "topic",
+            "group": "topic",
         })
 
     edges = []
@@ -1949,17 +1975,26 @@ def _write_viz(root: Path, db: CrucibleDB,
             if src is not None and tgt is not None:
                 edges.append({"source": src, "target": tgt, "type": "derivation"})
 
-    graph_json = json.dumps({"nodes": nodes, "edges": edges})
-    root_path = json.dumps(str(root.resolve()))
+    # One pass over the template, so a title that reads "/*ROOT_PATH*/" is
+    # not itself replaced.
+    slots = {
+        "GRAPH_DATA": _script_json({"nodes": nodes, "edges": edges}),
+        "ROOT_PATH": _script_json(str(root.resolve())),
+        "LINK_MODE": _script_json(link_mode),
+    }
+    html = _VIZ_SLOT_RE.sub(lambda m: slots[m.group(1)], _VIZ_TEMPLATE)
+    return html, len(nodes), len(edges)
 
-    html = _VIZ_TEMPLATE.replace("/*GRAPH_DATA*/", graph_json)
-    html = html.replace("/*ROOT_PATH*/", root_path)
 
+def _write_viz(root: Path, db: CrucibleDB,
+               output: Path | None = None) -> tuple[Path, int, int]:
+    """Write the knowledge-graph HTML; return (path, node count, edge count)."""
+    html, n_nodes, n_edges = viz_html(root, db)
     if output is None:
         output = cdir(root) / "wiki" / "viz.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html, encoding="utf-8")
-    return output, len(nodes), len(edges)
+    return output, n_nodes, n_edges
 
 
 @cli.command()
@@ -2038,16 +2073,25 @@ _VIZ_TEMPLATE = """<!DOCTYPE html>
 <script>
 const data = /*GRAPH_DATA*/;
 
+const rootPath = /*ROOT_PATH*/;
+const linkMode = /*LINK_MODE*/;
+
+// Article types, and "topic" for concept (tag) nodes; matches the legend.
 const colors = {
   concept: "#e94560", summary: "#0f3460", comparison: "#533483",
-  method: "#1a8a5c", "concept": "#e9a045"
+  method: "#1a8a5c", topic: "#e9a045"
 };
 function nodeColor(d) {
-  if (d.type === "concept" && !d.path) return colors["concept"];
   return colors[d.group] || "#888";
 }
 function nodeRadius(d) {
-  return d.type === "concept" && !d.path ? 6 : 10;
+  return d.path ? 10 : 6;
+}
+// Browse URL of a wiki article (path relative to .crucible/wiki/).
+function browseHref(path) {
+  const prefix = ".crucible/wiki/";
+  if (path.startsWith(prefix)) path = path.slice(prefix.length);
+  return "/" + path.split("/").map(encodeURIComponent).join("/");
 }
 
 const svg = d3.select("svg");
@@ -2089,21 +2133,26 @@ node.append("text")
 
 const tooltip = d3.select("#tooltip");
 node.on("mouseover", (e, d) => {
-  let html = "<strong>" + d.label + "</strong>";
-  if (d.type) html += "<br>Type: " + d.type;
-  if (d.status) html += "<br>Status: " + d.status;
-  if (d.path) html += "<br>" + d.path;
-  tooltip.html(html).style("display", "block");
+  // Built from text nodes: titles and paths are data, never markup.
+  tooltip.text("");
+  tooltip.append("strong").text(d.label);
+  const line = (s) => { tooltip.append("br"); tooltip.append("span").text(s); };
+  if (d.type) line("Type: " + d.type);
+  if (d.status) line("Status: " + d.status);
+  if (d.path) line(d.path);
+  tooltip.style("display", "block");
 }).on("mousemove", (e) => {
   tooltip.style("left", (e.pageX + 12) + "px").style("top", (e.pageY - 12) + "px");
 }).on("mouseout", () => tooltip.style("display", "none"))
 .on("click", (e, d) => {
-  if (d.path) {
-    const rootPath = /*ROOT_PATH*/;
+  if (linkMode === "browse") {
+    window.location.href = d.path ? browseHref(d.path)
+      : "/_topics#" + encodeURIComponent(d.label);
+  } else if (d.path) {
     window.location.href = "vscode://file/" + rootPath + "/" + d.path;
   }
 });
-node.style("cursor", d => d.path ? "pointer" : "default");
+node.style("cursor", d => d.path || linkMode === "browse" ? "pointer" : "default");
 
 sim.on("tick", () => {
   link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
@@ -2151,16 +2200,14 @@ def browse(port, no_open):
     if not wiki_dir.exists():
         raise click.ClickException("No wiki directory found. Run 'crucible init' first.")
 
-    # Ensure knowledge graph is up to date
-    viz_path = wiki_dir / "viz.html"
-    if not viz_path.exists():
-        click.echo("Generating knowledge graph...")
-        # In-process: a `crucible` subprocess depends on PATH and its
-        # failure went unnoticed.
-        try:
-            _write_viz(root, db, viz_path)
-        except Exception as e:
-            click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
+    # Refresh viz.html, which goes stale whenever the wiki changes. (The
+    # server's /_graph page is built from the database on each request.)
+    # In-process: a `crucible` subprocess depends on PATH and its failure
+    # went unnoticed.
+    try:
+        _write_viz(root, db, wiki_dir / "viz.html")
+    except Exception as e:
+        click.echo(f"Warning: could not generate the knowledge graph: {e}", err=True)
 
     articles = db.list_articles()
     db_path = cdir(root) / "crucible.db"
@@ -2227,15 +2274,12 @@ def vscode(file):
     if not wiki_dir.exists():
         raise click.ClickException("No wiki directory found. Run 'crucible init' first.")
 
-    # Ensure knowledge graph is up to date
-    viz_path = wiki_dir / "viz.html"
-    if not viz_path.exists():
-        click.echo("Generating knowledge graph...")
-        db = get_db(root)
-        try:
-            _write_viz(root, db, viz_path)
-        finally:
-            db.close()
+    # Refresh viz.html, which goes stale whenever the wiki changes.
+    db = get_db(root)
+    try:
+        _write_viz(root, db, wiki_dir / "viz.html")
+    finally:
+        db.close()
 
     # Open the project root in VS Code
     cmd = ["code", str(root)]
@@ -4122,6 +4166,9 @@ Full-text search (FTS5 with porter stemming):
   crucible search "activation energy"
   crucible search "platinum catalysis" -n 5
   crucible search "zeolites" --all     Search every registered crucible
+  crucible search "catal*"             A trailing * matches a word prefix
+  Titles and article text are searched; words are matched literally (no
+  AND/OR/NOT operators or quoting).
 
 Semantic and hybrid search (after `crucible embed`, needs ollama):
   crucible search "query" --mode semantic
