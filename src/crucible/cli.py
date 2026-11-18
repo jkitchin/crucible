@@ -20,6 +20,7 @@ from crucible.database import CrucibleDB, fts_joined
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source, read_bib_text, write_bib_text
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
+from crucible.orgparse import comma_parts, source_keys as split_source_keys
 from crucible.wikiwalk import wiki_alias_of
 from crucible.wikiwalk import wiki_article_files as _wiki_article_files
 from crucible.viz import _VIZ_TEMPLATE, _script_json, viz_html  # noqa: F401
@@ -1017,6 +1018,22 @@ def _resolve_source_keys(
     }
 
 
+def _article_source_keys(value: str, index) -> list[str]:
+    """The cite keys of a SOURCE_KEYS value.
+
+    Entries are space-separated. One with a comma inside (``a,b``) is a
+    single key if it resolves (sync keys run,1.csv as ``run,1``), else the
+    comma-separated keys in it.
+    """
+    keys: list[str] = []
+    for entry in split_source_keys(value):
+        if "," in entry and not _resolve_source_keys([entry], index)[entry]:
+            keys.extend(comma_parts(entry))
+        else:
+            keys.append(entry)
+    return keys
+
+
 ARTICLE_TYPES = ("concept", "summary", "comparison", "method")
 
 
@@ -1265,7 +1282,8 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                         and db.add_article_link(article_id, target_article["id"])):
                     stats["article_links"] += 1
 
-            source_keys = meta.properties.get("SOURCE_KEYS", "").split()
+            source_keys = _article_source_keys(
+                meta.properties.get("SOURCE_KEYS", ""), source_index)
             if source_keys:
                 for source_ids in _resolve_source_keys(source_keys, source_index).values():
                     if len(source_ids) > 1:
@@ -2321,11 +2339,16 @@ def delete(path, yes, delete_file):
         finally:
             db.close()
         click.echo("  Deleted from database.")
+        disk_path = root / article["path"]
         if delete_file:
-            disk_path = root / article["path"]
             if disk_path.exists():
                 disk_path.unlink()
                 click.echo(f"  Deleted file: {disk_path}")
+        elif disk_path.exists():
+            click.echo(
+                "  Note: the file is still in the wiki, so the next `crucible sync` "
+                "adds it back. Use --file to delete it too."
+            )
         return
 
     if src:
@@ -4337,7 +4360,8 @@ def lint(strict, json_output):
                 "message": f":MODIFIED: is earlier than :CREATED: in {article['path']}",
                 "path": article['path'],
             })
-        source_keys = meta.properties.get("SOURCE_KEYS", "").split()
+        source_keys = _article_source_keys(
+            meta.properties.get("SOURCE_KEYS", ""), source_index)
         if not source_keys:
             issues.append({
                 "type": "missing_property",
@@ -4362,14 +4386,19 @@ def lint(strict, json_output):
                     })
                 if not source_ids:
                     message = f"Unresolved SOURCE_KEYS value '{key}' in {article['path']}"
-                    if key in bib_without_file:
+                    # A key references.bib has with no file is a work cited
+                    # without its file (older versions made a placeholder
+                    # source for it): normal, so info rather than a warning.
+                    bib_only = key in bib_without_file
+                    if bib_only:
                         message += (
                             f" (references.bib has '{key}' but no file field naming"
-                            " its stored file; add file = {.crucible/sources/...})"
+                            " its stored file; if you have the file, add"
+                            " file = {.crucible/sources/...})"
                         )
                     issues.append({
                         "type": "unresolved_source_key",
-                        "severity": "warning",
+                        "severity": "info" if bib_only else "warning",
                         "message": message,
                         "path": article['path'],
                         "key": key,

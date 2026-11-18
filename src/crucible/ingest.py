@@ -26,7 +26,7 @@ from filelock import FileLock
 
 from crucible import bibtex as bibtex_mod
 from crucible.database import CrucibleDB
-from crucible.orgparse import parse_org_file
+from crucible.orgparse import comma_parts, parse_org_file, source_keys as split_source_keys
 from crucible.wikiwalk import wiki_article_files
 
 
@@ -1456,8 +1456,12 @@ def _keys_cited_in_wiki(root: Path) -> set[str]:
             cached = _cited_keys_cache.get(path)
             if cached is None or cached[0] != stamp:
                 meta = parse_org_file(path)
-                cached = (stamp, frozenset(
-                    meta.properties.get("SOURCE_KEYS", "").split()) | frozenset(meta.cite_keys))
+                # An entry with a comma may be one key or several, so both
+                # count as cited.
+                entries = split_source_keys(meta.properties.get("SOURCE_KEYS", ""))
+                cached = (stamp, frozenset(entries)
+                          | frozenset(p for e in entries for p in comma_parts(e))
+                          | frozenset(meta.cite_keys))
                 _cited_keys_cache[path] = cached
         except (OSError, UnicodeDecodeError):
             continue

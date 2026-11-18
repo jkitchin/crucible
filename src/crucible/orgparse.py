@@ -40,6 +40,13 @@ PROP_DRAWER_RE = re.compile(
 PROP_LINE_RE = re.compile(
     r"^[ \t]*:([^\s:]+?)(\+)?:(?:[ \t]+(.*?))?[ \t]*$", re.MULTILINE
 )
+# File-wide properties: #+PROPERTY: NAME value (NAME+ appends). A drawer
+# value overrides them, as in org. Names with ':' (header-args:python) are
+# not article properties and do not match.
+PROPERTY_KEYWORD_RE = re.compile(
+    r"^[ \t]*#\+PROPERTY:[ \t]+([^\s:+]+)(\+)?(?:[ \t]+(.*?))?[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 # File links: [[file:path]], plus the prefix-less forms org also reads as
 # file links: paths starting with ./ ../ / or ~/, and bare names ending in
 # .org (which contain no ':', so other link types such as id:, https: and
@@ -198,10 +205,24 @@ def parse_org(text: str) -> OrgMetadata:
             if tag and tag not in meta.filetags:
                 meta.filetags.append(tag)
 
+    # #+PROPERTY: keywords set file-wide values; a later one wins, and
+    # NAME+ appends, as in org.
+    # Commented-out text (comment blocks, COMMENT subtrees) sets nothing.
+    keyword_text = _strip_comment_subtrees(_COMMENT_BLOCK_RE.sub("", prose))
+    keyword_props: dict[str, str] = {}
+    for m in PROPERTY_KEYWORD_RE.finditer(keyword_text):
+        key = m.group(1).upper()
+        value = (m.group(3) or "").strip()
+        if m.group(2):
+            keyword_props[key] = f"{keyword_props.get(key, '')} {value}".strip()
+        else:
+            keyword_props[key] = value
+
     # Properties come from the file-level drawer (before the first heading,
     # where org-id and org-roam put :ID:) and the first heading's drawer,
     # first value winning; :KEY+: appends to the value, as in org. Drawers
-    # on later headings describe those sections, not the article.
+    # on later headings describe those sections, not the article. A drawer
+    # value overrides a #+PROPERTY: one, and :KEY+: appends to it.
     for section in _article_property_sections(prose):
         drawer = PROP_DRAWER_RE.search(section)
         if not drawer:
@@ -210,10 +231,12 @@ def parse_org(text: str) -> OrgMetadata:
             key = m.group(1).upper()
             value = (m.group(3) or "").strip()
             if m.group(2):
-                old = meta.properties.get(key, "")
+                old = meta.properties.get(key, keyword_props.get(key, ""))
                 meta.properties[key] = f"{old} {value}".strip()
             elif key not in meta.properties:
                 meta.properties[key] = value
+    for key, value in keyword_props.items():
+        meta.properties.setdefault(key, value)
 
     # Links and citations count only in live text: not in comments,
     # fixed-width lines or inline verbatim and code.
@@ -229,6 +252,22 @@ def parse_org(text: str) -> OrgMetadata:
         meta.cite_keys.extend(citation_keys(m))
 
     return meta
+
+
+def source_keys(value: str) -> list[str]:
+    """The space-separated entries of a SOURCE_KEYS value.
+
+    A comma next to a space (``a, b``) is dropped. A comma inside an entry
+    (``a,b``) is kept: a key sync makes from a file name may contain one
+    (``run,1`` for run,1.csv), so whether ``a,b`` is one key or two is for
+    the caller to decide, with comma_parts.
+    """
+    return [k for k in (t.strip(",") for t in value.split()) if k]
+
+
+def comma_parts(key: str) -> list[str]:
+    """The comma-separated keys in a SOURCE_KEYS entry such as ``a,b``."""
+    return [k for k in key.split(",") if k]
 
 
 def parse_org_file(path: Path) -> OrgMetadata:
