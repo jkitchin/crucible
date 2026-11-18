@@ -106,7 +106,7 @@ class DictConnection:
     def close(self):
         self._conn.close()
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -197,13 +197,68 @@ def _fts_literal(token: str) -> str:
     return '"' + token.replace('"', '""') + '"'
 
 
+# A chemistry-style subscript: org's X_2 / X_{2} after a letter, digit or
+# ")". Only all-digit subscripts count, and the bare form only when what
+# follows cannot continue the subscript (org reads X_2b as subscript "2b"),
+# except an uppercase letter, the next element in H_2O. So CO_2, TiO_{2},
+# (NH_4)_2SO_4 and Fe_2O_3 are written CO2, TiO2, (NH4)2SO4 and Fe2O3, while
+# snake_case names (file_2024_report, foo_bar) are left alone.
+_SUBSCRIPT_RE = re.compile(r"(?<=[^\W_]|\))_(?:\{(\d+)\}|(\d+)(?![a-z0-9_]))")
+_UNICODE_SUBSCRIPTS = str.maketrans("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089",
+                                    "0123456789")
+
+
+def fts_text(text: str) -> str:
+    """Text as it is put in the FTS index: chemical subscripts joined.
+
+    The unicode61 tokenizer splits words at "_", so CO_2 would be indexed as
+    "co" and "2" and a search for CO2 would miss it. Indexed text and
+    queries both go through this, so CO2, CO_2, CO_{2} and CO\u2082 all
+    find each other. It is idempotent.
+    """
+    if not text:
+        return text
+    text = text.translate(_UNICODE_SUBSCRIPTS)
+    return _SUBSCRIPT_RE.sub(lambda m: m.group(1) or m.group(2), text)
+
+
+# A query term: a "quoted phrase" (straight or curly quotes) starting a
+# word, or else a run of anything up to whitespace. A quote with no partner,
+# or inside a word (a"b), is literal text, which the tokenizer drops.
+_QUERY_TERM_RE = re.compile(
+    r'(?<!\S)(?:"([^"]*)"|\u201c([^\u201c\u201d]*)\u201d)|(\S+)')
+
+
+def _query_terms(raw: str) -> list[tuple[bool, str, str]]:
+    """Split a raw query into (is_phrase, text, unnormalized text) terms.
+
+    Control characters are dropped first: a NUL terminates the string at
+    the SQLite C layer ("unterminated string"), and the others contribute
+    nothing to a text search. Terms with no letter or digit are dropped.
+    """
+    cleaned = "".join(ch for ch in raw if ch >= " " or ch in "\t\n\r")
+    terms = []
+    for m in _QUERY_TERM_RE.finditer(cleaned):
+        phrase = m.group(1) if m.group(1) is not None else m.group(2)
+        orig = phrase if phrase is not None else m.group(3)
+        if phrase is not None:
+            orig = " ".join(orig.split())
+        if not any(ch.isalnum() for ch in orig.rstrip("*")):
+            continue  # "*", "&", "--", "": nothing the tokenizer would index
+        terms.append((phrase is not None, fts_text(orig), orig))
+    return terms
+
+
 def _fts_query(raw: str, broad: bool = False) -> str:
     """Turn a raw user query into a safe FTS5 MATCH expression.
 
-    Each whitespace-separated token is wrapped as a quoted string literal so
-    FTS5 query operators in user input (-, :, parentheses, the bare keywords
-    AND/OR/NOT/NEAR) are treated as ordinary text rather than crashing the
-    parser. A token ending in * is a prefix query (catal* matches catalysis).
+    A "quoted phrase" is searched as a phrase: its words in that order,
+    next to each other. A quote with no partner is ignored.
+    Every other whitespace-separated token is wrapped as a quoted string
+    literal so FTS5 query operators in user input (-, :, parentheses, the
+    bare keywords AND/OR/NOT/NEAR) are treated as ordinary text rather than
+    crashing the parser. A token ending in * is a prefix query (catal*
+    matches catalysis); a * inside a phrase is not.
     The porter tokenizer stems indexed words and the prefix alike, and a
     stem can be shorter than the prefix ("oxidation" is indexed as "oxid",
     so oxidat* finds nothing) or differ from it ("catalys" stems to
@@ -218,6 +273,9 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     A token with no letter or digit in it ("&", "-", "/", an en dash) is
     dropped: the tokenizer reads it as an empty phrase, which, ANDed with
     the rest, would make every search return nothing.
+    Chemical subscripts are joined as in the index (see fts_text). A term
+    that changes is also asked for as typed, so CO_2 still finds articles
+    in an index built before subscripts were joined.
 
     The match is limited to the title and content columns: the path column
     holds ".crucible/wiki/concepts/x.org", whose words would otherwise match
@@ -227,18 +285,20 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     Returns "" when the query has no usable tokens, in which case callers
     should skip the search and return no results.
     """
-    # Drop NUL and other control characters first: a NUL terminates the string
-    # at the SQLite C layer ("unterminated string"), and other control chars
-    # contribute nothing to a text search. Tab/newline/CR are left for split().
-    cleaned = "".join(ch for ch in raw if ch >= " " or ch in "\t\n\r")
     terms = []
-    for token in cleaned.split():
-        stem = token.rstrip("*")
-        if not any(ch.isalnum() for ch in stem):
-            continue  # "*", "&", "--": nothing the tokenizer would index
-        if stem == token:
-            terms.append(_fts_literal(token))
-        else:
+    for is_phrase, token, orig in _query_terms(raw):
+        if is_phrase:
+            term = _fts_literal(token)
+            if orig != token:
+                term = f"({term} OR {_fts_literal(orig)})"
+            terms.append(term)
+            continue
+        alts = []
+        for tok in dict.fromkeys((token, orig)):
+            stem = tok.rstrip("*")
+            if stem == tok:
+                alts.append(_fts_literal(tok))
+                continue
             # Only the last word of the token is the prefix ("a-b*" is the
             # phrase a, then a word starting with b); cut it to two characters.
             # The full prefix is asked for too, so rows that match it rank
@@ -246,9 +306,11 @@ def _fts_query(raw: str, broad: bool = False) -> str:
             last = re.search(r"[^\W_]+$", stem)
             if broad and last and len(last.group(0)) > 2:
                 short = stem[:last.start() + 2]
-                terms.append(f"({_fts_literal(stem)}* OR {_fts_literal(short)}*)")
+                alts.append(f"{_fts_literal(stem)}* OR {_fts_literal(short)}*")
             else:
-                terms.append(f"{_fts_literal(stem)}*")
+                alts.append(f"{_fts_literal(stem)}*")
+        terms.append(alts[0] if len(alts) == 1 and " OR " not in alts[0]
+                     else "(" + " OR ".join(alts) + ")")
     if not terms:
         return ""
     # Explicit AND: FTS5 allows implicit AND only between plain phrases.
@@ -263,13 +325,14 @@ def _fold(text: str) -> str:
 
 def _fts_prefix_res(raw: str) -> list[re.Pattern]:
     """For each prefix token (catal*) in a query, a pattern for a word starting with it."""
-    cleaned = "".join(ch for ch in raw if ch >= " " or ch in "\t\n\r")
     patterns = []
-    for token in cleaned.split():
+    for is_phrase, token, _orig in _query_terms(raw):
         stem = token.rstrip("*")
-        if stem != token and any(ch.isalnum() for ch in stem):
+        if not is_phrase and stem != token:
             # A word starts after anything that is not a letter or digit
             # (unicode61 splits words there, underscores included).
+            # A quote left open ("catal*) is not part of the word.
+            stem = re.sub(r"^[\W_]+", "", stem)
             patterns.append(re.compile(r"(?<![^\W_])" + re.escape(_fold(stem))))
     return patterns
 
@@ -303,7 +366,9 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
     for query_match in dict.fromkeys((match, _fts_query(query, broad=True))):
         for row in conn.execute(sql, (query_match,)):
             r = dict(row)
-            text = _fold(f"{r.pop('_fts_title') or ''}\n{r.pop('_fts_content') or ''}")
+            # fts_text: the index may predate joined subscripts (a peer's).
+            text = _fold(fts_text(
+                f"{r.pop('_fts_title') or ''}\n{r.pop('_fts_content') or ''}"))
             if r["id"] in seen or not all(p.search(text) for p in prefixes):
                 continue
             seen.add(r["id"])
@@ -374,8 +439,10 @@ class CrucibleDB:
         """Run the migrations from version `current` up to SCHEMA_VERSION."""
         if current < 2:
             self._migrate_v2()
+        if current < 3:
+            self._migrate_v3()
         # Future migrations:
-        # if current < 3: self._migrate_v3()
+        # if current < 4: self._migrate_v4()
 
     def _migrate_v2(self):
         """v2: Drop peers table (replaced by global registry)."""
@@ -384,6 +451,22 @@ class CrucibleDB:
             "INSERT OR IGNORE INTO schema_version (version) VALUES (2)"
         )
         self.conn.commit()
+
+    def _migrate_v3(self):
+        """v3: Reindex article text with chemical subscripts joined (fts_text)."""
+        with self.conn.transaction():
+            rows = self.conn.execute(
+                "SELECT rowid, title, content FROM article_fts").fetchall()
+            for row in rows:
+                title, content = fts_text(row["title"]), fts_text(row["content"])
+                if (title, content) != (row["title"], row["content"]):
+                    self.conn.execute(
+                        "UPDATE article_fts SET title = ?, content = ? WHERE rowid = ?",
+                        (title, content, row["rowid"]),
+                    )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (3)"
+            )
 
     def schema_version(self) -> int:
         """Return the current schema version."""
@@ -608,7 +691,7 @@ class CrucibleDB:
         # row with the file, and a missing row reads as a change.
         self.conn.execute(
             "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
-            (article_id, path, title, content),
+            (article_id, path, fts_text(title), fts_text(content)),
         )
         self.conn.commit()
         return article_id
@@ -655,12 +738,15 @@ class CrucibleDB:
         self.conn.execute("DELETE FROM article_fts WHERE rowid = ?", (article_id,))
         self.conn.execute(
             "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
-            (article_id, path, title, content),
+            (article_id, path, fts_text(title), fts_text(content)),
         )
         self.conn.commit()
 
     def get_article_fts(self, article_id: int) -> dict | None:
-        """Return the indexed path, title and content of an article."""
+        """Return the indexed path, title and content of an article.
+
+        The title and content are as indexed, so passed through fts_text.
+        """
         row = self.conn.execute(
             "SELECT path, title, content FROM article_fts WHERE rowid = ?",
             (article_id,),

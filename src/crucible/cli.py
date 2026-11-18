@@ -16,7 +16,7 @@ import click
 
 from crucible import package_version
 from crucible import registry as registry_module
-from crucible.database import CrucibleDB
+from crucible.database import CrucibleDB, fts_text
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source, read_bib_text, write_bib_text
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
@@ -1126,10 +1126,16 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                     "abstract": meta.properties.get("ABSTRACT", ""),
                 }
                 indexed = db.get_article_fts(article_id)
+                current = {"path": rel_path, "title": fts_text(meta.title),
+                           "content": fts_text(meta.content)}
+                # A row indexed before subscripts were joined (fts_text)
+                # holds the file's text as is: the file is unchanged, but
+                # the row is reindexed below.
+                stale_index = indexed != current and indexed == {
+                    "path": rel_path, "title": meta.title, "content": meta.content}
                 changed = (
                     any(existing[k] != v for k, v in fields.items())
-                    or indexed != {"path": rel_path, "title": meta.title,
-                                   "content": meta.content}
+                    or (indexed != current and not stale_index)
                 )
                 # Only rewrite articles whose file changed, so updated_at
                 # records real edits and unchanged articles keep their
@@ -1139,6 +1145,8 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                     db.update_article(article_id, **fields)
                     db.update_article_fts(article_id, rel_path, meta.title, meta.content)
                     db.delete_embedding(article_id)
+                elif stale_index:
+                    db.update_article_fts(article_id, rel_path, meta.title, meta.content)
                 # Dates from properties are applied on their own, so a DB
                 # whose dates predate this (every :CREATED: article on
                 # upgrade) is corrected without dropping embeddings.
