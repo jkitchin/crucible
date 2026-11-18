@@ -2581,7 +2581,15 @@ def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path
             data[src_path] = src_path.read_bytes()
         except OSError as exc:
             raise click.ClickException(f"Cannot read {src_path}: {exc}") from exc
-        copies = [c for c in existing_copies(dest) if c not in used]
+        copies = existing_copies(dest)
+        # name_N.org may be a renamed copy an earlier merge made of the
+        # target's own name.org (merged A into B, now merging B back into
+        # A), so the base name and its copies are candidates too.
+        renamed = re.fullmatch(r"(.+)_[0-9]+", dest.stem)
+        if renamed:
+            base = dest.with_name(renamed.group(1) + dest.suffix)
+            copies += [c for c in existing_copies(base) if c not in copies]
+        copies = [c for c in copies if c not in used]
         contents = {}
         for copy in copies:
             try:
@@ -2969,6 +2977,32 @@ class _MergeConflict(Exception):
     """A single reason an incoming source cannot be merged safely."""
 
 
+class _MergeRollback(Exception):
+    """Raised to roll back a transaction opened only to look ahead."""
+
+
+def _merge_target_sources(root: Path, target_db: CrucibleDB) -> list[dict]:
+    """The target's source rows, with the files in sources/notebooks/ and
+    sources/data/ keyed as the sync after the merge (or a rebuild) keys them.
+
+    The database may predate files added since the last sync, and a key a
+    file there will take is as taken as one in the database. The disk scan
+    sync runs is applied in a transaction that is rolled back, so nothing
+    is written.
+    """
+    from crucible.ingest import upsert_sources_from_disk
+
+    rows: list[dict] = []
+    try:
+        with target_db.conn.transaction():
+            upsert_sources_from_disk(root, target_db)
+            rows = target_db.list_sources()
+            raise _MergeRollback
+    except _MergeRollback:
+        pass
+    return rows
+
+
 def _plan_source_merge(
     source_root: Path, root: Path, source_db: CrucibleDB, target_db: CrucibleDB
 ) -> _MergePlan:
@@ -3007,7 +3041,7 @@ def _plan_source_merge(
     if source_bib.exists():
         plan.bib_macros = bibtex.macro_blocks(read_bib_text(source_bib))
 
-    target_sources = target_db.list_sources()
+    target_sources = _merge_target_sources(root, target_db)
     # Real paths already taken in the target, plus every path planned below.
     reserved = {os.path.realpath(root / s["path"]) for s in target_sources}
     target_by_key: dict[str, list[dict]] = {}
@@ -3076,7 +3110,9 @@ def _plan_source_merge(
                 )
 
             src_text = src_file.with_suffix(".txt")
-            if src_text == src_file or not src_text.exists():
+            # A .txt source (in any case: NOTES.TXT on a case-insensitive disk)
+            # is its own text, not a source with a sidecar.
+            if src_file.suffix.lower() == ".txt" or not src_text.exists():
                 src_text = None
             private = not bool(src["shareable"])
 
@@ -3182,6 +3218,22 @@ def _plan_source_merge(
                 plan.warnings.append(
                     f"bibliography-only source '{cite_key}' has no source file."
                 )
+        if (
+            cite_key not in target_entries
+            and cite_key not in mapped_keys
+            and cite_key in target_by_key
+        ):
+            # The target has a source with this key but no entry for it (a
+            # file in sources/notebooks/ or sources/data/, keyed by its
+            # name). Adding the entry would hand the key, and the target
+            # articles citing it, to this reference.
+            problems.append(
+                f"Cannot safely merge bibliography entry '{cite_key}': the target "
+                f"source '{target_by_key[cite_key][0]['path']}' already has this "
+                "citation key, and the entry would take it over. Rename the key "
+                "in the source crucible, sync it, and merge again."
+            )
+            continue
         if cite_key in target_entries:
             if cite_key in copied_keys:
                 # The target has the reference but no source for it. Attach
@@ -3362,31 +3414,59 @@ def _merge_source_metadata(source: dict) -> tuple[dict, str | None]:
     return metadata, cite_key
 
 
+# The parts of a crucible's layout that may be symlinks to another drive or
+# a synced folder (a large, gitignored sources/external/, say), relative to
+# .crucible/. The private ones (sources/external/) come last.
+_MERGE_PRIVATE_DIRS = ("sources/external", "sources/external/pdfs", "sources/external/web")
+_MERGE_LAYOUT_DIRS = (".", "sources") + _MERGE_PRIVATE_DIRS
+
+
+def _merge_inside(path: Path, root: Path, names: tuple[str, ...]) -> bool:
+    """Whether path is in one of the named directories of root's .crucible/.
+
+    Lexically first, as ingest and _cdir_relative compare paths, so a layout
+    directory that is a symlink to another drive still counts as inside,
+    and ``..`` cannot escape. Then resolved: the file must really be where
+    one of the named directories really is, so any other symlink in the
+    tree that points out of the crucible (or from shareable into private
+    sources) does not count.
+    """
+    base = root / CRUCIBLE_DIR
+    lexical = Path(os.path.normpath(os.path.abspath(path)))
+    if not any(
+        lexical.is_relative_to(os.path.normpath(os.path.abspath(base / name)))
+        for name in names
+    ):
+        return False
+    real = Path(os.path.realpath(path))
+    return any(real.is_relative_to(os.path.realpath(base / name)) for name in names)
+
+
 def _check_merge_copy(
     source: Path, destination: Path, source_root: Path, target_root: Path, *, private: bool
 ) -> None:
     """Refuse copies that leave either crucible or publish private files."""
     if not source.is_file():
         raise _MergeConflict(f"Cannot safely merge '{source}': not a regular file.")
-    source_root = source_root.resolve()
-    target_root = target_root.resolve()
-    source_path = source.resolve()
-    destination_path = destination.resolve()
-    if not source_path.is_relative_to(source_root / CRUCIBLE_DIR):
+    if not _merge_inside(source, source_root, _MERGE_LAYOUT_DIRS):
         raise _MergeConflict(
             f"Cannot safely merge '{source}': it resolves outside the source crucible."
         )
-    if not destination_path.is_relative_to(target_root / CRUCIBLE_DIR):
+    if not _merge_inside(destination, target_root, _MERGE_LAYOUT_DIRS):
         raise _MergeConflict(
             f"Cannot safely merge '{destination}': it resolves outside the target crucible."
         )
-    source_private = source_root / CRUCIBLE_DIR / "sources/external"
-    target_private = target_root / CRUCIBLE_DIR / "sources/external"
-    if (
-        (private or source_path.is_relative_to(source_private)
-         or Path(os.path.abspath(source)).is_relative_to(source_private))
-        and not destination_path.is_relative_to(target_private)
-    ):
+    # Private when stored under sources/external/, or linked to a file there.
+    source_cdir = source_root / CRUCIBLE_DIR
+    real_source = Path(os.path.realpath(source))
+    is_private = (
+        private
+        or Path(os.path.normpath(os.path.abspath(source))).is_relative_to(
+            os.path.normpath(os.path.abspath(source_cdir / _MERGE_PRIVATE_DIRS[0])))
+        or any(real_source.is_relative_to(os.path.realpath(source_cdir / name))
+               for name in _MERGE_PRIVATE_DIRS)
+    )
+    if is_private and not _merge_inside(destination, target_root, _MERGE_PRIVATE_DIRS):
         raise _MergeConflict(
             f"Cannot safely merge '{source}': a private file would be copied to "
             "a shareable path. In the source crucible, move it under "
@@ -5187,14 +5267,49 @@ def _install(root: Path | None, directive: bool, register: bool = True) -> None:
                 claude_md.write_text(updated, encoding="utf-8")
                 click.echo(f"  CLAUDE.md: updated existing directive")
         else:
-            claude_md.write_text(existing.rstrip() + "\n" + directive_text, encoding="utf-8")
+            # A blank line before the block, unless nothing precedes it.
+            updated = (existing.rstrip() + "\n" + directive_text if existing.strip()
+                       else directive_text.lstrip("\n"))
+            claude_md.write_text(updated, encoding="utf-8")
             click.echo(f"  CLAUDE.md: added directive")
     else:
         claude_md.parent.mkdir(parents=True, exist_ok=True)
-        claude_md.write_text(directive_text, encoding="utf-8")
+        # The block starts the file: no empty first line.
+        claude_md.write_text(directive_text.lstrip("\n"), encoding="utf-8")
         click.echo(f"  CLAUDE.md: created with directive")
 
     click.echo(f"\nCrucible installed. Restart Claude Code to pick up the skill.")
+
+
+def _remove_marker_blocks(text: str, marker: str) -> tuple[str, int]:
+    """text without the marker...marker blocks, and how many were removed.
+
+    A block on lines of its own goes with its line end, so the lines before
+    and after it stay separate lines, and a blank line on each side (the one
+    install puts before the block, say) becomes one blank line, not two. A
+    block that shares a line with other text leaves that text's line end.
+    """
+    pattern = re.compile(re.escape(marker) + r".*?" + re.escape(marker), re.DOTALL)
+    pieces, pos, count = [], 0, 0
+    for block in pattern.finditer(text):
+        before = "".join(pieces) + text[pos:block.start()]
+        if not before.strip("\r\n"):
+            before = ""   # only the empty first line earlier installs wrote
+        after_start = block.end()
+        if before == "" or before.endswith("\n"):
+            # The block starts a line: its line end goes with it.
+            if text.startswith("\r\n", after_start):
+                after_start += 2
+            elif text.startswith("\n", after_start):
+                after_start += 1
+            # A blank line on both sides (or one at the start) collapses.
+            if (before == "" or before.endswith(("\n\n", "\n\r\n"))) and (
+                text.startswith("\n", after_start)
+                or text.startswith("\r\n", after_start)
+            ):
+                after_start += 2 if text.startswith("\r\n", after_start) else 1
+        pieces, pos, count = [before], after_start, count + 1
+    return "".join(pieces) + text[pos:], count
 
 
 @cli.command()
@@ -5254,11 +5369,7 @@ def uninstall():
     if claude_md.exists():
         existing = claude_md.read_text(encoding="utf-8")
         if marker in existing:
-            pattern = re.compile(
-                r"\n?" + re.escape(marker) + r".*?" + re.escape(marker) + r"\n?",
-                re.DOTALL,
-            )
-            updated, count = pattern.subn("", existing)
+            updated, count = _remove_marker_blocks(existing, marker)
             if existing.count(marker) % 2:
                 count = 0  # an unpaired marker: do not guess where the block ends
             if count:
