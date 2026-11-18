@@ -472,3 +472,38 @@ def test_front_matter_title_is_read_as_yaml(tmp_path, front, want):
     text = f"---\n{front}\n---\n\n# Heading\n\nBody.\n"
     p.write_text(text)
     assert ingest_module.declared_title(p, text) == want
+
+
+def test_url_page_with_a_bibtex_url_is_restored_by_the_same_ingest(kb, web):  # noqa: F811
+    # --bibtex sets the source's url field to its own url; running the same
+    # command again on a fresh clone restores the page, as on main.
+    url = "https://ex.example.com/canon"
+    web[url] = b"<html><head><title>Canon page</title></head><body>Canon.</body></html>"
+    entry = "@misc{canon, title={Canon page}, url={https://canonical.example.org/canon}}"
+    run("ingest", url, "--bibtex", entry)
+    _fresh_clone(kb)
+    result = run("ingest", url, "--bibtex", entry)
+    assert "restored" in result.output
+    assert list((kb / WEB).glob("*.html"))
+    # Another site's page under the same name is still refused.
+    other = "https://other.example.com/canon"
+    web[other] = b"<html><head><title>Canon page</title></head><body>Other.</body></html>"
+    _fresh_clone(kb)
+    result = run("ingest", other, ok=False)
+    assert result.exit_code != 0 and "comes from" in result.output
+
+
+def test_bibtex_url_does_not_vouch_for_a_different_file(kb, tmp_path):  # noqa: F811
+    # The --bibtex entry given again says nothing about the file: a
+    # different page under the same name is still checked by its title.
+    entry = "@misc{loc, title={Local page}, url={https://canon.example.org/local}}"
+    p = tmp_path / "p.html"
+    p.write_text("<html><head><title>Local page</title></head><body>Mine.</body></html>")
+    args = ["--url", "https://x.example.com/local", "--bibtex", entry]
+    run("ingest", str(p), *args)
+    _fresh_clone(kb)
+    p.write_text("<html><head><title>Other page</title></head><body>Not mine.</body></html>")
+    result = run("ingest", str(p), *args, ok=False)
+    assert result.exit_code != 0
+    assert "nothing shows it is that source" in result.output
+    assert not (kb / WEB / "p.html").exists()
