@@ -106,7 +106,8 @@ crucible ingest <path> [--type TYPE] [-t "Title"] [--date YYYY-MM-DD] [-a "Autho
 
 Ingest copies the source into `.crucible/sources/` and appends a BibTeX entry
 to `.crucible/references.bib`. Give `--doi` when you know it: the complete
-entry is fetched from doi.org (a DOI found in the text is used too). Use
+entry is fetched from doi.org (a DOI found near the start of a PDF or web
+page is used too, when its title matches; never one in a deck or Word file). Use
 `--bibtex` to supply an entry yourself. Ingest prints the **cite key**
 (e.g. `smith2024`, or `smith2024a` when that key is taken). That key is what
 goes in `SOURCE_KEYS` and in `cite:` links. The entry's `file` field records

@@ -115,7 +115,11 @@ _PLAIN_LINK_RE = re.compile(
 _BARE_LINK_RE = re.compile(r"\[\[(https?://[^\]]+)\]\]")
 # A bare URL in prose. Trailing sentence punctuation is not part of it; a
 # trailing ')' is, only when it closes a '(' in the URL (see _bare_url).
-_URL_RE = re.compile(r"(?<![\w\"'=/])https?://[^\s<>\[\]\"']*[^\s<>\[\]\"'.,;:!?]")
+# A URL also ends at \x00/\x01, the delimiters of the placeholders that
+# hold links and citations already rendered (see _process_inline).
+_URL_RE = re.compile(
+    r"(?<![\w\"'=/])https?://[^\s<>\[\]\"'\x00\x01]*[^\s<>\[\]\"'.,;:!?\x00\x01]"
+)
 # Org emphasis boundaries: a marker opens after whitespace or one of -('"{
 # and closes before whitespace or one of -.,:!?;'")}[ (the \x00/\x01
 # placeholder delimiters count as boundaries too). Without these, the
