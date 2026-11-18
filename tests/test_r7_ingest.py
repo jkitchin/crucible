@@ -1,0 +1,474 @@
+"""Regression tests for the seventh review round: ingest."""
+
+import json
+import signal
+import threading
+
+import pytest
+from test_data_loss_ingest import kb, run  # noqa: F401
+
+from crucible import cli as cli_module
+from crucible import ingest as ingest_module
+from crucible.database import CrucibleDB
+
+DOI = "10.1021/acscatal.5b00001"
+FETCHED = ("@article{Smith_2015, title={Oxygen evolution on perovskite oxides}, "
+           "author={Smith, Jane and Doe, John}, journal={ACS Catal.}, year={2015}, "
+           "doi={%s}}" % DOI)
+WEB = ".crucible/sources/external/web"
+
+
+@pytest.fixture
+def doi_lookup(monkeypatch):
+    monkeypatch.setattr(ingest_module, "fetch_bibtex_from_doi",
+                        lambda doi, timeout=10.0: FETCHED if doi.casefold() == DOI.casefold() else None)
+
+
+def bib(root):
+    return (root / ".crucible/references.bib").read_text()
+
+
+def rows(root):
+    db = CrucibleDB(root / ".crucible" / "crucible.db")
+    try:
+        return {src["path"]: src for src in db.list_sources()}
+    finally:
+        db.close()
+
+
+@pytest.fixture
+def alarm():
+    """Fail, rather than hang, if a command loops."""
+    def boom(*_):
+        raise TimeoutError("still running after 10 s")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(10)
+    yield
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, old)
+
+
+def case_insensitive(path):
+    probe = path / "CaseProbe"
+    probe.write_text("")
+    try:
+        return (path / "caseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+# 1. a markdown note that cites a DOI is not filed as the cited paper ----------
+
+NOTE_BODY = (f"We compared our OER data with {DOI} and found lower "
+             "overpotentials.\n")
+
+
+@pytest.mark.parametrize("text", [
+    "---\ntitle: Group meeting 2026-11-10\n---\n\n## Discussion\n\n" + NOTE_BODY,
+    "## Discussion\n\n" + NOTE_BODY,
+    NOTE_BODY,
+])
+def test_markdown_note_citing_a_doi_is_not_that_paper(kb, tmp_path, doi_lookup, text):  # noqa: F811
+    (tmp_path / "group-meeting-notes.md").write_text(text)
+    result = run("ingest", str(tmp_path / "group-meeting-notes.md"))
+    assert "Ignored DOI" in result.output
+    assert DOI not in bib(kb) and "smith2015" not in bib(kb).lower()
+    assert "Oxygen evolution" not in bib(kb)
+
+
+def test_stdin_note_citing_a_doi_is_not_that_paper(kb, doi_lookup):  # noqa: F811
+    result = run("ingest", "-", input=NOTE_BODY)
+    assert "Ignored DOI" in result.output
+    assert DOI not in bib(kb) and "Oxygen evolution" not in bib(kb)
+
+
+@pytest.mark.parametrize("text", [
+    f"Oxygen evolution on perovskite oxides\n\nJane Smith, John Doe\n\ndoi: {DOI}\n",
+    f"Computer Science\n\n# Title:Oxygen evolution on perovskite oxides\n\n"
+    f"https://doi.org/{DOI}\n",
+])
+def test_page_without_citation_metadata_does_not_guess_its_doi(
+        kb, tmp_path, doi_lookup, text):  # noqa: F811
+    (tmp_path / "page.md").write_text(text)
+    result = run("ingest", str(tmp_path / "page.md"))
+    assert "Ignored DOI" in result.output
+    assert DOI not in bib(kb)
+
+
+TITLE = "Oxygen evolution on perovskite oxides"
+
+
+@pytest.mark.parametrize("name, text", [
+    ("article.html",
+     f"<html><head><title>{TITLE} | ACS Catalysis</title>"
+     f'<meta name="citation_doi" content="{DOI}"></head><body>'
+     f"<h1>{TITLE}</h1><p>https://doi.org/{DOI}</p></body></html>"),
+    ("article2.htm",
+     f"<html><head><meta name='dc.identifier' content='doi:{DOI.upper()}'>"
+     f"<title>ACS Catalysis - {TITLE}</title></head><body>doi:{DOI}</body></html>"),
+])
+def test_page_that_declares_its_own_doi_keeps_it(kb, tmp_path, doi_lookup, name, text):  # noqa: F811
+    p = tmp_path / name
+    p.write_text(text)
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI in bib(kb)
+
+
+@pytest.mark.parametrize("name, text", [
+    ("hn.html", f"<html><head><title>{TITLE} | Hacker News</title></head>"
+                f"<body><a href='https://doi.org/{DOI}'>{TITLE}</a></body></html>"),
+    ("yt.html", f"<html><head><title>{TITLE} - YouTube</title></head>"
+                f"<body>https://doi.org/{DOI}</body></html>"),
+    ("summary.md", f"# Paper summary - {TITLE}\n\nhttps://doi.org/{DOI}\n"),
+    ("other.html", f"<html><head><title>Something else</title>"
+                   f'<meta name="citation_doi" content="10.1000/other"></head>'
+                   f"<body>https://doi.org/{DOI}</body></html>"),
+])
+def test_page_about_a_paper_does_not_take_its_doi(kb, tmp_path, doi_lookup, name, text):  # noqa: F811
+    p = tmp_path / name
+    p.write_text(text)
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
+
+
+def test_note_titled_about_a_paper_does_not_take_its_doi(kb, tmp_path, doi_lookup):  # noqa: F811
+    p = tmp_path / "note.md"
+    p.write_text(f"# Notes on {TITLE}\n\nSee https://doi.org/{DOI}\n")
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
+    assert "Ignored DOI" in result.output
+
+
+def test_note_citing_a_missing_sources_doi_is_not_restored_as_it(kb, tmp_path, doi_lookup):  # noqa: F811
+    # The row for web/notes.md was rebuilt from its entry (a fresh clone):
+    # a different notes.md that only cites that paper's DOI is not it.
+    (kb / ".crucible/references.bib").write_text(
+        "@article{smith2015, title={Oxygen evolution on perovskite oxides}, "
+        f"author={{Smith, Jane}}, year={{2015}}, doi={{{DOI}}}, file={{{WEB}/notes.md}}}}\n")
+    run("sync")
+    assert f"{WEB}/notes.md" in rows(kb)
+    (tmp_path / "notes.md").write_text(NOTE_BODY)
+    result = run("ingest", str(tmp_path / "notes.md"), ok=False)
+    assert result.exit_code != 0
+    assert not (kb / WEB / "notes.md").exists()
+
+
+# 2. an upper-case .TXT is its own text ---------------------------------------
+
+def test_upper_case_txt_is_ingested_without_hanging(kb, tmp_path, alarm):  # noqa: F811
+    (tmp_path / "NOTES.TXT").write_text("Field notes from the reactor run.\n")
+    run("ingest", str(tmp_path / "NOTES.TXT"))
+    stored = sorted(p.name for p in (kb / WEB).iterdir())
+    assert stored == ["NOTES.TXT"]
+    assert (kb / WEB / "NOTES.TXT").read_text() == "Field notes from the reactor run.\n"
+
+
+def test_upper_case_txt_is_not_its_own_sidecar(kb, tmp_path):  # noqa: F811
+    if not case_insensitive(tmp_path):
+        pytest.skip("needs a case-insensitive filesystem")
+    disk = kb / WEB / "NOTES.TXT"
+    disk.parent.mkdir(parents=True, exist_ok=True)
+    disk.write_text("Field notes.\n")
+    db = CrucibleDB(kb / ".crucible" / "crucible.db")
+    try:
+        src = {"path": f"{WEB}/NOTES.TXT", "metadata": json.dumps({})}
+        assert not cli_module._is_own_sidecar(kb, db, src, disk, disk.with_suffix(".txt"))
+    finally:
+        db.close()
+
+
+def test_name_search_is_bounded(kb, tmp_path, monkeypatch, alarm):  # noqa: F811
+    monkeypatch.setattr(ingest_module, "_MAX_NAME_TRIES", 5)
+    monkeypatch.setattr(ingest_module, "_claim", lambda path, created: False)
+    (tmp_path / "paper.md").write_text("# A paper\n\nbody\n")
+    result = run("ingest", str(tmp_path / "paper.md"), ok=False)
+    assert result.exit_code != 0
+    assert "free name" in result.output
+
+
+# 3. a sync during an ingest does not lose the source ---------------------------
+
+def test_sync_during_ingest_waits_for_the_row(kb, tmp_path, monkeypatch):  # noqa: F811
+    real = ingest_module.append_bib_entry_unique_key
+    syncs = []
+
+    def sync():
+        other = CrucibleDB(kb / ".crucible" / "crucible.db")
+        try:
+            ingest_module.reconcile_sources(kb, other)
+        finally:
+            other.close()
+
+    def append_then_sync(root, db, base, entry):
+        key = real(root, db, base, entry)
+        # A concurrent `crucible sync`, given a second to run in the window
+        # between the entry and the row.
+        thread = threading.Thread(target=sync)
+        thread.start()
+        thread.join(timeout=1.0)
+        syncs.append(thread)
+        return key
+
+    monkeypatch.setattr(ingest_module, "append_bib_entry_unique_key", append_then_sync)
+    (tmp_path / "paper.md").write_text("# A study of things\n\nbody\n")
+    run("ingest", str(tmp_path / "paper.md"))
+    for thread in syncs:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+    monkeypatch.setattr(ingest_module, "append_bib_entry_unique_key", real)
+
+    row = rows(kb)[f"{WEB}/paper.md"]
+    key = json.loads(row["metadata"])["cite_key"]
+    assert key in bib(kb)
+    assert (kb / WEB / "paper.md").exists()
+    run("sync")
+    assert f"{WEB}/paper.md" in rows(kb) and key in bib(kb)
+
+
+def test_disk_scan_row_made_during_ingest_is_adopted(kb, tmp_path, monkeypatch):  # noqa: F811
+    # A sync after the notebook is copied but before its entry is written
+    # indexes it from the disk scan; ingest takes that row over.
+    real = ingest_module.append_bib_entry_unique_key
+
+    def sync_then_append(root, db, base, entry):
+        other = CrucibleDB(root / ".crucible" / "crucible.db")
+        try:
+            ingest_module.reconcile_sources(root, other)
+        finally:
+            other.close()
+        return real(root, db, base, entry)
+
+    monkeypatch.setattr(ingest_module, "append_bib_entry_unique_key", sync_then_append)
+    (tmp_path / "notes.org").write_text("#+TITLE: Lab notes\n\nfirst run\n")
+    result = run("ingest", str(tmp_path / "notes.org"), "--type", "notebook")
+    monkeypatch.setattr(ingest_module, "append_bib_entry_unique_key", real)
+
+    path = ".crucible/sources/notebooks/notes.org"
+    (row,) = [r for p, r in rows(kb).items() if p == path]
+    metadata = json.loads(row["metadata"])
+    assert "content_hash" in metadata and "disk_scan" not in metadata
+    assert metadata["cite_key"] in bib(kb)
+    assert f"citep:{metadata['cite_key']}" in result.output
+
+
+def test_restore_into_a_row_without_a_bib_entry_is_refused(kb, tmp_path):  # noqa: F811
+    (kb / ".crucible/references.bib").write_text(
+        "@misc{study2026, title={A study of things}, year={2026}, "
+        f"file={{{WEB}/paper.md}}}}\n")
+    run("sync")
+    assert f"{WEB}/paper.md" in rows(kb)
+    # The entry is removed (an interrupted ingest, or by hand) before a
+    # sync drops the row: restoring into it would leave a source with no
+    # entry, which the next sync removes.
+    (kb / ".crucible/references.bib").write_text("")
+    (tmp_path / "paper.md").write_text("# A study of things\n\nbody\n")
+    result = run("ingest", str(tmp_path / "paper.md"), ok=False)
+    assert result.exit_code != 0
+    assert "no entry" in result.output
+    assert not (kb / WEB / "paper.md").exists()
+
+
+# -- eighth review round --------------------------------------------------------
+
+class _Page:
+    def __init__(self, body):
+        self.body = body
+
+    class headers:
+        get_content_type = staticmethod(lambda: "text/html")
+        get_content_charset = staticmethod(lambda: "utf-8")
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def web(monkeypatch):
+    import urllib.request
+    pages = {}
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=30: _Page(pages[req.full_url]))
+    return pages
+
+
+def test_url_page_about_a_paper_does_not_take_its_doi(kb, doi_lookup, web):  # noqa: F811
+    # URL ingest cuts "| Blog" off the title it names the page by; the
+    # check must still see the page's own <title>.
+    url = "https://blog.example.org/journal-club"
+    web[url] = (f"<html><head><title>{TITLE} | Reading Group Blog</title></head>"
+                f"<body><h1>Our take on {TITLE}</h1><p>doi:{DOI}</p></body></html>").encode()
+    result = run("ingest", url)
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
+    assert "Ignored DOI" in result.output
+
+
+def test_url_publisher_page_keeps_its_doi(kb, doi_lookup, web):  # noqa: F811
+    url = "https://pubs.example.org/doi/abs/x"
+    web[url] = (f"<html><head><title>{TITLE} | ACS Catalysis</title>"
+                f'<meta content="{DOI}" property="citation_doi"></head>'
+                f"<body><h1>{TITLE}</h1><p>doi:{DOI}</p></body></html>").encode()
+    result = run("ingest", url)
+    assert result.exit_code == 0, result.output
+    assert DOI in bib(kb)
+
+
+def test_url_page_is_not_restored_into_another_sites_page(kb, web):  # noqa: F811
+    # Two sites' "Introduction" pages share the stored name; on a fresh
+    # clone the second must not become the first's missing file.
+    rust, python = "https://doc.rust-lang.org/book/intro", "https://docs.python.org/3/intro"
+    web[rust] = b"<html><head><title>Introduction - Rust</title></head><body>Rust.</body></html>"
+    web[python] = b"<html><head><title>Introduction - Python</title></head><body>Py.</body></html>"
+    run("ingest", rust)
+    for p in (kb / WEB).iterdir():
+        p.unlink()
+    (kb / ".crucible/crucible.db").unlink()
+    run("sync")
+    result = run("ingest", python, ok=False)
+    assert result.exit_code != 0
+    assert "comes from" in result.output
+    assert not (kb / WEB / "introduction.html").exists()
+    # The same URL is restored.
+    result = run("ingest", rust)
+    assert "Rust." in (kb / WEB / "introduction.html").read_text()
+
+
+@pytest.mark.parametrize("front", [
+    "---\ntitle: Journal club 2026-11-10\n---\n",
+    "---\nauthor: me\ntitle: \"Journal club\"\n...\n",
+])
+def test_markdown_note_titled_in_front_matter_does_not_take_its_doi(
+        kb, tmp_path, doi_lookup, front):  # noqa: F811
+    p = tmp_path / "reading-notes.md"
+    p.write_text(front + f"\nWe read Smith, {TITLE}, doi:{DOI}.\n")
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
+    assert "Journal club" in bib(kb)
+
+
+@pytest.mark.parametrize("meta", [
+    f'<meta content="{DOI}" name="citation_doi">',
+    f'<meta property="citation_doi" content="{DOI}">',
+    f'<meta name="dc.identifier" content="info:doi/{DOI}">',
+])
+def test_page_declaring_its_doi_in_any_meta_form_keeps_it(
+        kb, tmp_path, doi_lookup, meta):  # noqa: F811
+    p = tmp_path / "article.html"
+    p.write_text(f"<html><head><title>{TITLE} | ACS Catalysis</title>{meta}</head>"
+                 f"<body>doi:{DOI}</body></html>")
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI in bib(kb)
+
+
+def test_failed_ingest_is_undone_before_the_bib_lock_is_released(
+        kb, tmp_path, monkeypatch):  # noqa: F811
+    held = []
+    drop = ingest_module._drop_bib_entry
+
+    def checked_drop(root, key, rel):
+        held.append(ingest_module._bib_lock(root).is_locked)
+        drop(root, key, rel)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ingest_module, "_drop_bib_entry", checked_drop)
+    monkeypatch.setattr(CrucibleDB, "add_source", fail)
+    p = tmp_path / "n.md"
+    p.write_text("# N\n\nx\n")
+    result = run("ingest", str(p), ok=False)
+    assert result.exit_code != 0
+    assert held == [True]
+    assert "@" not in bib(kb)
+    assert not list((kb / WEB).glob("n*"))
+
+
+# -- regressions against main found in the final review --------------------------
+
+def _fresh_clone(kb):  # noqa: F811
+    for p in (kb / WEB).iterdir():
+        p.unlink()
+    for p in (kb / ".crucible").glob("crucible.db*"):
+        p.unlink()
+    run("sync")
+
+
+def test_url_page_with_a_doi_is_restored_by_the_same_ingest(kb, monkeypatch, web):  # noqa: F811
+    # The fetched entry's url is the doi.org link, not the page's.
+    fetched = FETCHED[:-1] + ", url={http://dx.doi.org/%s}}" % DOI
+    monkeypatch.setattr(ingest_module, "fetch_bibtex_from_doi",
+                        lambda doi, timeout=10.0: fetched if doi == DOI else None)
+    url = "https://journal.example.com/articles/oxygen"
+    web[url] = f"<html><head><title>{TITLE}</title></head><body>x</body></html>".encode()
+    run("ingest", url, "--doi", DOI)
+    _fresh_clone(kb)
+    result = run("ingest", url, "--doi", DOI)
+    assert "restored" in result.output
+    assert list((kb / WEB).glob("*.html"))
+
+
+def test_note_titled_by_its_heading_is_restored(kb, tmp_path):  # noqa: F811
+    # Older versions titled a note by its first heading, not its front
+    # matter; its row still has that title on a fresh clone.
+    p = tmp_path / "notes.md"
+    p.write_text("---\ntitle: Kinetics of CO oxidation\n---\n\n# Background\n\nSome notes.\n")
+    run("ingest", str(p), "--title", "Background")
+    _fresh_clone(kb)
+    result = run("ingest", str(p))
+    assert "restored" in result.output
+    assert (kb / WEB / "notes.md").is_file()
+
+
+def test_saved_page_ingested_with_its_doi_is_restored(kb, tmp_path, doi_lookup):  # noqa: F811
+    # The page's <title> is the site's and the paper's title is far down;
+    # its DOI, given at ingest and in its text, shows it, as on main.
+    nav = "".join(f"<li>Menu item number {i} journals books</li>" for i in range(150))
+    p = tmp_path / "article.html"
+    p.write_text(f"<html><head><title>Journal</title></head><body>"
+                 f"<p>https://doi.org/{DOI}</p><ul>{nav}</ul>"
+                 f"<h1>Oxygen evolution on perovskite oxides</h1></body></html>")
+    run("ingest", str(p), "--doi", DOI)
+    _fresh_clone(kb)
+    result = run("ingest", str(p))
+    assert "restored" in result.output
+    assert (kb / WEB / "article.html").is_file()
+
+
+def test_note_with_the_doi_is_told_to_give_it(kb, tmp_path, doi_lookup):  # noqa: F811
+    p = tmp_path / "notes.md"
+    # A note that has the source's DOI may only cite it: it is not taken
+    # for the source without --doi, and the error says so.
+    p.write_text(f"# Reading log\n\nSee doi:{DOI}.\n")
+    run("ingest", str(p), "--doi", DOI)
+    _fresh_clone(kb)
+    result = run("ingest", str(p), ok=False)
+    assert result.exit_code != 0
+    assert f"--doi {DOI}" in result.output
+    result = run("ingest", str(p), "--doi", DOI)
+    assert "restored" in result.output
+
+
+@pytest.mark.parametrize("front, want", [
+    ("title: >-\n  A Folded\n  Title", "Heading"),
+    ("title: |\n  Literal", "Heading"),
+    ("title: 'It''s a Title'", "It's a Title"),
+    ('title: "A \\"quoted\\" title"', 'A "quoted" title'),
+    ("title: Plain title # a comment", "Plain title"),
+    ("title: C# in practice", "C# in practice"),
+])
+def test_front_matter_title_is_read_as_yaml(tmp_path, front, want):
+    p = tmp_path / "n.md"
+    text = f"---\n{front}\n---\n\n# Heading\n\nBody.\n"
+    p.write_text(text)
+    assert ingest_module.declared_title(p, text) == want

@@ -16,7 +16,7 @@ import click
 
 from crucible import package_version
 from crucible import registry as registry_module
-from crucible.database import CrucibleDB
+from crucible.database import CrucibleDB, fts_joined
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source, read_bib_text, write_bib_text
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
@@ -855,6 +855,33 @@ def _alias_target(root: Path, target: Path) -> Path:
     return real if real is not None else target
 
 
+def _wiki_link_on_path(root: Path, path: Path) -> Path | None:
+    """The real path PATH reaches through a symlink alias in the wiki, else None.
+
+    PATH is absolute and as typed. A component of it that is a symlink
+    lying in the wiki and pointing into the wiki makes it an alias, as the
+    wiki walk sees it (see wikiwalk), however the path reaches that link:
+    through the project, another spelling of the root (/tmp for
+    /private/tmp), or a link from outside the project (~/wiki ->
+    .crucible/wiki). A symlinked wiki or project directory is not such a
+    link, so the real path of an article is never an alias.
+    """
+    try:
+        wiki_real = Path(os.path.realpath(cdir(root) / "wiki"))
+        parts = path.parts
+        for i in range(1, len(parts)):
+            q = Path(*parts[:i + 1])
+            if not q.is_symlink():
+                continue
+            where = Path(os.path.realpath(q.parent)) / q.name
+            if (where.is_relative_to(wiki_real) and where != wiki_real
+                    and Path(os.path.realpath(q)).is_relative_to(wiki_real)):
+                return Path(os.path.realpath(path))
+    except OSError:
+        return None
+    return None
+
+
 def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
     """The project-relative path a wiki file link points at, or None.
 
@@ -862,7 +889,17 @@ def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
     name the real location of a symlinked wiki or project, so the resolved
     path is also tried against the resolved wiki and root.
     """
-    target = _alias_target(root, _link_path(org_path, link))
+    return _target_rel(root, _link_path(org_path, link))
+
+
+def _target_rel(root: Path, target: Path) -> str | None:
+    """The project-relative path normalised `target` names, or None.
+
+    A path through a symlink alias in the wiki maps to the article's own
+    path (see _alias_target). None means the target lies outside the
+    project.
+    """
+    target = _alias_target(root, target)
     rel = _safe_relative_to(target, root)
     if rel is not None:
         return rel
@@ -1013,9 +1050,7 @@ def _resolve_derived_from(db: CrucibleDB, root: Path, org_path: Path, ref: str) 
         within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
         article = _find_linked_article(
             db, root,
-            _safe_relative_to(
-                Path(os.path.normpath(cdir(root) / "wiki" / within)), root
-            ),
+            _target_rel(root, Path(os.path.normpath(cdir(root) / "wiki" / within))),
         )
     return article
 
@@ -1126,10 +1161,20 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                     "abstract": meta.properties.get("ABSTRACT", ""),
                 }
                 indexed = db.get_article_fts(article_id)
+                current = {"path": rel_path, "title": meta.title,
+                           "content": meta.content}
+                text_changed = indexed is None or {
+                    k: indexed[k] for k in current} != current
+                # A row of article_fts_joined that is out of date or
+                # missing (the article was indexed by an older version) is
+                # reindexed below, though the file is unchanged.
+                want = fts_joined(meta.title, meta.content)
+                stale_index = (not text_changed and "joined" in indexed
+                               and indexed["joined"] != ((meta.title, meta.content, want)
+                                                         if want else None))
                 changed = (
                     any(existing[k] != v for k, v in fields.items())
-                    or indexed != {"path": rel_path, "title": meta.title,
-                                   "content": meta.content}
+                    or text_changed
                 )
                 # Only rewrite articles whose file changed, so updated_at
                 # records real edits and unchanged articles keep their
@@ -1139,6 +1184,8 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                     db.update_article(article_id, **fields)
                     db.update_article_fts(article_id, rel_path, meta.title, meta.content)
                     db.delete_embedding(article_id)
+                elif stale_index:
+                    db.update_article_fts(article_id, rel_path, meta.title, meta.content)
                 # Dates from properties are applied on their own, so a DB
                 # whose dates predate this (every :CREATED: article on
                 # upgrade) is corrected without dropping embeddings.
@@ -1590,14 +1637,15 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
             click.echo(f"    (absorbed: {', '.join(absorbed)})")
 
 
-def _project_path_candidates(root: Path, path: str) -> list[str]:
+def _project_path_candidates(root: Path, path: str, aliases: bool = True) -> list[str]:
     """Database paths (relative to the project root) that PATH may name.
 
     In order: PATH as given (normalized), relative to the current
     directory or absolute, relative to the wiki (``concepts/x.org``), and
     relative to ``.crucible/`` (``wiki/concepts/x.org``,
     ``sources/data/x.csv``). Raises a ClickException for an empty PATH,
-    which would otherwise match everything.
+    which would otherwise match everything. With aliases=False, a path
+    through a symlink alias in the wiki is not mapped to its article.
     """
     if not path or not path.strip():
         raise click.ClickException("The path is empty.")
@@ -1612,7 +1660,16 @@ def _project_path_candidates(root: Path, path: str) -> list[str]:
     if not given.is_absolute():
         add(os.path.normpath(given.as_posix()).replace(os.sep, "/"))
     absolute = given if given.is_absolute() else Path.cwd() / given
-    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
+    lexical = Path(os.path.abspath(absolute))
+    # The root spelled another way (/tmp for /private/tmp, a symlinked
+    # ~/Dropbox): the ancestor that is the root, with the rest of the path
+    # kept as typed, so a symlink alias inside the wiki is still seen.
+    real_root = os.path.realpath(root)
+    for ancestor in reversed(lexical.parents):
+        if os.path.realpath(ancestor) == real_root:
+            add(lexical.relative_to(ancestor).as_posix())
+            break
+    for target in (lexical, absolute.resolve()):
         for base in (root, root.resolve()):
             rel = _safe_relative_to(target, base)
             if rel is not None:
@@ -1623,17 +1680,25 @@ def _project_path_candidates(root: Path, path: str) -> list[str]:
             # Never let ../ climb out of the project.
             if not normalized.startswith(".."):
                 add(Path(normalized).as_posix())
+    # A path through a symlink alias in the wiki (dft.org ->
+    # concepts/density-functional-theory.org) names the article indexed
+    # under its own path; those come last, after every literal match.
+    for candidate in (list(candidates) if aliases else []):
+        target = Path(os.path.normpath(root / candidate))
+        if _alias_target(root, target) != target:
+            add(_target_rel(root, target))
     return candidates
 
 
-def _lookup_project_path(root: Path, path: str, lookup) -> dict | None:
+def _lookup_project_path(root: Path, path: str, lookup,
+                         aliases: bool = True) -> dict | None:
     """The row lookup(candidate) returns for the first candidate PATH names.
 
     lookup is a database getter such as db.get_article_by_path or
     db.get_source_by_path. See _project_path_candidates for the path forms
     accepted. Returns None if no candidate matches.
     """
-    for candidate in _project_path_candidates(root, path):
+    for candidate in _project_path_candidates(root, path, aliases):
         row = lookup(candidate)
         if row:
             return row
@@ -1992,7 +2057,7 @@ def _write_viz(root: Path, db: CrucibleDB,
     if output is None:
         output = cdir(root) / "wiki" / "viz.html"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(html, encoding="utf-8")
+    _replace_file(output, html)
     return output, n_nodes, n_edges
 
 
@@ -2164,7 +2229,10 @@ def _is_own_sidecar(root: Path, db, src: dict, disk_path: Path, sidecar: Path) -
     """
     from crucible.ingest import extract_text, file_sha256
 
-    if sidecar == disk_path or not sidecar.is_file():
+    # NOTES.TXT's sidecar name NOTES.txt is the source itself on a
+    # case-insensitive filesystem, so the suffix is compared without case.
+    if (sidecar == disk_path or disk_path.suffix.lower() == ".txt"
+            or not sidecar.is_file()):
         return False
     sidecar_rel = _safe_relative_to(sidecar, root)
     if sidecar_rel is not None and db.get_source_by_path(sidecar_rel) is not None:
@@ -2206,7 +2274,30 @@ def delete(path, yes, delete_file):
     # source, not an article whose path merely contains it. Paths may be
     # given relative to the cwd, the project, the wiki, or absolute.
     try:
-        article = _lookup_project_path(root, path, db.get_article_by_path)
+        # A symlink alias (dft.org -> concepts/dft-theory.org) is not the
+        # article: deleting through it would remove the real one. Each
+        # spelling of PATH is checked in turn, so the alias is refused
+        # however it is named (wiki-relative, project-relative, absolute).
+        article = None
+        for candidate in _project_path_candidates(root, path, aliases=False):
+            real = _wiki_link_on_path(root, Path(os.path.abspath(root / candidate)))
+            if real is not None:
+                raise click.ClickException(
+                    f"{path} is a symlink alias of {_target_rel(root, real)}. "
+                    "Delete the symlink by hand, or name the article's own "
+                    "path to delete the article.")
+            if not os.path.isabs(candidate):
+                article = db.get_article_by_path(candidate)
+                if article:
+                    break
+        else:
+            # No alias on the way: the real file may be named through a
+            # symlinked wiki (.crucible/wiki -> ../wiki-real) or root.
+            for candidate in _project_path_candidates(root, path, aliases=False):
+                rel = _target_rel(root, Path(os.path.realpath(root / candidate)))
+                article = db.get_article_by_path(rel) if rel else None
+                if article:
+                    break
         src = None if article else _lookup_project_path(root, path, db.get_source_by_path)
         if not article and not src:
             src = _source_by_cite_key(db, path)
@@ -2543,7 +2634,15 @@ def _plan_article_merge(plan: "_MergePlan", source_wiki: Path, target_wiki: Path
             data[src_path] = src_path.read_bytes()
         except OSError as exc:
             raise click.ClickException(f"Cannot read {src_path}: {exc}") from exc
-        copies = [c for c in existing_copies(dest) if c not in used]
+        copies = existing_copies(dest)
+        # name_N.org may be a renamed copy an earlier merge made of the
+        # target's own name.org (merged A into B, now merging B back into
+        # A), so the base name and its copies are candidates too.
+        renamed = re.fullmatch(r"(.+)_[0-9]+", dest.stem)
+        if renamed:
+            base = dest.with_name(renamed.group(1) + dest.suffix)
+            copies += [c for c in existing_copies(base) if c not in copies]
+        copies = [c for c in copies if c not in used]
         contents = {}
         for copy in copies:
             try:
@@ -2931,6 +3030,37 @@ class _MergeConflict(Exception):
     """A single reason an incoming source cannot be merged safely."""
 
 
+def _merge_target_sources(root: Path, target_db: CrucibleDB) -> list[dict]:
+    """The target's source rows, with the files in sources/notebooks/ and
+    sources/data/ keyed as the sync after the merge (or a rebuild) keys them.
+
+    The database may predate files added since the last sync, and a key a
+    file there will take is as taken as one in the database. The disk scan
+    sync runs is applied to a temporary copy of the database (VACUUM INTO
+    only reads the target), so nothing is written, and a read-only target,
+    or one another process is writing to, can still be planned against.
+    """
+    import tempfile
+
+    from crucible.ingest import upsert_sources_from_disk
+
+    with tempfile.TemporaryDirectory(prefix="crucible-merge-") as tmp:
+        copy_path = Path(tmp) / "plan.db"
+        try:
+            target_db.conn.execute("VACUUM INTO ?", (str(copy_path),))
+        except Exception as exc:  # noqa: BLE001 - libsql raises ValueError
+            click.echo(f"Warning: cannot scan the target's sources ({exc}); "
+                       "files added since its last sync are not counted.",
+                       err=True)
+            return target_db.list_sources()
+        copy = CrucibleDB(copy_path)
+        try:
+            upsert_sources_from_disk(root, copy)
+            return copy.list_sources()
+        finally:
+            copy.close()
+
+
 def _plan_source_merge(
     source_root: Path, root: Path, source_db: CrucibleDB, target_db: CrucibleDB
 ) -> _MergePlan:
@@ -2969,7 +3099,7 @@ def _plan_source_merge(
     if source_bib.exists():
         plan.bib_macros = bibtex.macro_blocks(read_bib_text(source_bib))
 
-    target_sources = target_db.list_sources()
+    target_sources = _merge_target_sources(root, target_db)
     # Real paths already taken in the target, plus every path planned below.
     reserved = {os.path.realpath(root / s["path"]) for s in target_sources}
     target_by_key: dict[str, list[dict]] = {}
@@ -3038,7 +3168,9 @@ def _plan_source_merge(
                 )
 
             src_text = src_file.with_suffix(".txt")
-            if src_text == src_file or not src_text.exists():
+            # A .txt source (in any case: NOTES.TXT on a case-insensitive disk)
+            # is its own text, not a source with a sidecar.
+            if src_file.suffix.lower() == ".txt" or not src_text.exists():
                 src_text = None
             private = not bool(src["shareable"])
 
@@ -3144,6 +3276,22 @@ def _plan_source_merge(
                 plan.warnings.append(
                     f"bibliography-only source '{cite_key}' has no source file."
                 )
+        if (
+            cite_key not in target_entries
+            and cite_key not in mapped_keys
+            and cite_key in target_by_key
+        ):
+            # The target has a source with this key but no entry for it (a
+            # file in sources/notebooks/ or sources/data/, keyed by its
+            # name). Adding the entry would hand the key, and the target
+            # articles citing it, to this reference.
+            problems.append(
+                f"Cannot safely merge bibliography entry '{cite_key}': the target "
+                f"source '{target_by_key[cite_key][0]['path']}' already has this "
+                "citation key, and the entry would take it over. Rename the key "
+                "in the source crucible, sync it, and merge again."
+            )
+            continue
         if cite_key in target_entries:
             if cite_key in copied_keys:
                 # The target has the reference but no source for it. Attach
@@ -3324,31 +3472,73 @@ def _merge_source_metadata(source: dict) -> tuple[dict, str | None]:
     return metadata, cite_key
 
 
+# The parts of a crucible's layout that may be symlinks to another drive or
+# a synced folder (a large, gitignored sources/external/, say), relative to
+# .crucible/. The private ones (sources/external/) come last.
+_MERGE_PRIVATE_DIRS = ("sources/external", "sources/external/pdfs", "sources/external/web")
+# The target is the user's own layout: its sources/, sources/data/,
+# sources/notebooks/ and sources/external/ may be symlinks to another drive. The source may be a stranger's clone,
+# whose committed symlinks must not reach the user's files: there only the
+# private directories may be links, since their files can only be copied to
+# the target's private, gitignored sources/external/.
+_MERGE_TARGET_DIRS = (".", "sources", "sources/data", "sources/notebooks") + _MERGE_PRIVATE_DIRS
+
+
+def _merge_inside(path: Path, root: Path, names: tuple[str, ...]) -> bool:
+    """Whether path is in one of the named directories of root's .crucible/.
+
+    Lexically first, as ingest and _cdir_relative compare paths, so a layout
+    directory that is a symlink to another drive still counts as inside,
+    and ``..`` cannot escape. Then resolved: the file must really be where
+    one of the named directories really is, so any other symlink in the
+    tree that points out of the crucible (or from shareable into private
+    sources) does not count.
+    """
+    base = root / CRUCIBLE_DIR
+    lexical = Path(os.path.normpath(os.path.abspath(path)))
+    if not any(
+        lexical.is_relative_to(os.path.normpath(os.path.abspath(base / name)))
+        for name in names
+    ):
+        return False
+    real = Path(os.path.realpath(path))
+    return any(real.is_relative_to(os.path.realpath(base / name)) for name in names)
+
+
 def _check_merge_copy(
     source: Path, destination: Path, source_root: Path, target_root: Path, *, private: bool
 ) -> None:
     """Refuse copies that leave either crucible or publish private files."""
     if not source.is_file():
         raise _MergeConflict(f"Cannot safely merge '{source}': not a regular file.")
-    source_root = source_root.resolve()
-    target_root = target_root.resolve()
-    source_path = source.resolve()
-    destination_path = destination.resolve()
-    if not source_path.is_relative_to(source_root / CRUCIBLE_DIR):
+    real_source = Path(os.path.realpath(source))
+    lexical_source = Path(os.path.normpath(os.path.abspath(source)))
+    # The incoming crucible may be someone else's clone, and git keeps the
+    # symlinks it commits, so no link in it is trusted: the file must really
+    # be inside it. (Its own sources/external/ on another drive is refused.)
+    if not (
+        lexical_source.is_relative_to(
+            os.path.normpath(os.path.abspath(source_root / CRUCIBLE_DIR)))
+        and real_source.is_relative_to(
+            Path(os.path.realpath(source_root)) / CRUCIBLE_DIR)
+    ):
         raise _MergeConflict(
             f"Cannot safely merge '{source}': it resolves outside the source crucible."
         )
-    if not destination_path.is_relative_to(target_root / CRUCIBLE_DIR):
+    if not _merge_inside(destination, target_root, _MERGE_TARGET_DIRS):
         raise _MergeConflict(
             f"Cannot safely merge '{destination}': it resolves outside the target crucible."
         )
-    source_private = source_root / CRUCIBLE_DIR / "sources/external"
-    target_private = target_root / CRUCIBLE_DIR / "sources/external"
-    if (
-        (private or source_path.is_relative_to(source_private)
-         or Path(os.path.abspath(source)).is_relative_to(source_private))
-        and not destination_path.is_relative_to(target_private)
-    ):
+    # Private when stored under sources/external/, or linked to a file there.
+    source_cdir = source_root / CRUCIBLE_DIR
+    is_private = (
+        private
+        or Path(os.path.normpath(os.path.abspath(source))).is_relative_to(
+            os.path.normpath(os.path.abspath(source_cdir / _MERGE_PRIVATE_DIRS[0])))
+        or any(real_source.is_relative_to(os.path.realpath(source_cdir / name))
+               for name in _MERGE_PRIVATE_DIRS)
+    )
+    if is_private and not _merge_inside(destination, target_root, _MERGE_PRIVATE_DIRS):
         raise _MergeConflict(
             f"Cannot safely merge '{source}': a private file would be copied to "
             "a shareable path. In the source crucible, move it under "
@@ -3703,11 +3893,56 @@ def _render_manifest(root: Path, db: CrucibleDB) -> str:
 _GENERATED_DATE_RE = re.compile(r"^(#\+DATE:|Updated:) .*$", re.MULTILINE)
 
 
+def _replace_file(path: Path, text: str) -> None:
+    """Write a generated file by renaming a temporary file onto `path`.
+
+    Writing in place would follow a symlink, or write into the inode a hard
+    link shares, and so overwrite whatever article `path` was linked to.
+    Renaming replaces the link itself. The file gets the mode a plain
+    write would give it (0666 less the umask), not mkstemp's 0600.
+    In a directory that cannot be written (chmod 555) but whose file can,
+    a plain file that is no link is written in place, as before.
+    """
+    umask = os.umask(0)
+    os.umask(umask)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.",
+                                   suffix=".tmp")
+    except PermissionError as e:
+        if path.is_file() and not _is_link(path) and os.access(path, os.W_OK):
+            path.write_text(text, encoding="utf-8")
+            return
+        raise click.ClickException(
+            f"Cannot write {path}: its directory is not writable ({e.strerror}).")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _is_link(path: Path) -> bool:
+    """True if `path` is a symlink, or a file with other hard links."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink > 1)
+
+
 def _write_generated(path: Path, text: str) -> None:
     """Write a generated page unless only its date line would change.
 
     MANIFEST.md and index.org are rewritten on every sync; leaving them
     alone when the content is unchanged keeps the date out of git churn.
+    A link at `path` is replaced by the generated file (with a warning on
+    stderr), never written through, so the file it shares is untouched.
     """
     if path.exists():
         try:
@@ -3718,7 +3953,10 @@ def _write_generated(path: Path, text: str) -> None:
             _GENERATED_DATE_RE.sub("", old) == _GENERATED_DATE_RE.sub("", text)
         ):
             return
-    path.write_text(text, encoding="utf-8")
+    if _is_link(path):
+        click.echo(f"crucible: {path} was a link; replaced it with the "
+                   "generated file and left the linked file alone", err=True)
+    _replace_file(path, text)
 
 
 def _write_manifest(root: Path, db: CrucibleDB) -> Path:
@@ -3742,7 +3980,7 @@ def manifest():
     text = _render_manifest(root, db)
     db.close()
     manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
-    manifest_path.write_text(text, encoding="utf-8")
+    _write_generated(manifest_path, text)
     click.echo(text)
     click.echo(f"Written to {manifest_path}")
 
@@ -4833,7 +5071,7 @@ def publish(output, init_only):
     }
 
     config_path = wiki_dir / ".org-publish.json"
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    _replace_file(config_path, json.dumps(config, indent=2))
     click.echo(f"Publish config: {config_path}")
 
     if init_only:
@@ -5110,14 +5348,50 @@ def _install(root: Path | None, directive: bool, register: bool = True) -> None:
                 claude_md.write_text(updated, encoding="utf-8")
                 click.echo(f"  CLAUDE.md: updated existing directive")
         else:
-            claude_md.write_text(existing.rstrip() + "\n" + directive_text, encoding="utf-8")
+            # A blank line before the block, unless nothing precedes it.
+            updated = (existing.rstrip() + "\n" + directive_text if existing.strip()
+                       else directive_text.lstrip("\n"))
+            claude_md.write_text(updated, encoding="utf-8")
             click.echo(f"  CLAUDE.md: added directive")
     else:
         claude_md.parent.mkdir(parents=True, exist_ok=True)
-        claude_md.write_text(directive_text, encoding="utf-8")
+        # The block starts the file: no empty first line.
+        claude_md.write_text(directive_text.lstrip("\n"), encoding="utf-8")
         click.echo(f"  CLAUDE.md: created with directive")
 
     click.echo(f"\nCrucible installed. Restart Claude Code to pick up the skill.")
+
+
+def _remove_marker_blocks(text: str, marker: str) -> tuple[str, int]:
+    """text without the marker...marker blocks, and how many were removed.
+
+    A block on lines of its own goes with its line end, so the lines before
+    and after it stay separate lines, and so does the blank line before it
+    (install puts one there), so text added after the block follows the
+    text before it as it did before install. A block that shares a line
+    with other text leaves that text's line end.
+    """
+    pattern = re.compile(re.escape(marker) + r".*?" + re.escape(marker), re.DOTALL)
+    pieces, pos, count = [], 0, 0
+    for block in pattern.finditer(text):
+        before = "".join(pieces) + text[pos:block.start()]
+        if not before.strip("\r\n"):
+            before = ""   # only the empty first line earlier installs wrote
+        after_start = block.end()
+        if before == "" or before.endswith("\n"):
+            # The block starts a line: its line end goes with it.
+            if text.startswith("\r\n", after_start):
+                after_start += 2
+            elif text.startswith("\n", after_start):
+                after_start += 1
+            if before.endswith(("\n\n", "\n\r\n")):
+                # The blank line before the block goes with it.
+                before = before[:-2] if before.endswith("\r\n") else before[:-1]
+            elif before == "" and text.startswith(("\n", "\r\n"), after_start):
+                # A block at the start takes the blank line after it.
+                after_start += 2 if text.startswith("\r\n", after_start) else 1
+        pieces, pos, count = [before], after_start, count + 1
+    return "".join(pieces) + text[pos:], count
 
 
 @cli.command()
@@ -5177,11 +5451,7 @@ def uninstall():
     if claude_md.exists():
         existing = claude_md.read_text(encoding="utf-8")
         if marker in existing:
-            pattern = re.compile(
-                r"\n?" + re.escape(marker) + r".*?" + re.escape(marker) + r"\n?",
-                re.DOTALL,
-            )
-            updated, count = pattern.subn("", existing)
+            updated, count = _remove_marker_blocks(existing, marker)
             if existing.count(marker) % 2:
                 count = 0  # an unpaired marker: do not guess where the block ends
             if count:

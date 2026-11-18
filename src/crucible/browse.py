@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from crucible import bibtex
 from crucible.orgparse import CITATION_RE, FILE_LINK_RE, citation_keys, citation_type
 from crucible.orgparse import DRAWER_RE as _DRAWER_RE
+from crucible.wikiwalk import wiki_alias_of
 
 
 # ---------------------------------------------------------------------------
@@ -1283,6 +1284,11 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
             self._serve_image(file_path, IMAGE_TYPES[suffix])
             return
 
+        # Through a symlink alias (dft.org -> concepts/dft-long.org), the
+        # article's relative links are relative to its own location.
+        alias = wiki_alias_of(self.wiki_dir, self.wiki_dir / rel)
+        if alias is not None:
+            rel = alias.relative_to(self.wiki_dir).as_posix()
         text = file_path.read_text(encoding="utf-8", errors="replace")
         title, content_html, filetags = org_to_html(text, rel, bib=self.bib)
 

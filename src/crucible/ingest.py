@@ -198,9 +198,57 @@ def _title_key(title: str) -> str:
     return "".join(ch for ch in title.casefold() if ch.isalnum())
 
 
+# arXiv's abstract pages label the title: "Title:Oxygen evolution ...".
+_TITLE_LABEL = re.compile(r"^\s*title\s*:\s*", re.IGNORECASE)
+
+# The metadata a publisher's page carries for its own article. A page
+# that only discusses a paper (a forum thread, a video, a blog post)
+# does not declare its DOI this way.
+_META_TAG = re.compile(r"<meta\s[^>]*>", re.IGNORECASE)
+_META_ATTR = re.compile(r"""([\w:.-]+)\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+)""")
+_OWN_DOI_NAMES = frozenset({"citation_doi", "dc.identifier", "prism.doi"})
+_DOI_PREFIX = re.compile(r"^\s*(?:doi:\s*|info:doi/|https?://(?:dx\.)?doi\.org/)",
+                         re.IGNORECASE)
+
+
+def _declares_title(declared: str, title: str) -> bool:
+    """Whether a file declaring `declared` names the paper titled `title`.
+
+    The titles must be the same, apart from an arXiv "Title:" label. A
+    site or journal name beside the title ("Title | ACS Catalysis") is
+    not stripped: "Title | Hacker News" and "Paper summary - Title" are
+    pages about the paper. A publisher's page is recognised by its
+    citation_doi metadata instead (see _page_declares_doi).
+    """
+    want = _title_key(title)
+    return bool(want) and _title_key(_TITLE_LABEL.sub("", declared)) == want
+
+
+def _page_declares_doi(path: Path, doi: str) -> bool:
+    """Whether an HTML page's citation metadata names `doi` as its own."""
+    if path.suffix.lower() not in (".html", ".htm", ".xhtml"):
+        return False
+    try:
+        head = path.read_bytes()[:200_000].decode("utf-8", "replace")
+    except OSError:
+        return False
+    for tag in _META_TAG.finditer(head):
+        attrs = {k.casefold(): v.strip("\"'")
+                 for k, v in _META_ATTR.findall(tag.group(0))}
+        if (attrs.get("name") or attrs.get("property") or "").casefold() not in _OWN_DOI_NAMES:
+            continue
+        own = _DOI_PREFIX.sub("", attrs.get("content", "")).strip().rstrip(".")
+        if own and own.casefold() == doi.casefold():
+            return True
+    return False
+
+
 # Files that never carry their own DOI: a DOI in a deck or a Word document
 # is one it cites.
 _NO_OWN_DOI_SUFFIXES = frozenset({".docx", ".pptx"})
+
+# Notes: text a person wrote, which cites papers by DOI rather than being one.
+_NOTE_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".text", ".org", ".rst"})
 
 # How much of a document's text is its front matter: where a paper prints
 # its own title and DOI, before any reference list.
@@ -244,8 +292,26 @@ def _title_on_first_page(title: str, text: str | None,
     return found >= 0.7 * len(words) or (len(words) >= 3 and found >= len(words) - 1)
 
 
-def declared_title(path: Path, text: str) -> str | None:
-    """The title the file itself declares (#+TITLE, a # heading, <title>), or None."""
+def _yaml_scalar(value: str) -> str | None:
+    """A one-line YAML scalar's text: 'It''s', "a \\"b\\"" or plain (a "#"
+    after a space starts a comment). None for a block scalar (| or >),
+    whose text is on the lines below, so the caller uses the heading."""
+    value = value.strip()
+    if not value or value[0] in "|>":
+        return None
+    if len(value) > 1 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'").strip() or None
+    if len(value) > 1 and value[0] == value[-1] == '"':
+        return re.sub(r'\\(.)', r"\1", value[1:-1]).strip() or None
+    return re.split(r"\s+#", value, 1)[0].strip() or None
+
+
+def declared_title(path: Path, text: str, front_matter: bool = True) -> str | None:
+    """The title the file itself declares (#+TITLE, a # heading, <title>), or None.
+
+    A Markdown file's YAML front-matter title comes before its first
+    heading, unless front_matter is False.
+    """
     suffix = path.suffix.lower()
 
     if suffix == ".org":
@@ -254,13 +320,19 @@ def declared_title(path: Path, text: str) -> str | None:
             return meta.title
 
     if suffix == ".md":
+        front = re.match(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|\Z)",
+                         text or "", re.DOTALL)
+        if front and front_matter:
+            m = re.search(r"^title\s*:\s*(.+?)\s*$", front.group(1), re.MULTILINE)
+            value = _yaml_scalar(m.group(1)) if m else None
+            if value:
+                return value
         for line in text.split("\n"):
             line = line.strip()
             if line.startswith("# "):
                 return line[2:].strip()
 
     if suffix in (".html", ".htm"):
-        import re
         m = re.search(r"<title>(.*?)</title>",
                        path.read_text(encoding="utf-8", errors="replace"),
                        re.IGNORECASE | re.DOTALL)
@@ -904,10 +976,9 @@ def reconcile_sources(root: Path, db, on_warning=None, lock: bool = True) -> int
 
     # The bib lock is taken before the database write lock, the order merge
     # uses, so a sync and a merge never each hold one lock while waiting
-    # for the other. The bibliography is read inside the transaction: ingest
-    # appends its entry before it adds its row, and the row cannot be added
-    # while this transaction holds the write lock, so every ingested row
-    # seen here has its entry in what is read.
+    # for the other. Ingest appends its entry and adds its row under the
+    # bib lock, so every ingested row seen here has its entry in what is
+    # read, and no entry is seen whose ingest has yet to add its row.
     with _bib_lock(root) if lock else nullcontext(), db.conn.transaction():
         entries, malformed = _read_bib_entries(root, lock=lock)
         bib_keys = {entry["cite_key"] for entry in entries}
@@ -1144,8 +1215,9 @@ def _bib_lock(root: Path) -> FileLock:
     bib reads and rewrites inside it take it again.
 
     Lock order: every writer takes this lock before the database write lock
-    (sync's transaction, merge's row inserts). Ingest takes it only to
-    append its entry, and adds its row after releasing it.
+    (sync's transaction, merge's row inserts). Ingest holds it while it
+    appends its entry and adds its row, so a sync never sees one without
+    the other.
     """
     lock_path = os.path.abspath(root / CRUCIBLE_DIR / "references.bib.lock")
     lock = _BIB_LOCKS.get(lock_path)
@@ -1393,6 +1465,22 @@ def _keys_cited_in_wiki(root: Path) -> set[str]:
     return keys
 
 
+def _sidecar_path(path: Path) -> Path:
+    """Where the extracted text of the stored file `path` goes: <stem>.txt,
+    or `path` itself for a .txt file, which is its own text.
+
+    The suffix is compared without case: NOTES.TXT and NOTES.txt are one
+    file on a case-insensitive filesystem (macOS, Windows), so a sidecar
+    beside NOTES.TXT would be the source itself.
+    """
+    return path if path.suffix.lower() == ".txt" else path.with_suffix(".txt")
+
+
+# How many numbered names (<stem>_1, <stem>_2, ...) ingest tries before
+# giving up on storing a file.
+_MAX_NAME_TRIES = 10000
+
+
 def _dest_taken(dest_path: Path) -> bool:
     """Whether storing a source at dest_path would collide with an existing file.
 
@@ -1449,42 +1537,95 @@ def _norm_title(title: str | None) -> str:
 
 
 def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str,
-                      title: str | None, doi: str | None, text: str) -> str | None:
+                      title: str | None, doi: str | None, text: str,
+                      url: str | None = None) -> str | None:
     """Why source_path may not be the missing file of the row src, or None.
 
     The row was rebuilt from its bib entry, so it has no hash to compare.
     The file is taken to be that source when its DOI (given, or found in a
-    paper's or web page's text) equals the row's, or failing a DOI on both
-    sides, when its title (given, or declared by the file) equals the
-    row's, or when its text equals the row's committed text sidecar. A
+    paper's or web page's text, but not a note's) equals the row's, or
+    when its title (given, or declared by the file) equals the row's, or
+    when its text equals the row's committed text sidecar. A
     disagreeing DOI, or no evidence at all, is a problem.
+
+    URL ingest names pages from a title with the site cut off, so the
+    "Introduction" pages of two sites share a name: the same URL shows the
+    page is the source, and a different one shows it is not, when the row
+    has no DOI. A row with a DOI got its url field from the fetched entry
+    (a doi.org link, say), not from the page that was ingested, so there
+    the DOI and title decide. A Markdown note is matched by its front-matter
+    title or by its first heading, which is what older versions used.
     """
     key = _source_metadata(src).get("cite_key") or src["path"]
     advice = ("If it is that source, run again with --restore; if not, "
               "rename the file before ingesting it.")
     row_doi = _norm_doi(_source_metadata(src).get("doi"))
+    cited = None
+    row_url, file_url = (u.strip().rstrip("/") if u else None for u in (src.get("url"), url))
+    if row_url and file_url:
+        if row_url == file_url:
+            return None
+        if not row_doi:
+            return (f"{source_path.name} would be stored as {src['path']}, the missing "
+                    f"file of source {key}, but it comes from {file_url}, not that "
+                    f"source's {row_url}. {advice}")
     file_doi = _norm_doi(doi or (extract_doi_from_text(text)
                                  if may_carry_own_doi(source_type, source_path) else None))
     if row_doi and file_doi:
-        if row_doi == file_doi:
+        if row_doi != file_doi:
+            return (f"{source_path.name} would be stored as {src['path']}, the missing "
+                    f"file of source {key}, but its DOI {file_doi} differs from that "
+                    f"source's DOI {row_doi}. {advice}")
+        # A paper's or saved web page's DOI shows it, as on main. A note
+        # (Markdown, text) that has the DOI may only cite it, so there the
+        # title must be near the start, or the title or text below match.
+        if (doi or source_path.suffix.lower() not in _NOTE_SUFFIXES
+                or _title_on_first_page(src.get("title") or "", text)):
             return None
-        return (f"{source_path.name} would be stored as {src['path']}, the missing "
-                f"file of source {key}, but its DOI {file_doi} differs from that "
-                f"source's DOI {row_doi}. {advice}")
+        cited = row_doi
     row_title = _norm_title(src.get("title"))
-    file_title = _norm_title(title or declared_title(source_path, text))
-    if row_title and file_title and row_title == file_title:
+    file_titles = {_norm_title(t) for t in
+                   ((title,) if title else (declared_title(source_path, text),
+                                            declared_title(source_path, text,
+                                                           front_matter=False)))}
+    if row_title and row_title in file_titles:
         return None
-    sidecar = (root / src["path"]).with_suffix(".txt")
+    sidecar = _sidecar_path(root / src["path"])
     if text and sidecar != root / src["path"] and sidecar.is_file():
         try:
             if sidecar.read_text(encoding="utf-8", errors="replace") == text:
                 return None
         except OSError:
             pass
+    if cited:
+        return (f"{source_path.name} would be stored as {src['path']}, the missing "
+                f"file of source {key}. Its text has that source's DOI {cited}, but "
+                f"it may only cite it, and its title and text do not match. If it is "
+                f"that source, run again with --doi {cited} or --restore; if not, "
+                f"rename the file before ingesting it.")
     return (f"{source_path.name} would be stored as {src['path']}, the missing "
             f"file of source {key}, but nothing shows it is that source (no "
             f"matching DOI, title or text). {advice}")
+
+
+def _add_or_adopt_source(db: CrucibleDB, cite_key: str, **fields) -> int:
+    """Add ingest's row for fields["path"], or take over the row a sync made for it.
+
+    Called under the bib lock, right after the entry `cite_key` was
+    appended. A sync that ran after the file was copied but before the
+    entry was appended may have indexed the file from the disk scan
+    (sources/notebooks/, sources/data/); a row under this entry's own key
+    can only come from a sync that read the entry. Either row is this
+    source, so it is updated in place rather than the insert failing on
+    its path and the ingest being undone. Any other row at the path is
+    not ours, and the insert's error stands.
+    """
+    row = db.get_source_by_path(fields["path"])
+    if row is not None and (_from_disk_scan(row)
+                            or _source_metadata(row).get("cite_key") == cite_key):
+        db.update_source(row["id"], **{k: v for k, v in fields.items() if k != "path"})
+        return row["id"]
+    return db.add_source(**fields)
 
 
 def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
@@ -1497,6 +1638,21 @@ def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
     bib entry is left alone; the file (and its text sidecar, unless one is
     there) is copied back and the content hash recorded.
     """
+    # The row keeps its cite key and leaves the bibliography alone, so the
+    # key must have an entry there: a row whose entry is gone (left by an
+    # interrupted ingest, or an entry removed by hand) is dropped by the
+    # next sync, and restoring into it would report a source that then
+    # disappears. A disk-scan row is keyed by the scan and needs no entry.
+    key = _source_metadata(src).get("cite_key")
+    if isinstance(key, str) and key and not _from_disk_scan(src):
+        entries, malformed = _read_bib_entries(root)
+        if not malformed and key not in {entry["cite_key"] for entry in entries}:
+            raise ValueError(
+                f"{source_path.name} would be restored as {src['path']}, the "
+                f"missing file of source {key}, but references.bib has no entry "
+                f"{key}, so the next sync drops that source. Run `crucible sync`, "
+                "then ingest the file again."
+            )
     dest = root / src["path"]
     dest.parent.mkdir(parents=True, exist_ok=True)
     created: list[Path] = []
@@ -1511,7 +1667,7 @@ def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
         metadata = _source_metadata(src)
         if text is None:
             text = extract_text(source_path)
-        text_path = dest.with_suffix(".txt")
+        text_path = _sidecar_path(dest)
         wrote_text = False
         if text and text_path != dest and _claim(text_path, created):
             atomic_write_text(text_path, text)
@@ -1627,7 +1783,7 @@ def ingest_source(
         text = extract_text(source_path)
         if not restore:
             problem = _restore_mismatch(root, holder, source_path, source_type,
-                                        title, doi, text)
+                                        title, doi, text, url)
             if problem:
                 raise ValueError(problem)
         return _restore_source(root, db, holder, source_path, content_hash, text)
@@ -1660,26 +1816,31 @@ def ingest_source(
     known = _parse_bib_fields(bib_entry) if bib_entry else {}
 
     # A DOI guessed from the text may be one the document cites rather than
-    # its own. When the file declares a title (an org #+TITLE, say) or the
-    # user gave one, and the fetched entry's title is a different one, the
-    # guess named another paper: none of that entry (authors, year, DOI)
-    # describes this file, so it is dropped for a generated one.
+    # its own. A web page or note keeps it only when its citation metadata
+    # names it: guessing from titles ("Title | Blog", front matter, arXiv
+    # labels) let pages about a paper become the paper. A PDF keeps it
+    # when its declared title, if any, is the fetched one, or when the
+    # fetched title is printed near the start, where a paper prints its own.
     if bib_entry is not None and supplied_entry is None and not doi_given:
-        declared = title or declared_title(source_path, text)
-        if declared and _title_key(declared) != _title_key(known.get("title", "")):
+        fetched_title = known.get("title", "")
+        if source_type != "pdf":
+            if not _page_declares_doi(source_path, doi):
+                warnings.append(
+                    f"Ignored DOI {doi} found in the text: the page's citation "
+                    f"metadata does not name it. If it is this source's own, "
+                    f"ingest it again with --doi {doi}"
+                )
+                bib_entry, known, doi = None, {}, None
+        elif title and not _declares_title(title, fetched_title):
             warnings.append(
                 f"Ignored DOI {doi} found in the text: it belongs to "
-                f"\"{known.get('title', '')}\", not \"{declared}\""
+                f"\"{fetched_title}\", not \"{title}\""
             )
             bib_entry, known, doi = None, {}, None
-        elif (not declared and source_type == "pdf"
-              and not _title_on_first_page(known.get("title", ""), text)):
-            # Nothing to compare with: a paper prints its own title near
-            # the top, next to its DOI. A report or thesis that cites a DOI
-            # there does not carry the cited paper's title with it.
+        elif not title and not _title_on_first_page(fetched_title, text):
             warnings.append(
                 f"Ignored DOI {doi} found in the text: its title "
-                f"\"{known.get('title', '')}\" is not near the start of the document"
+                f"\"{fetched_title}\" is not near the start of the document"
             )
             bib_entry, known, doi = None, {}, None
 
@@ -1743,21 +1904,44 @@ def ingest_source(
     # interrupt before the copy still removes the empty placeholders.
     created: list[Path] = []
     cite_key = None
+    undone = False
+
+    def undo() -> None:
+        # Leave nothing behind: no orphan copy, sidecar or bib entry.
+        nonlocal undone
+        undone = True
+        if cite_key is not None:
+            try:
+                _drop_bib_entry(root, cite_key, rel_path)
+            except Exception:
+                pass
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     try:
         write_sidecar = False
         if in_place:
-            text_path = dest_path.with_suffix(".txt")
+            text_path = _sidecar_path(dest_path)
             if text and text_path != dest_path:
                 write_sidecar = _claim(text_path, created)
         else:
             stem, suffix = dest_path.stem, dest_path.suffix
             counter = 1
             while True:
+                if counter > _MAX_NAME_TRIES:
+                    raise ValueError(
+                        f"Cannot find a free name to store {source_path.name} in "
+                        f"{dest_dir}: {stem}{suffix} and {_MAX_NAME_TRIES} numbered "
+                        "variants (and their .txt sidecars) are all taken"
+                    )
                 # A path a row holds is taken even when its file is missing.
                 if (not _dest_taken(dest_path)
                         and _project_rel(root, dest_path) not in held
                         and _claim(dest_path, created)):
-                    text_path = dest_path.with_suffix(".txt")
+                    text_path = _sidecar_path(dest_path)
                     if not text or text_path == dest_path:
                         break
                     if _claim(text_path, created):
@@ -1777,48 +1961,52 @@ def ingest_source(
         if write_sidecar:
             atomic_write_text(text_path, text)
 
-        cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
-        bib_entry = replace_cite_key(bib_entry, cite_key)
+        # The entry and the row are written under one hold of the bib lock.
+        # A sync reconciles under that lock, so it never sees the entry
+        # without the row: it would insert a row from the entry, and this
+        # insert would then fail on the path and undo the ingest, leaving
+        # the sync's row with no entry and no file.
+        with _bib_lock(root):
+            try:
+                cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
+                bib_entry = replace_cite_key(bib_entry, cite_key)
 
-        # Describe the source exactly as a rebuild from the entry would.
-        first = bibtex_mod.first_entry(bib_entry)
-        rebuilt = _fields_from_bib(
-            {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
-        )
-        title = rebuilt["title"]
-        authors = rebuilt["authors"] or authors
-        date = rebuilt["date"] or date
-        url = rebuilt["url"] or url
+                # Describe the source exactly as a rebuild from the entry would.
+                first = bibtex_mod.first_entry(bib_entry)
+                rebuilt = _fields_from_bib(
+                    {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
+                )
+                title = rebuilt["title"]
+                authors = rebuilt["authors"] or authors
+                date = rebuilt["date"] or date
+                url = rebuilt["url"] or url
 
-        # Register in database (store cite_key and content hash in metadata)
-        metadata = {"cite_key": cite_key, "content_hash": content_hash}
-        if write_sidecar:
-            # Lets delete tell this sidecar from a user's own <stem>.txt.
-            metadata["text_hash"] = file_sha256(text_path)
-        if doi:
-            metadata["doi"] = doi
-        source_id = db.add_source(
-            path=rel_path,
-            title=title,
-            source_type=source_type,
-            shareable=shareable,
-            url=url,
-            authors=authors,
-            date=date,
-            metadata=metadata,
-        )
+                # Register in database (store cite_key and content hash in metadata)
+                metadata = {"cite_key": cite_key, "content_hash": content_hash}
+                if write_sidecar:
+                    # Lets delete tell this sidecar from a user's own <stem>.txt.
+                    metadata["text_hash"] = file_sha256(text_path)
+                if doi:
+                    metadata["doi"] = doi
+                source_id = _add_or_adopt_source(
+                    db, cite_key,
+                    path=rel_path,
+                    title=title,
+                    source_type=source_type,
+                    shareable=shareable,
+                    url=url,
+                    authors=authors,
+                    date=date,
+                    metadata=metadata,
+                )
+            except BaseException:
+                # Undone before the lock is released, so a sync never sees
+                # the entry without its row.
+                undo()
+                raise
     except BaseException:
-        # Leave nothing behind: no orphan copy, sidecar or bib entry.
-        if cite_key is not None:
-            try:
-                _drop_bib_entry(root, cite_key, rel_path)
-            except Exception:
-                pass
-        for path in reversed(created):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        if not undone:
+            undo()
         raise
 
     if text_path != dest_path and not text_path.exists():
