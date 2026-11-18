@@ -129,7 +129,9 @@ def test_guessed_doi_whose_title_matches_is_kept(kb, tmp_path, doi_lookup):  # n
 
 
 def test_web_page_without_a_title_takes_the_fetched_one(kb, tmp_path, doi_lookup):  # noqa: F811
-    (tmp_path / "page.md").write_text(f"doi: {DOI}\n")
+    # No declared title, but the page prints the fetched title by its DOI.
+    # (A bare DOI is not enough: a note citing a paper looks the same.)
+    (tmp_path / "page.md").write_text(f"Some catalysis paper\n\ndoi: {DOI}\n")
     result = run("ingest", str(tmp_path / "page.md"))
     assert "Ingested: Some Catalysis Paper" in result.output
 
