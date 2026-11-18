@@ -1,4 +1,3 @@
-import pytest
 """Regression tests: generated files never write through links, and wiki
 paths through a symlink alias resolve everywhere."""
 
@@ -6,6 +5,7 @@ import http.client
 import os
 import threading
 
+import pytest
 from click.testing import CliRunner
 from test_data_loss_ingest import kb, run  # noqa: F401
 
