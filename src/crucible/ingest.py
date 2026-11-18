@@ -289,8 +289,12 @@ def _title_on_first_page(title: str, text: str | None,
     return found >= 0.7 * len(words) or (len(words) >= 3 and found >= len(words) - 1)
 
 
-def declared_title(path: Path, text: str) -> str | None:
-    """The title the file itself declares (#+TITLE, a # heading, <title>), or None."""
+def declared_title(path: Path, text: str, front_matter: bool = True) -> str | None:
+    """The title the file itself declares (#+TITLE, a # heading, <title>), or None.
+
+    A Markdown file's YAML front-matter title comes before its first
+    heading, unless front_matter is False.
+    """
     suffix = path.suffix.lower()
 
     if suffix == ".org":
@@ -301,7 +305,7 @@ def declared_title(path: Path, text: str) -> str | None:
     if suffix == ".md":
         front = re.match(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|\Z)",
                          text or "", re.DOTALL)
-        if front:
+        if front and front_matter:
             m = re.search(r"^title\s*:\s*(.+?)\s*$", front.group(1), re.MULTILINE)
             if m and m.group(1).strip("\"' "):
                 return m.group(1).strip().strip("\"'").strip()
@@ -1524,22 +1528,28 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     paper's or web page's text) equals the row's, or failing a DOI on both
     sides, when its title (given, or declared by the file) equals the
     row's, or when its text equals the row's committed text sidecar. A
-    disagreeing DOI, or no evidence at all, is a problem. When both the
-    row and the ingest have a URL, it decides: URL ingest names pages from
-    a title with the site cut off, so "Introduction" pages of two sites
-    share a name.
+    disagreeing DOI, or no evidence at all, is a problem.
+
+    URL ingest names pages from a title with the site cut off, so the
+    "Introduction" pages of two sites share a name: the same URL shows the
+    page is the source, and a different one shows it is not, when the row
+    has no DOI. A row with a DOI got its url field from the fetched entry
+    (a doi.org link, say), not from the page that was ingested, so there
+    the DOI and title decide. A Markdown note is matched by its front-matter
+    title or by its first heading, which is what older versions used.
     """
     key = _source_metadata(src).get("cite_key") or src["path"]
     advice = ("If it is that source, run again with --restore; if not, "
               "rename the file before ingesting it.")
+    row_doi = _norm_doi(_source_metadata(src).get("doi"))
     row_url, file_url = (u.strip().rstrip("/") if u else None for u in (src.get("url"), url))
     if row_url and file_url:
-        if row_url != file_url:
+        if row_url == file_url:
+            return None
+        if not row_doi:
             return (f"{source_path.name} would be stored as {src['path']}, the missing "
                     f"file of source {key}, but it comes from {file_url}, not that "
                     f"source's {row_url}. {advice}")
-        return None
-    row_doi = _norm_doi(_source_metadata(src).get("doi"))
     file_doi = _norm_doi(doi or (extract_doi_from_text(text)
                                  if may_carry_own_doi(source_type, source_path) else None))
     if row_doi and file_doi:
@@ -1554,8 +1564,11 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
         if doi or _title_on_first_page(src.get("title") or "", text):
             return None
     row_title = _norm_title(src.get("title"))
-    file_title = _norm_title(title or declared_title(source_path, text))
-    if row_title and file_title and row_title == file_title:
+    file_titles = {_norm_title(t) for t in
+                   ((title,) if title else (declared_title(source_path, text),
+                                            declared_title(source_path, text,
+                                                           front_matter=False)))}
+    if row_title and row_title in file_titles:
         return None
     sidecar = _sidecar_path(root / src["path"])
     if text and sidecar != root / src["path"] and sidecar.is_file():

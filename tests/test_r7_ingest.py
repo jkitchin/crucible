@@ -392,3 +392,39 @@ def test_failed_ingest_is_undone_before_the_bib_lock_is_released(
     assert held == [True]
     assert "@" not in bib(kb)
     assert not list((kb / WEB).glob("n*"))
+
+
+# -- regressions against main found in the final review --------------------------
+
+def _fresh_clone(kb):  # noqa: F811
+    for p in (kb / WEB).iterdir():
+        p.unlink()
+    for p in (kb / ".crucible").glob("crucible.db*"):
+        p.unlink()
+    run("sync")
+
+
+def test_url_page_with_a_doi_is_restored_by_the_same_ingest(kb, monkeypatch, web):  # noqa: F811
+    # The fetched entry's url is the doi.org link, not the page's.
+    fetched = FETCHED[:-1] + ", url={http://dx.doi.org/%s}}" % DOI
+    monkeypatch.setattr(ingest_module, "fetch_bibtex_from_doi",
+                        lambda doi, timeout=10.0: fetched if doi == DOI else None)
+    url = "https://journal.example.com/articles/oxygen"
+    web[url] = f"<html><head><title>{TITLE}</title></head><body>x</body></html>".encode()
+    run("ingest", url, "--doi", DOI)
+    _fresh_clone(kb)
+    result = run("ingest", url, "--doi", DOI)
+    assert "restored" in result.output
+    assert list((kb / WEB).glob("*.html"))
+
+
+def test_note_titled_by_its_heading_is_restored(kb, tmp_path):  # noqa: F811
+    # Older versions titled a note by its first heading, not its front
+    # matter; its row still has that title on a fresh clone.
+    p = tmp_path / "notes.md"
+    p.write_text("---\ntitle: Kinetics of CO oxidation\n---\n\n# Background\n\nSome notes.\n")
+    run("ingest", str(p), "--title", "Background")
+    _fresh_clone(kb)
+    result = run("ingest", str(p))
+    assert "restored" in result.output
+    assert (kb / WEB / "notes.md").is_file()
