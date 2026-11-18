@@ -44,6 +44,16 @@ def copy_without_database(root, dest):
     return dest
 
 
+def claim_in_target_bib(root, *rel_paths):
+    """Give target files bibliography entries, so the disk scan does not key
+    them by file name and an incoming source with that name is no key collision."""
+    bib = root / ".crucible/references.bib"
+    text = bib.read_text() if bib.exists() else ""
+    for i, rel_path in enumerate(rel_paths):
+        text += f"\n@misc{{target{i}2026,\n  file = {{{rel_path}}},\n}}\n"
+    bib.write_text(text)
+
+
 def run_json(*args):
     result = CliRunner().invoke(cli, [*args, "--json"])
     assert result.exit_code == 0, result.output
@@ -322,6 +332,7 @@ def test_merge_reserves_filenames_for_multiple_imported_sources(project, tmp_pat
     monkeypatch.chdir(project)
     target_dir = project / ".crucible/sources/data"
     (target_dir / "evidence.md").write_text("Existing target source.\n")
+    claim_in_target_bib(project, ".crucible/sources/data/evidence.md")
     preview = runner.invoke(cli, ["merge", str(source), "--dry-run"])
     assert preview.exit_code == 0, preview.output
     planned = {
@@ -360,6 +371,8 @@ def test_merge_reserves_filenames_across_symlinked_target_directories(
         target_notebooks.symlink_to("data", target_is_directory=True)
     except (OSError, NotImplementedError) as exc:
         pytest.skip(f"Symlinks unavailable: {exc}")
+    claim_in_target_bib(project, ".crucible/sources/data/paper.md",
+                        ".crucible/sources/notebooks/paper.md")
     preview = runner.invoke(cli, ["merge", str(source), "--dry-run"])
     assert preview.exit_code == 0, preview.output
     planned = [
@@ -391,8 +404,10 @@ def test_merge_does_not_overwrite_existing_or_planned_text_sidecars(
     monkeypatch.chdir(project)
     target_dir = project / ".crucible/sources/data"
     (target_dir / "paper.pdf").write_bytes(b"Existing PDF")
+    claim_in_target_bib(project, ".crucible/sources/data/paper.pdf")
     if existing_sidecar:
         (target_dir / "paper_1.txt").write_text("Existing target text.\n")
+        claim_in_target_bib(project, ".crucible/sources/data/paper_1.txt")
     preview = runner.invoke(cli, ["merge", str(source), "--dry-run"])
     assert preview.exit_code == 0, preview.output
     planned = {
