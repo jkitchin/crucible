@@ -2,16 +2,18 @@
 
 import json
 
+import pytest
+
 from crucible.database import CrucibleDB
 from crucible.orgparse import parse_org, source_keys
 
 from test_sources import ISSUE_BIB, cdir, ingest, invoke, linked_paths, project, write_article  # noqa: F401
 
 
-def test_source_keys_accepts_commas_and_spaces():
+def test_source_keys_drops_commas_beside_spaces():
     assert source_keys("a b") == ["a", "b"]
-    assert source_keys("a, b") == ["a", "b"]
-    assert source_keys("a,b,") == ["a", "b"]
+    assert source_keys("a, b,") == ["a", "b"]
+    assert source_keys("a,b") == ["a,b"]  # one key or two: the caller resolves
     assert source_keys("") == []
 
 
@@ -28,9 +30,14 @@ def test_property_keywords_are_read_below_drawers():
     assert not any(k.startswith("HEADER") for k in meta.properties)
 
 
-def test_property_keywords_in_a_src_block_are_ignored():
-    meta = parse_org("#+BEGIN_SRC org\n#+PROPERTY: ARTICLE_TYPE method\n#+END_SRC\n")
-    assert "ARTICLE_TYPE" not in meta.properties
+@pytest.mark.parametrize("text", [
+    "#+BEGIN_SRC org\n#+PROPERTY: ARTICLE_TYPE method\n#+END_SRC\n",
+    "#+BEGIN_COMMENT\n#+property: ARTICLE_TYPE method\n#+END_COMMENT\n",
+    "* COMMENT Old\n#+PROPERTY: ARTICLE_TYPE method\n",
+    "# #+PROPERTY: ARTICLE_TYPE method\n",
+])
+def test_commented_or_quoted_property_keywords_are_ignored(text):
+    assert "ARTICLE_TYPE" not in parse_org(text).properties
 
 
 def test_comma_separated_source_keys_link(project, tmp_path):  # noqa: F811
@@ -39,6 +46,16 @@ def test_comma_separated_source_keys_link(project, tmp_path):  # noqa: F811
     write_article(project, f"{k1}, {k2}")
     invoke("sync")
     assert len(linked_paths(project)) == 2
+    issues = json.loads(invoke("lint", "--json").stdout)
+    assert not [i for i in issues if i["type"] == "unresolved_source_key"]
+
+
+def test_a_key_with_a_comma_still_links(project):  # noqa: F811
+    # Sync keys a data file by its name, so run,1.csv is the key run,1.
+    (cdir(project) / "sources" / "data" / "run,1.csv").write_text("x,y\n1,2\n")
+    write_article(project, "run,1")
+    invoke("sync")
+    assert linked_paths(project) == {".crucible/sources/data/run,1.csv"}
     issues = json.loads(invoke("lint", "--json").stdout)
     assert not [i for i in issues if i["type"] == "unresolved_source_key"]
 

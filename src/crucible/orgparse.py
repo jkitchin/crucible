@@ -207,8 +207,10 @@ def parse_org(text: str) -> OrgMetadata:
 
     # #+PROPERTY: keywords set file-wide values; a later one wins, and
     # NAME+ appends, as in org.
+    # Commented-out text (comment blocks, COMMENT subtrees) sets nothing.
+    keyword_text = _strip_comment_subtrees(_COMMENT_BLOCK_RE.sub("", prose))
     keyword_props: dict[str, str] = {}
-    for m in PROPERTY_KEYWORD_RE.finditer(prose):
+    for m in PROPERTY_KEYWORD_RE.finditer(keyword_text):
         key = m.group(1).upper()
         value = (m.group(3) or "").strip()
         if m.group(2):
@@ -253,12 +255,19 @@ def parse_org(text: str) -> OrgMetadata:
 
 
 def source_keys(value: str) -> list[str]:
-    """The cite keys of a SOURCE_KEYS value.
+    """The space-separated entries of a SOURCE_KEYS value.
 
-    Keys are space-separated, but commas (``a, b`` or ``a,b``) are accepted
-    too: a cite key never contains a comma.
+    A comma next to a space (``a, b``) is dropped. A comma inside an entry
+    (``a,b``) is kept: a key sync makes from a file name may contain one
+    (``run,1`` for run,1.csv), so whether ``a,b`` is one key or two is for
+    the caller to decide, with comma_parts.
     """
-    return [k for k in re.split(r"[\s,]+", value) if k]
+    return [k for k in (t.strip(",") for t in value.split()) if k]
+
+
+def comma_parts(key: str) -> list[str]:
+    """The comma-separated keys in a SOURCE_KEYS entry such as ``a,b``."""
+    return [k for k in key.split(",") if k]
 
 
 def parse_org_file(path: Path) -> OrgMetadata:

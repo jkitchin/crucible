@@ -193,7 +193,7 @@ Parses: =#+TITLE=, =#+FILETAGS=, =:ARTICLE_TYPE:=, =:SOURCE_KEYS:=,
 =:DERIVED_FROM:=, =:CREATED:=, =:MODIFIED:=, =[[file:...]]= links, and
 full text for FTS. Properties come from the top heading's drawer, or from
 file-wide =#+PROPERTY: NAME value= lines when no drawer sets them.
-=:SOURCE_KEYS:= are space-separated; commas between keys are accepted too.
+=:SOURCE_KEYS:= are space-separated; commas between keys are accepted too (=a, b= or =a,b=; a key that itself contains a comma, such as =run,1= for =run,1.csv=, still resolves as one key).
 
 An article's dates come from its =:CREATED:= and =:MODIFIED:= properties
 (an ISO date, optionally with a time, or an org timestamp). =:MODIFIED:=
