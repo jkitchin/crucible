@@ -1777,33 +1777,31 @@ def ingest_source(
     known = _parse_bib_fields(bib_entry) if bib_entry else {}
 
     # A DOI guessed from the text may be one the document cites rather than
-    # its own. When the file declares a title (an org #+TITLE, say) or the
-    # user gave one, and the fetched entry's title is a different one, the
-    # guess named another paper: none of that entry (authors, year, DOI)
-    # describes this file, so it is dropped for a generated one.
+    # its own. A web page or note keeps it only when its citation metadata
+    # names it: guessing from titles ("Title | Blog", front matter, arXiv
+    # labels) let pages about a paper become the paper. A PDF keeps it
+    # when its declared title, if any, is the fetched one, or when the
+    # fetched title is printed near the start, where a paper prints its own.
     if bib_entry is not None and supplied_entry is None and not doi_given:
-        # A web page's own <title> is what it declares: URL ingest passes
-        # one with the site name cut off ("Title | Blog" -> "Title").
-        declared = ((declared_title(source_path, text)
-                     if source_path.suffix.lower() in (".html", ".htm") else None)
-                    or title or declared_title(source_path, text))
-        if _page_declares_doi(source_path, doi):
-            pass  # a publisher's page, whose metadata names its own DOI
-        elif declared and not _declares_title(declared, known.get("title", "")):
+        fetched_title = known.get("title", "")
+        if source_type != "pdf":
+            if not _page_declares_doi(source_path, doi):
+                warnings.append(
+                    f"Ignored DOI {doi} found in the text: the page's citation "
+                    f"metadata does not name it. If it is this source's own, "
+                    f"ingest it again with --doi {doi}"
+                )
+                bib_entry, known, doi = None, {}, None
+        elif title and not _declares_title(title, fetched_title):
             warnings.append(
                 f"Ignored DOI {doi} found in the text: it belongs to "
-                f"\"{known.get('title', '')}\", not \"{declared}\""
+                f"\"{fetched_title}\", not \"{title}\""
             )
             bib_entry, known, doi = None, {}, None
-        elif not declared and not _title_on_first_page(known.get("title", ""), text):
-            # Nothing to compare with: a paper or web page prints its own
-            # title near the top, next to its DOI. A report, thesis or
-            # markdown note (titled in YAML front matter, or by a ## heading,
-            # or not at all) that cites a DOI there does not carry the cited
-            # paper's title with it.
+        elif not title and not _title_on_first_page(fetched_title, text):
             warnings.append(
                 f"Ignored DOI {doi} found in the text: its title "
-                f"\"{known.get('title', '')}\" is not near the start of the document"
+                f"\"{fetched_title}\" is not near the start of the document"
             )
             bib_entry, known, doi = None, {}, None
 

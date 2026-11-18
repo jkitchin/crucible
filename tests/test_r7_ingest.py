@@ -82,12 +82,17 @@ def test_stdin_note_citing_a_doi_is_not_that_paper(kb, doi_lookup):  # noqa: F81
     assert DOI not in bib(kb) and "Oxygen evolution" not in bib(kb)
 
 
-def test_web_page_with_its_title_by_its_doi_takes_the_fetched_entry(kb, tmp_path, doi_lookup):  # noqa: F811
-    (tmp_path / "page.md").write_text(
-        f"Oxygen evolution on perovskite oxides\n\nJane Smith, John Doe\n\ndoi: {DOI}\n")
+@pytest.mark.parametrize("text", [
+    f"Oxygen evolution on perovskite oxides\n\nJane Smith, John Doe\n\ndoi: {DOI}\n",
+    f"Computer Science\n\n# Title:Oxygen evolution on perovskite oxides\n\n"
+    f"https://doi.org/{DOI}\n",
+])
+def test_page_without_citation_metadata_does_not_guess_its_doi(
+        kb, tmp_path, doi_lookup, text):  # noqa: F811
+    (tmp_path / "page.md").write_text(text)
     result = run("ingest", str(tmp_path / "page.md"))
-    assert "Ignored DOI" not in result.output
-    assert DOI in bib(kb) and "Smith" in bib(kb)
+    assert "Ignored DOI" in result.output
+    assert DOI not in bib(kb)
 
 
 TITLE = "Oxygen evolution on perovskite oxides"
@@ -101,7 +106,6 @@ TITLE = "Oxygen evolution on perovskite oxides"
     ("article2.htm",
      f"<html><head><meta name='dc.identifier' content='doi:{DOI.upper()}'>"
      f"<title>ACS Catalysis - {TITLE}</title></head><body>doi:{DOI}</body></html>"),
-    ("abs.md", f"Computer Science\n\n# Title:{TITLE}\n\nhttps://doi.org/{DOI}\n"),
 ])
 def test_page_that_declares_its_own_doi_keeps_it(kb, tmp_path, doi_lookup, name, text):  # noqa: F811
     p = tmp_path / name

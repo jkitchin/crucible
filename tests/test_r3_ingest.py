@@ -120,20 +120,21 @@ def test_guessed_doi_of_another_paper_is_dropped_entirely(kb, tmp_path, doi_look
     assert "2024" in bib
 
 
-def test_guessed_doi_whose_title_matches_is_kept(kb, tmp_path, doi_lookup):  # noqa: F811
+def test_note_titled_as_the_paper_does_not_guess_its_doi(kb, tmp_path, doi_lookup):  # noqa: F811
+    # A note has no citation metadata: a matching title is not enough,
+    # since notes about a paper are titled after it too. --doi says so.
     (tmp_path / "page.md").write_text(f"# Some catalysis paper.\n\ndoi: {DOI}\n")
     result = run("ingest", str(tmp_path / "page.md"))
+    assert f"--doi {DOI}" in result.output
+    assert DOI not in (kb / ".crucible/references.bib").read_text()
+
+
+def test_note_with_its_doi_given_takes_the_fetched_entry(kb, tmp_path, doi_lookup):  # noqa: F811
+    (tmp_path / "page.md").write_text(f"Some catalysis paper\n\ndoi: {DOI}\n")
+    result = run("ingest", str(tmp_path / "page.md"), "--doi", DOI)
     assert "Ignored DOI" not in result.output
     bib = (kb / ".crucible/references.bib").read_text()
     assert DOI in bib and "Smith" in bib
-
-
-def test_web_page_without_a_title_takes_the_fetched_one(kb, tmp_path, doi_lookup):  # noqa: F811
-    # No declared title, but the page prints the fetched title by its DOI.
-    # (A bare DOI is not enough: a note citing a paper looks the same.)
-    (tmp_path / "page.md").write_text(f"Some catalysis paper\n\ndoi: {DOI}\n")
-    result = run("ingest", str(tmp_path / "page.md"))
-    assert "Ingested: Some Catalysis Paper" in result.output
 
 
 # 2. Article links follow sources the merge renames --------------------------------
