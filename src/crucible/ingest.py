@@ -198,6 +198,33 @@ def _title_key(title: str) -> str:
     return "".join(ch for ch in title.casefold() if ch.isalnum())
 
 
+# Where a page title puts the site or journal name: "Title | ACS Catalysis",
+# "Title - Wiley Online Library", "Title — Nature". Also arXiv's
+# "Title:" label before the title itself.
+_TITLE_SITE_SEP = re.compile(r"\s+(?:\||-|\u2013|\u2014|::|\u00b7)\s+")
+_TITLE_LABEL = re.compile(r"^\s*title\s*:\s*", re.IGNORECASE)
+
+
+def _declares_title(declared: str, title: str) -> bool:
+    """Whether a file declaring `declared` names the paper titled `title`.
+
+    The titles must be the same, except that a web page's title may carry
+    the site's or journal's name before or after it, set off by a
+    separator, and arXiv's pages label it "Title:". A title that merely
+    contains the other one in a sentence ("Notes on ...") is not the same.
+    """
+    want = _title_key(title)
+    if not want:
+        return False
+    declared = _TITLE_LABEL.sub("", declared)
+    if _title_key(declared) == want:
+        return True
+    parts = [_TITLE_LABEL.sub("", p) for p in _TITLE_SITE_SEP.split(declared)]
+    # The title is a run of whole parts (a title may itself contain " - ").
+    return any(_title_key(" ".join(parts[i:j])) == want
+               for i in range(len(parts)) for j in range(i + 1, len(parts) + 1))
+
+
 # Files that never carry their own DOI: a DOI in a deck or a Word document
 # is one it cites.
 _NO_OWN_DOI_SUFFIXES = frozenset({".docx", ".pptx"})
@@ -1722,7 +1749,7 @@ def ingest_source(
     # describes this file, so it is dropped for a generated one.
     if bib_entry is not None and supplied_entry is None and not doi_given:
         declared = title or declared_title(source_path, text)
-        if declared and _title_key(declared) != _title_key(known.get("title", "")):
+        if declared and not _declares_title(declared, known.get("title", "")):
             warnings.append(
                 f"Ignored DOI {doi} found in the text: it belongs to "
                 f"\"{known.get('title', '')}\", not \"{declared}\""

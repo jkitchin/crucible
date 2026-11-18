@@ -90,6 +90,35 @@ def test_web_page_with_its_title_by_its_doi_takes_the_fetched_entry(kb, tmp_path
     assert DOI in bib(kb) and "Smith" in bib(kb)
 
 
+TITLE = "Oxygen evolution on perovskite oxides"
+
+
+@pytest.mark.parametrize("name, text", [
+    ("article.html",
+     f"<html><head><title>{TITLE} | ACS Catalysis</title></head><body>"
+     f"<h1>{TITLE}</h1><p>https://doi.org/{DOI}</p></body></html>"),
+    ("article2.html",
+     f"<html><head><title>ACS Catalysis - {TITLE}</title></head><body>"
+     f"<p>https://doi.org/{DOI}</p></body></html>"),
+    ("abs.md", f"Computer Science\n\n# Title:{TITLE}\n\nhttps://doi.org/{DOI}\n"),
+])
+def test_page_title_with_site_name_keeps_its_own_doi(kb, tmp_path, doi_lookup, name, text):  # noqa: F811
+    p = tmp_path / name
+    p.write_text(text)
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI in bib(kb)
+
+
+def test_note_titled_about_a_paper_does_not_take_its_doi(kb, tmp_path, doi_lookup):  # noqa: F811
+    p = tmp_path / "note.md"
+    p.write_text(f"# Notes on {TITLE}\n\nSee https://doi.org/{DOI}\n")
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
+    assert "Ignored DOI" in result.output
+
+
 def test_note_citing_a_missing_sources_doi_is_not_restored_as_it(kb, tmp_path, doi_lookup):  # noqa: F811
     # The row for web/notes.md was rebuilt from its entry (a fresh clone):
     # a different notes.md that only cites that paper's DOI is not it.
