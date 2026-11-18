@@ -9,7 +9,8 @@ import pytest
 from test_embeddings import FakeOllama, _make_project, invoke
 
 from crucible.browse import start_server
-from crucible.database import CrucibleDB, fts_text, join_subscripts
+from crucible.database import (CrucibleDB, FTS_JOINED_SEP, fts_base, fts_text,
+                               join_subscripts)
 from crucible.embeddings import EmbeddingIndex
 
 DFT = ("DFT", "Density functional theory computes ground states.")
@@ -135,11 +136,14 @@ def test_join_subscripts(text, want):
 
 def test_fts_text_keeps_the_words_as_written():
     # The joined forms are added; the text itself is indexed unchanged.
-    assert fts_text("Amines bind CO_2 on TiO_{2}.") == (
-        "Amines bind CO_2 on TiO_{2}.\nCO2 TiO2.")
-    assert fts_text("step_1 and report_2024") == (
-        "step_1 and report_2024\nstep1 report2024")
+    # The paragraphs that change are added, joined, after a separator.
+    text = "Amines bind CO_2 on TiO_{2}.\n\nNo subscript.\n\nThen H_2O."
+    assert fts_text(text) == (
+        text + FTS_JOINED_SEP + "Amines bind CO2 on TiO2.\n\nThen H2O.")
     assert fts_text("no subscripts here") == "no subscripts here"
+    # Indexed text is not indexed twice (a migration after a sync).
+    assert fts_text(fts_text(text)) == fts_text(text)
+    assert fts_base(fts_text(text)) == text
 
 
 def test_words_with_digit_subscripts_are_still_found_by_their_parts(
@@ -242,7 +246,7 @@ def test_sync_reindexes_old_rows_without_counting_an_edit(
         assert "CO2" in row["content"]
         # Put the row back as an index built before subscripts were joined.
         d.conn.execute("UPDATE article_fts SET content = ? WHERE rowid = ?",
-                       (row["content"].rsplit("\n", 1)[0], aid))
+                       (fts_base(row["content"]), aid))
         d.conn.commit()
         assert titles(d.search("CO2")) == []
     finally:
@@ -286,3 +290,68 @@ def test_phrase_finds_each_way_of_writing_a_subscript(
         assert titles(d.search(f'"{typed} reduction"')) == ["Red"]
     finally:
         d.close()
+
+
+@pytest.fixture
+def phrase_db(tmp_path):
+    d = CrucibleDB(tmp_path / "p.db")
+    d.initialize()
+    for i, (title, body) in enumerate((
+            ("Cobalt", "Solutions of Co 2+ ions, then Python 3 scripts and Table 2."),
+            ("Apart", "We measured CO_2 uptake. Later, unrelated, H_2O was added."),
+            ("End", "Only at the end is CO_2 mentioned"),
+            ("Water", "Photocatalytic H_2O splitting on Fe_2O_3 rust."))):
+        d.add_article(path=f".crucible/wiki/concepts/p{i}.org", title=title,
+                      article_type="concept", content=body)
+    yield d
+    d.close()
+
+
+@pytest.mark.parametrize("q", ['"CO2"', '"Python3"', '"Table2"'])
+def test_phrase_with_digits_does_not_match_them_written_apart(phrase_db, q):
+    assert titles(phrase_db.search(q)) == ([] if q != '"CO2"' else ["Apart", "End"])
+
+
+@pytest.mark.parametrize("q", ['"CO2 H2O"', '"mentioned CO2"', '"mentioned CO_2"'])
+def test_phrase_does_not_run_across_the_joined_copy(phrase_db, q):
+    assert titles(phrase_db.search(q)) == []
+
+
+@pytest.mark.parametrize("q", ['"H2O splitting"', '"H₂O splitting"',
+                               '"Fe2O3 rust"', '"H_2O splitting"'])
+def test_phrase_with_a_subscript_inside_the_word(phrase_db, q):
+    assert titles(phrase_db.search(q)) == ["Water"]
+
+
+def test_migration_after_sync_does_not_reindex_twice(
+        tmp_path, registry, monkeypatch):
+    # New sync on a v2 database reindexes it; a later migration (update,
+    # init) must leave those rows alone, or the next sync counts an edit.
+    monkeypatch.delenv("CRUCIBLE_OLLAMA_URL", raising=False)
+    root = _make_project(tmp_path / "kb", monkeypatch, {"c.org": CAPTURE})
+    db_path = root / ".crucible" / "crucible.db"
+    d = CrucibleDB(db_path)
+    try:
+        aid = d.get_article_by_path(".crucible/wiki/concepts/c.org")["id"]
+        row = d.get_article_fts(aid)
+        d.conn.execute("UPDATE article_fts SET content = ? WHERE rowid = ?",
+                       (fts_base(row["content"]), aid))
+        d.conn.execute("DELETE FROM schema_version")
+        d.conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+        d.conn.commit()
+    finally:
+        d.close()
+    assert invoke("sync").exit_code == 0
+    d = CrucibleDB(db_path)
+    try:
+        assert d.schema_version() == 2
+        d.initialize()
+        assert d.get_article_fts(aid) == row
+    finally:
+        d.close()
+    edits = []
+    monkeypatch.setattr(CrucibleDB, "delete_embedding",
+                        lambda self, article_id: edits.append(article_id))
+    result = invoke("sync")
+    assert "0 updated" in result.output
+    assert edits == []

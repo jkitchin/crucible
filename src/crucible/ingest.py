@@ -204,10 +204,11 @@ _TITLE_LABEL = re.compile(r"^\s*title\s*:\s*", re.IGNORECASE)
 # The metadata a publisher's page carries for its own article. A page
 # that only discusses a paper (a forum thread, a video, a blog post)
 # does not declare its DOI this way.
-_OWN_DOI_META = re.compile(
-    r"""<meta\s[^>]*?name\s*=\s*["']?(?:citation_doi|dc\.identifier|prism\.doi)["']?"""
-    r"""[^>]*?content\s*=\s*["']\s*(?:doi:\s*|https?://(?:dx\.)?doi\.org/)?([^"'\s]+)""",
-    re.IGNORECASE)
+_META_TAG = re.compile(r"<meta\s[^>]*>", re.IGNORECASE)
+_META_ATTR = re.compile(r"""([\w:.-]+)\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+)""")
+_OWN_DOI_NAMES = frozenset({"citation_doi", "dc.identifier", "prism.doi"})
+_DOI_PREFIX = re.compile(r"^\s*(?:doi:\s*|info:doi/|https?://(?:dx\.)?doi\.org/)",
+                         re.IGNORECASE)
 
 
 def _declares_title(declared: str, title: str) -> bool:
@@ -231,8 +232,15 @@ def _page_declares_doi(path: Path, doi: str) -> bool:
         head = path.read_bytes()[:200_000].decode("utf-8", "replace")
     except OSError:
         return False
-    return any(m.group(1).rstrip(".").casefold() == doi.casefold()
-               for m in _OWN_DOI_META.finditer(head))
+    for tag in _META_TAG.finditer(head):
+        attrs = {k.casefold(): v.strip("\"'")
+                 for k, v in _META_ATTR.findall(tag.group(0))}
+        if (attrs.get("name") or attrs.get("property") or "").casefold() not in _OWN_DOI_NAMES:
+            continue
+        own = _DOI_PREFIX.sub("", attrs.get("content", "")).strip().rstrip(".")
+        if own and own.casefold() == doi.casefold():
+            return True
+    return False
 
 
 # Files that never carry their own DOI: a DOI in a deck or a Word document
@@ -291,13 +299,18 @@ def declared_title(path: Path, text: str) -> str | None:
             return meta.title
 
     if suffix == ".md":
+        front = re.match(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|\Z)",
+                         text or "", re.DOTALL)
+        if front:
+            m = re.search(r"^title\s*:\s*(.+?)\s*$", front.group(1), re.MULTILINE)
+            if m and m.group(1).strip("\"' "):
+                return m.group(1).strip().strip("\"'").strip()
         for line in text.split("\n"):
             line = line.strip()
             if line.startswith("# "):
                 return line[2:].strip()
 
     if suffix in (".html", ".htm"):
-        import re
         m = re.search(r"<title>(.*?)</title>",
                        path.read_text(encoding="utf-8", errors="replace"),
                        re.IGNORECASE | re.DOTALL)
@@ -1502,7 +1515,8 @@ def _norm_title(title: str | None) -> str:
 
 
 def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str,
-                      title: str | None, doi: str | None, text: str) -> str | None:
+                      title: str | None, doi: str | None, text: str,
+                      url: str | None = None) -> str | None:
     """Why source_path may not be the missing file of the row src, or None.
 
     The row was rebuilt from its bib entry, so it has no hash to compare.
@@ -1510,11 +1524,21 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     paper's or web page's text) equals the row's, or failing a DOI on both
     sides, when its title (given, or declared by the file) equals the
     row's, or when its text equals the row's committed text sidecar. A
-    disagreeing DOI, or no evidence at all, is a problem.
+    disagreeing DOI, or no evidence at all, is a problem. When both the
+    row and the ingest have a URL, it decides: URL ingest names pages from
+    a title with the site cut off, so "Introduction" pages of two sites
+    share a name.
     """
     key = _source_metadata(src).get("cite_key") or src["path"]
     advice = ("If it is that source, run again with --restore; if not, "
               "rename the file before ingesting it.")
+    row_url, file_url = (u.strip().rstrip("/") if u else None for u in (src.get("url"), url))
+    if row_url and file_url:
+        if row_url != file_url:
+            return (f"{source_path.name} would be stored as {src['path']}, the missing "
+                    f"file of source {key}, but it comes from {file_url}, not that "
+                    f"source's {row_url}. {advice}")
+        return None
     row_doi = _norm_doi(_source_metadata(src).get("doi"))
     file_doi = _norm_doi(doi or (extract_doi_from_text(text)
                                  if may_carry_own_doi(source_type, source_path) else None))
@@ -1720,7 +1744,7 @@ def ingest_source(
         text = extract_text(source_path)
         if not restore:
             problem = _restore_mismatch(root, holder, source_path, source_type,
-                                        title, doi, text)
+                                        title, doi, text, url)
             if problem:
                 raise ValueError(problem)
         return _restore_source(root, db, holder, source_path, content_hash, text)
@@ -1758,7 +1782,11 @@ def ingest_source(
     # guess named another paper: none of that entry (authors, year, DOI)
     # describes this file, so it is dropped for a generated one.
     if bib_entry is not None and supplied_entry is None and not doi_given:
-        declared = title or declared_title(source_path, text)
+        # A web page's own <title> is what it declares: URL ingest passes
+        # one with the site name cut off ("Title | Blog" -> "Title").
+        declared = ((declared_title(source_path, text)
+                     if source_path.suffix.lower() in (".html", ".htm") else None)
+                    or title or declared_title(source_path, text))
         if _page_declares_doi(source_path, doi):
             pass  # a publisher's page, whose metadata names its own DOI
         elif declared and not _declares_title(declared, known.get("title", "")):
@@ -1839,6 +1867,23 @@ def ingest_source(
     # interrupt before the copy still removes the empty placeholders.
     created: list[Path] = []
     cite_key = None
+    undone = False
+
+    def undo() -> None:
+        # Leave nothing behind: no orphan copy, sidecar or bib entry.
+        nonlocal undone
+        undone = True
+        if cite_key is not None:
+            try:
+                _drop_bib_entry(root, cite_key, rel_path)
+            except Exception:
+                pass
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     try:
         write_sidecar = False
         if in_place:
@@ -1885,49 +1930,46 @@ def ingest_source(
         # insert would then fail on the path and undo the ingest, leaving
         # the sync's row with no entry and no file.
         with _bib_lock(root):
-            cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
-            bib_entry = replace_cite_key(bib_entry, cite_key)
+            try:
+                cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
+                bib_entry = replace_cite_key(bib_entry, cite_key)
 
-            # Describe the source exactly as a rebuild from the entry would.
-            first = bibtex_mod.first_entry(bib_entry)
-            rebuilt = _fields_from_bib(
-                {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
-            )
-            title = rebuilt["title"]
-            authors = rebuilt["authors"] or authors
-            date = rebuilt["date"] or date
-            url = rebuilt["url"] or url
+                # Describe the source exactly as a rebuild from the entry would.
+                first = bibtex_mod.first_entry(bib_entry)
+                rebuilt = _fields_from_bib(
+                    {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
+                )
+                title = rebuilt["title"]
+                authors = rebuilt["authors"] or authors
+                date = rebuilt["date"] or date
+                url = rebuilt["url"] or url
 
-            # Register in database (store cite_key and content hash in metadata)
-            metadata = {"cite_key": cite_key, "content_hash": content_hash}
-            if write_sidecar:
-                # Lets delete tell this sidecar from a user's own <stem>.txt.
-                metadata["text_hash"] = file_sha256(text_path)
-            if doi:
-                metadata["doi"] = doi
-            source_id = _add_or_adopt_source(
-                db, cite_key,
-                path=rel_path,
-                title=title,
-                source_type=source_type,
-                shareable=shareable,
-                url=url,
-                authors=authors,
-                date=date,
-                metadata=metadata,
-            )
+                # Register in database (store cite_key and content hash in metadata)
+                metadata = {"cite_key": cite_key, "content_hash": content_hash}
+                if write_sidecar:
+                    # Lets delete tell this sidecar from a user's own <stem>.txt.
+                    metadata["text_hash"] = file_sha256(text_path)
+                if doi:
+                    metadata["doi"] = doi
+                source_id = _add_or_adopt_source(
+                    db, cite_key,
+                    path=rel_path,
+                    title=title,
+                    source_type=source_type,
+                    shareable=shareable,
+                    url=url,
+                    authors=authors,
+                    date=date,
+                    metadata=metadata,
+                )
+            except BaseException:
+                # Undone before the lock is released, so a sync never sees
+                # the entry without its row.
+                undo()
+                raise
     except BaseException:
-        # Leave nothing behind: no orphan copy, sidecar or bib entry.
-        if cite_key is not None:
-            try:
-                _drop_bib_entry(root, cite_key, rel_path)
-            except Exception:
-                pass
-        for path in reversed(created):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        if not undone:
+            undo()
         raise
 
     if text_path != dest_path and not text_path.exists():

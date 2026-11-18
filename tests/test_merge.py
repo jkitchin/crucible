@@ -556,21 +556,24 @@ def test_merge_copies_through_target_layout_symlinks(
     assert (elsewhere / "paper.md").read_text() == "Imported source.\n"
 
 
+@pytest.mark.parametrize("linked", ["sources", "sources/external"])
 def test_merge_refuses_a_source_symlink_out_of_the_source_crucible(
-    project, tmp_path, monkeypatch
+    project, tmp_path, monkeypatch, linked
 ):
-    # A shared crucible whose committed sources/ links to the user's home
-    # must not get files from there copied into the target's tree.
+    # A shared crucible whose committed sources/ or sources/external links
+    # to the user's home (git stores the link; .gitignore's "external/"
+    # matches only a directory) must not get files from there copied into
+    # the target, not even into its private sources/external/.
     home = tmp_path / "home"
     (home / ".ssh").mkdir(parents=True)
     (home / ".ssh" / "id_rsa").write_text("SECRET\n")
     source = make_crucible(tmp_path / "source")
-    sources = source / ".crucible" / "sources"
+    sources = source / ".crucible" / linked
     shutil.rmtree(sources)
     sources.symlink_to(home, target_is_directory=True)
     (source / ".crucible" / "references.bib").write_text(
         "@misc{key2026,\n  title = {Key},\n"
-        "  file = {.crucible/sources/.ssh/id_rsa},\n}\n")
+        f"  file = {{.crucible/{linked}/.ssh/id_rsa}},\n}}\n")
     db = source / ".crucible" / "crucible.db"
     if db.exists():
         db.unlink()

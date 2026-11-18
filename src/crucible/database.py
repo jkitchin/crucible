@@ -208,10 +208,6 @@ _UNICODE_SUBSCRIPTS = str.maketrans("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\
                                     "0123456789")
 
 
-_TO_SUBSCRIPTS = str.maketrans("0123456789",
-                               "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089")
-
-
 def join_subscripts(text: str) -> str:
     """TEXT with chemical subscripts joined: CO_2, CO_{2} and CO\u2082 become CO2."""
     if not text:
@@ -220,28 +216,40 @@ def join_subscripts(text: str) -> str:
     return _SUBSCRIPT_RE.sub(lambda m: m.group(1) or m.group(2), text)
 
 
+# Separates a row's text from the joined copy fts_text adds. It is a
+# private-use character, which unicode61 indexes as a word of its own, so a
+# phrase cannot run from the end of the text into the copy, and no query
+# asks for it.
+FTS_JOINED_SEP = "\n\ue000\n"
+
+
+def fts_base(text: str) -> str:
+    """The text fts_text was given, from what it returned."""
+    return text.split(FTS_JOINED_SEP, 1)[0] if text else text
+
+
 def fts_text(text: str) -> str:
-    """Text as it is put in the FTS index: TEXT plus its joined subscripts.
+    """Text as it is put in the FTS index: TEXT plus its paragraphs with subscripts joined.
 
     The unicode61 tokenizer splits words at "_", so CO_2 is indexed as "co"
     and "2" and a search for CO2 would miss it. The text is indexed as
-    written, and each word with a subscript is added once more, joined, at
-    the end: CO2 then finds CO_2, CO_{2} and CO\u2082, while step_1 is
-    still found by step, and phrases ("CO_2 reduction") still match the
-    words as written. Since the text is kept, any edit to the file changes
-    the indexed text.
+    written, and each paragraph with a subscript is added once more, joined,
+    after FTS_JOINED_SEP: CO2 and the phrase "CO2 reduction" then find
+    CO_2, CO_{2} and CO\u2082, while step_1 is still found by step, and
+    "CO_2 reduction" still matches the words as written. Since the text is
+    kept, any edit to the file changes the indexed text. Text already
+    passed through fts_text is returned unchanged.
     """
-    if not text:
+    if not text or FTS_JOINED_SEP in text:
         return text
     joined = []
-    for word in text.split():
-        if "_" in word or any("\u2080" <= ch <= "\u2089" for ch in word):
-            j = join_subscripts(word)
-            if j != word:
-                joined.append(j)
+    for para in re.split(r"\n\s*\n", text):
+        j = join_subscripts(para)
+        if j != para:
+            joined.append(j)
     if not joined:
         return text
-    return text + "\n" + " ".join(dict.fromkeys(joined))
+    return text + FTS_JOINED_SEP + "\n\n".join(joined)
 
 
 # A query term: a "quoted phrase" (straight or curly quotes) starting a
@@ -310,14 +318,9 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     terms = []
     for is_phrase, token, orig in _query_terms(raw):
         if is_phrase:
-            # As typed, joined, and with a word's trailing digits read as a
-            # subscript, written _N (CO_2, CO_{2}) or as a subscript digit
-            # (CO\u2082), since the joined forms are indexed apart from the
-            # sentence: "CO2 reduction" finds each way of writing it.
-            digits = r"(?<=[A-Za-z)])(\d+)(?![\w])"
-            split = re.sub(digits, r"_\1", token)
-            sub = re.sub(digits, lambda m: m.group(1).translate(_TO_SUBSCRIPTS), token)
-            alts = list(dict.fromkeys((orig, token, split, sub)))
+            # As typed, and joined, which matches the joined copy of the
+            # text (fts_text): "CO2 reduction" finds each way of writing it.
+            alts = list(dict.fromkeys((orig, token)))
             terms.append(_fts_literal(alts[0]) if len(alts) == 1 else
                          "(" + " OR ".join(_fts_literal(a) for a in alts) + ")")
             continue
@@ -403,8 +406,8 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
         for row in conn.execute(sql, (query_match,)):
             r = dict(row)
             # fts_text: the index may predate joined subscripts (a peer's).
-            text = _fold(fts_text(
-                f"{r.pop('_fts_title') or ''}\n{r.pop('_fts_content') or ''}"))
+            text = _fold(fts_text(r.pop("_fts_title") or "") + "\n"
+                         + fts_text(r.pop("_fts_content") or ""))
             if r["id"] in seen or not all(any(p.search(text) for p in alts)
                                              for alts in prefixes):
                 continue
@@ -495,7 +498,8 @@ class CrucibleDB:
             rows = self.conn.execute(
                 "SELECT rowid, title, content FROM article_fts").fetchall()
             for row in rows:
-                title, content = fts_text(row["title"]), fts_text(row["content"])
+                title = fts_text(fts_base(row["title"]))
+                content = fts_text(fts_base(row["content"]))
                 if (title, content) != (row["title"], row["content"]):
                     self.conn.execute(
                         "UPDATE article_fts SET title = ?, content = ? WHERE rowid = ?",

@@ -16,7 +16,7 @@ import click
 
 from crucible import package_version
 from crucible import registry as registry_module
-from crucible.database import CrucibleDB, fts_text
+from crucible.database import CrucibleDB, fts_base, fts_text
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source, read_bib_text, write_bib_text
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
@@ -855,6 +855,33 @@ def _alias_target(root: Path, target: Path) -> Path:
     return real if real is not None else target
 
 
+def _wiki_link_on_path(root: Path, path: Path) -> Path | None:
+    """The real path PATH reaches through a symlink alias in the wiki, else None.
+
+    PATH is absolute and as typed. A component of it that is a symlink
+    lying in the wiki and pointing into the wiki makes it an alias, as the
+    wiki walk sees it (see wikiwalk), however the path reaches that link:
+    through the project, another spelling of the root (/tmp for
+    /private/tmp), or a link from outside the project (~/wiki ->
+    .crucible/wiki). A symlinked wiki or project directory is not such a
+    link, so the real path of an article is never an alias.
+    """
+    try:
+        wiki_real = Path(os.path.realpath(cdir(root) / "wiki"))
+        parts = path.parts
+        for i in range(1, len(parts)):
+            q = Path(*parts[:i + 1])
+            if not q.is_symlink():
+                continue
+            where = Path(os.path.realpath(q.parent)) / q.name
+            if (where.is_relative_to(wiki_real) and where != wiki_real
+                    and Path(os.path.realpath(q)).is_relative_to(wiki_real)):
+                return Path(os.path.realpath(path))
+    except OSError:
+        return None
+    return None
+
+
 def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
     """The project-relative path a wiki file link points at, or None.
 
@@ -1139,7 +1166,9 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                 # A row indexed before subscripts were joined (fts_text)
                 # holds the file's text as is: the file is unchanged, but
                 # the row is reindexed below.
-                stale_index = indexed != current and indexed == {
+                stale_index = indexed != current and indexed is not None and {
+                    "path": indexed["path"], "title": fts_base(indexed["title"]),
+                    "content": fts_base(indexed["content"])} == {
                     "path": rel_path, "title": meta.title, "content": meta.content}
                 changed = (
                     any(existing[k] != v for k, v in fields.items())
@@ -2249,21 +2278,24 @@ def delete(path, yes, delete_file):
         # however it is named (wiki-relative, project-relative, absolute).
         article = None
         for candidate in _project_path_candidates(root, path, aliases=False):
-            if os.path.isabs(candidate):
-                # The path as typed; its root-relative forms follow. An
-                # absolute path spells the root its own way (/tmp for
-                # /private/tmp), which is no alias.
-                continue
-            named = Path(os.path.normpath(root / candidate))
-            real = _alias_target(root, named)
-            if real != named:
+            real = _wiki_link_on_path(root, Path(os.path.abspath(root / candidate)))
+            if real is not None:
                 raise click.ClickException(
                     f"{path} is a symlink alias of {_target_rel(root, real)}. "
                     "Delete the symlink by hand, or name the article's own "
                     "path to delete the article.")
-            article = db.get_article_by_path(candidate)
-            if article:
-                break
+            if not os.path.isabs(candidate):
+                article = db.get_article_by_path(candidate)
+                if article:
+                    break
+        else:
+            # No alias on the way: the real file may be named through a
+            # symlinked wiki (.crucible/wiki -> ../wiki-real) or root.
+            for candidate in _project_path_candidates(root, path, aliases=False):
+                rel = _target_rel(root, Path(os.path.realpath(root / candidate)))
+                article = db.get_article_by_path(rel) if rel else None
+                if article:
+                    break
         src = None if article else _lookup_project_path(root, path, db.get_source_by_path)
         if not article and not src:
             src = _source_by_cite_key(db, path)
@@ -3479,12 +3511,14 @@ def _check_merge_copy(
         raise _MergeConflict(f"Cannot safely merge '{source}': not a regular file.")
     real_source = Path(os.path.realpath(source))
     lexical_source = Path(os.path.normpath(os.path.abspath(source)))
+    # The incoming crucible may be someone else's clone, and git keeps the
+    # symlinks it commits, so no link in it is trusted: the file must really
+    # be inside it. (Its own sources/external/ on another drive is refused.)
     if not (
-        (lexical_source.is_relative_to(
+        lexical_source.is_relative_to(
             os.path.normpath(os.path.abspath(source_root / CRUCIBLE_DIR)))
-         and real_source.is_relative_to(
-             Path(os.path.realpath(source_root)) / CRUCIBLE_DIR))
-        or _merge_inside(source, source_root, _MERGE_PRIVATE_DIRS)
+        and real_source.is_relative_to(
+            Path(os.path.realpath(source_root)) / CRUCIBLE_DIR)
     ):
         raise _MergeConflict(
             f"Cannot safely merge '{source}': it resolves outside the source crucible."
@@ -3864,11 +3898,20 @@ def _replace_file(path: Path, text: str) -> None:
     link shares, and so overwrite whatever article `path` was linked to.
     Renaming replaces the link itself. The file gets the mode a plain
     write would give it (0666 less the umask), not mkstemp's 0600.
+    In a directory that cannot be written (chmod 555) but whose file can,
+    a plain file that is no link is written in place, as before.
     """
     umask = os.umask(0)
     os.umask(umask)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.",
-                               suffix=".tmp")
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.",
+                                   suffix=".tmp")
+    except PermissionError as e:
+        if path.is_file() and not _is_link(path) and os.access(path, os.W_OK):
+            path.write_text(text, encoding="utf-8")
+            return
+        raise click.ClickException(
+            f"Cannot write {path}: its directory is not writable ({e.strerror}).")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)

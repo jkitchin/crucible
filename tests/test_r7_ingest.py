@@ -265,3 +265,126 @@ def test_restore_into_a_row_without_a_bib_entry_is_refused(kb, tmp_path):  # noq
     assert result.exit_code != 0
     assert "no entry" in result.output
     assert not (kb / WEB / "paper.md").exists()
+
+
+# -- eighth review round --------------------------------------------------------
+
+class _Page:
+    def __init__(self, body):
+        self.body = body
+
+    class headers:
+        get_content_type = staticmethod(lambda: "text/html")
+        get_content_charset = staticmethod(lambda: "utf-8")
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def web(monkeypatch):
+    import urllib.request
+    pages = {}
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=30: _Page(pages[req.full_url]))
+    return pages
+
+
+def test_url_page_about_a_paper_does_not_take_its_doi(kb, doi_lookup, web):  # noqa: F811
+    # URL ingest cuts "| Blog" off the title it names the page by; the
+    # check must still see the page's own <title>.
+    url = "https://blog.example.org/journal-club"
+    web[url] = (f"<html><head><title>{TITLE} | Reading Group Blog</title></head>"
+                f"<body><h1>Our take on {TITLE}</h1><p>doi:{DOI}</p></body></html>").encode()
+    result = run("ingest", url)
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
+    assert "Ignored DOI" in result.output
+
+
+def test_url_publisher_page_keeps_its_doi(kb, doi_lookup, web):  # noqa: F811
+    url = "https://pubs.example.org/doi/abs/x"
+    web[url] = (f"<html><head><title>{TITLE} | ACS Catalysis</title>"
+                f'<meta content="{DOI}" property="citation_doi"></head>'
+                f"<body><h1>{TITLE}</h1><p>doi:{DOI}</p></body></html>").encode()
+    result = run("ingest", url)
+    assert result.exit_code == 0, result.output
+    assert DOI in bib(kb)
+
+
+def test_url_page_is_not_restored_into_another_sites_page(kb, web):  # noqa: F811
+    # Two sites' "Introduction" pages share the stored name; on a fresh
+    # clone the second must not become the first's missing file.
+    rust, python = "https://doc.rust-lang.org/book/intro", "https://docs.python.org/3/intro"
+    web[rust] = b"<html><head><title>Introduction - Rust</title></head><body>Rust.</body></html>"
+    web[python] = b"<html><head><title>Introduction - Python</title></head><body>Py.</body></html>"
+    run("ingest", rust)
+    for p in (kb / WEB).iterdir():
+        p.unlink()
+    (kb / ".crucible/crucible.db").unlink()
+    run("sync")
+    result = run("ingest", python, ok=False)
+    assert result.exit_code != 0
+    assert "comes from" in result.output
+    assert not (kb / WEB / "introduction.html").exists()
+    # The same URL is restored.
+    result = run("ingest", rust)
+    assert "Rust." in (kb / WEB / "introduction.html").read_text()
+
+
+@pytest.mark.parametrize("front", [
+    "---\ntitle: Journal club 2026-11-10\n---\n",
+    "---\nauthor: me\ntitle: \"Journal club\"\n...\n",
+])
+def test_markdown_note_titled_in_front_matter_does_not_take_its_doi(
+        kb, tmp_path, doi_lookup, front):  # noqa: F811
+    p = tmp_path / "reading-notes.md"
+    p.write_text(front + f"\nWe read Smith, {TITLE}, doi:{DOI}.\n")
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
+    assert "Journal club" in bib(kb)
+
+
+@pytest.mark.parametrize("meta", [
+    f'<meta content="{DOI}" name="citation_doi">',
+    f'<meta property="citation_doi" content="{DOI}">',
+    f'<meta name="dc.identifier" content="info:doi/{DOI}">',
+])
+def test_page_declaring_its_doi_in_any_meta_form_keeps_it(
+        kb, tmp_path, doi_lookup, meta):  # noqa: F811
+    p = tmp_path / "article.html"
+    p.write_text(f"<html><head><title>{TITLE} | ACS Catalysis</title>{meta}</head>"
+                 f"<body>doi:{DOI}</body></html>")
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI in bib(kb)
+
+
+def test_failed_ingest_is_undone_before_the_bib_lock_is_released(
+        kb, tmp_path, monkeypatch):  # noqa: F811
+    held = []
+    drop = ingest_module._drop_bib_entry
+
+    def checked_drop(root, key, rel):
+        held.append(ingest_module._bib_lock(root).is_locked)
+        drop(root, key, rel)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ingest_module, "_drop_bib_entry", checked_drop)
+    monkeypatch.setattr(CrucibleDB, "add_source", fail)
+    p = tmp_path / "n.md"
+    p.write_text("# N\n\nx\n")
+    result = run("ingest", str(p), ok=False)
+    assert result.exit_code != 0
+    assert held == [True]
+    assert "@" not in bib(kb)
+    assert not list((kb / WEB).glob("n*"))

@@ -175,3 +175,58 @@ def test_delete_real_article_through_another_spelling_of_the_root(
                  ok=False)
     assert result.exit_code != 0 and "symlink alias" in result.output
     assert (wiki(kb) / "concepts" / "density-functional-theory.org").exists()
+
+
+def test_delete_refuses_an_alias_reached_through_a_link_outside_the_project(
+        kb, tmp_path):  # noqa: F811
+    # ~/wiki -> .crucible/wiki: dft.org under it is still the alias.
+    alias_kb(kb)
+    (wiki(kb) / "concepts" / "other.org").write_text(article("Other"))
+    os.symlink("concepts", wiki(kb) / "topics")
+    run("sync")
+    outside = tmp_path / "outlink"
+    os.symlink(wiki(kb), outside)
+    for spelling in (outside / "dft.org", outside / "topics" / "other.org"):
+        result = run("delete", str(spelling), "--yes", "--file", ok=False)
+        assert result.exit_code != 0 and "symlink alias" in result.output, spelling
+    assert (wiki(kb) / "concepts" / "density-functional-theory.org").exists()
+    assert (wiki(kb) / "concepts" / "other.org").exists()
+    # The real article through the outside link is deleted.
+    run("delete", str(outside / "concepts" / "other.org"), "--yes", "--file")
+    assert not (wiki(kb) / "concepts" / "other.org").exists()
+
+
+def test_delete_in_a_wiki_that_is_a_symlink_into_the_project(
+        kb, monkeypatch):  # noqa: F811
+    # .crucible/wiki -> ../wiki-real: the real files are no aliases.
+    real_wiki = kb / "wiki-real"
+    os.rename(wiki(kb), real_wiki)
+    os.symlink("../wiki-real", wiki(kb))
+    (real_wiki / "concepts" / "a.org").write_text(article("A"))
+    (real_wiki / "concepts" / "b.org").write_text(article("B"))
+    run("sync")
+    run("delete", str(real_wiki / "concepts" / "b.org"), "--yes", "--file")
+    assert not (real_wiki / "concepts" / "b.org").exists()
+    monkeypatch.chdir(real_wiki / "concepts")
+    run("delete", "a.org", "--yes", "--file")
+    assert not (real_wiki / "concepts" / "a.org").exists()
+
+
+def test_sync_in_a_read_only_wiki_directory_rewrites_its_files_in_place(kb):  # noqa: F811
+    (wiki(kb) / "index.org").unlink(missing_ok=True)
+    os.chmod(wiki(kb), 0o555)
+    try:
+        # index.org cannot be created there: a clear error, not a traceback.
+        result = run("sync", ok=False)
+        assert result.exit_code == 1
+        assert "directory is not writable" in result.output
+        os.chmod(wiki(kb), 0o755)
+        run("sync")
+        (wiki(kb) / "concepts" / "two.org").write_text(article("Two"))
+        os.chmod(wiki(kb), 0o555)
+        result = run("sync")
+    finally:
+        os.chmod(wiki(kb), 0o755)
+    assert result.exit_code == 0, result.output
+    assert "1 added" in result.output
+    assert "Two" in (wiki(kb) / "index.org").read_text()

@@ -108,6 +108,13 @@ def test_merge_accepts_a_symlinked_external_directory(
     monkeypatch.setattr(os, "rename", rename)
     monkeypatch.chdir(project)
     result = invoke("merge", str(source), "--yes")
+    if side == "source":
+        # A clone keeps a committed symlink, so a shared crucible's
+        # sources/external link could pull any file into the target.
+        assert result.exit_code != 0
+        assert "resolves outside the source crucible" in result.output
+        assert not (project / ".crucible/sources/external/pdfs/paper.pdf").exists()
+        return
     assert result.exit_code == 0, result.output
     landed = project / ".crucible/sources/external/pdfs/paper.pdf"
     assert landed.read_bytes() == b"%PDF-1.4 fake paper"
