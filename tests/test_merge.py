@@ -527,33 +527,95 @@ def test_merge_refuses_private_metadata_in_shareable_source_paths(
             assert not (project / data / "paper.pdf").exists()
 
 
-@pytest.mark.parametrize("outside_crucible", [False, True])
-def test_merge_refuses_target_directory_symlinks_outside_the_crucible(
-    project, tmp_path, monkeypatch, outside_crucible
+@pytest.mark.parametrize("linked", ["sources/data", "sources/notebooks"])
+def test_merge_copies_through_target_layout_symlinks(
+    project, tmp_path, monkeypatch, linked
 ):
+    # The target's own data or notebooks kept on another drive.
     source = make_crucible(tmp_path / "source")
     runner = CliRunner()
-    (source / ".crucible/sources/data/paper.md").write_text("Imported source.\n")
+    (source / ".crucible" / linked / "paper.md").write_text("Imported source.\n")
     monkeypatch.chdir(source)
     result = runner.invoke(cli, ["sync"])
     assert result.exit_code == 0, result.output
 
     monkeypatch.chdir(project)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    if outside_crucible:
-        outside = project
-    target_data = project / ".crucible/sources/data"
-    target_data.rmdir()
+    elsewhere = tmp_path / "other-drive"
+    elsewhere.mkdir()
+    target_dir = project / ".crucible" / linked
+    shutil.rmtree(target_dir)
     try:
-        target_data.symlink_to(outside, target_is_directory=True)
+        target_dir.symlink_to(elsewhere, target_is_directory=True)
     except (OSError, NotImplementedError) as exc:
         pytest.skip(f"Symlinks unavailable: {exc}")
-    for args in (["--dry-run"], ["--yes"]):
-        result = runner.invoke(cli, ["merge", str(source), *args])
-        assert result.exit_code != 0
-        assert "outside" in result.output.lower()
-        assert not (outside / "paper.md").exists()
+    result = runner.invoke(cli, ["merge", str(source), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert not (elsewhere / "paper.md").exists()
+    result = runner.invoke(cli, ["merge", str(source), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert (elsewhere / "paper.md").read_text() == "Imported source.\n"
+
+
+def test_merge_refuses_a_source_symlink_out_of_the_source_crucible(
+    project, tmp_path, monkeypatch
+):
+    # A shared crucible whose committed sources/ links to the user's home
+    # must not get files from there copied into the target's tree.
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_rsa").write_text("SECRET\n")
+    source = make_crucible(tmp_path / "source")
+    sources = source / ".crucible" / "sources"
+    shutil.rmtree(sources)
+    sources.symlink_to(home, target_is_directory=True)
+    (source / ".crucible" / "references.bib").write_text(
+        "@misc{key2026,\n  title = {Key},\n"
+        "  file = {.crucible/sources/.ssh/id_rsa},\n}\n")
+    db = source / ".crucible" / "crucible.db"
+    if db.exists():
+        db.unlink()
+    monkeypatch.chdir(project)
+    result = CliRunner().invoke(cli, ["merge", str(source), "--yes"])
+    assert result.exit_code != 0
+    assert "outside the source crucible" in result.output
+    assert not list(project.rglob("id_rsa"))
+
+
+@pytest.mark.parametrize("blocked", ["readonly-file", "locked"])
+def test_merge_dry_run_does_not_write_the_target_database(
+    project, tmp_path, monkeypatch, blocked
+):
+    import traceback
+
+    import libsql
+
+    source = make_crucible(tmp_path / "source")
+    (source / ".crucible/sources/data/a.csv").write_text("x\n1\n")
+    monkeypatch.chdir(source)
+    assert CliRunner().invoke(cli, ["sync"]).exit_code == 0
+    # An unsynced file in the target counts, but nothing is written for it.
+    (project / ".crucible/sources/data/b.csv").write_text("y\n2\n")
+    monkeypatch.chdir(project)
+    cdir = project / ".crucible"
+    db = cdir / "crucible.db"
+    before = db.read_bytes()
+    holder = None
+    if blocked == "readonly-file":
+        db.chmod(0o444)
+    else:
+        holder = libsql.connect(str(db))
+        holder.execute("BEGIN IMMEDIATE")
+    try:
+        result = CliRunner().invoke(cli, ["merge", str(source), "--dry-run"])
+    finally:
+        if holder is not None:
+            holder.execute("ROLLBACK")
+            holder.close()
+        db.chmod(0o644)
+    assert result.exit_code == 0, "".join(
+        traceback.format_exception(result.exception)) if result.exception else result.output
+    assert "Would merge: 1 sources" in result.output
+    assert db.read_bytes() == before
 
 
 @pytest.mark.parametrize(

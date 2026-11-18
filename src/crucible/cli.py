@@ -2982,30 +2982,35 @@ class _MergeConflict(Exception):
     """A single reason an incoming source cannot be merged safely."""
 
 
-class _MergeRollback(Exception):
-    """Raised to roll back a transaction opened only to look ahead."""
-
-
 def _merge_target_sources(root: Path, target_db: CrucibleDB) -> list[dict]:
     """The target's source rows, with the files in sources/notebooks/ and
     sources/data/ keyed as the sync after the merge (or a rebuild) keys them.
 
     The database may predate files added since the last sync, and a key a
     file there will take is as taken as one in the database. The disk scan
-    sync runs is applied in a transaction that is rolled back, so nothing
-    is written.
+    sync runs is applied to a temporary copy of the database (VACUUM INTO
+    only reads the target), so nothing is written, and a read-only target,
+    or one another process is writing to, can still be planned against.
     """
+    import tempfile
+
     from crucible.ingest import upsert_sources_from_disk
 
-    rows: list[dict] = []
-    try:
-        with target_db.conn.transaction():
-            upsert_sources_from_disk(root, target_db)
-            rows = target_db.list_sources()
-            raise _MergeRollback
-    except _MergeRollback:
-        pass
-    return rows
+    with tempfile.TemporaryDirectory(prefix="crucible-merge-") as tmp:
+        copy_path = Path(tmp) / "plan.db"
+        try:
+            target_db.conn.execute("VACUUM INTO ?", (str(copy_path),))
+        except Exception as exc:  # noqa: BLE001 - libsql raises ValueError
+            click.echo(f"Warning: cannot scan the target's sources ({exc}); "
+                       "files added since its last sync are not counted.",
+                       err=True)
+            return target_db.list_sources()
+        copy = CrucibleDB(copy_path)
+        try:
+            upsert_sources_from_disk(root, copy)
+            return copy.list_sources()
+        finally:
+            copy.close()
 
 
 def _plan_source_merge(
@@ -3423,7 +3428,12 @@ def _merge_source_metadata(source: dict) -> tuple[dict, str | None]:
 # a synced folder (a large, gitignored sources/external/, say), relative to
 # .crucible/. The private ones (sources/external/) come last.
 _MERGE_PRIVATE_DIRS = ("sources/external", "sources/external/pdfs", "sources/external/web")
-_MERGE_LAYOUT_DIRS = (".", "sources") + _MERGE_PRIVATE_DIRS
+# The target is the user's own layout: its sources/, sources/data/,
+# sources/notebooks/ and sources/external/ may be symlinks to another drive. The source may be a stranger's clone,
+# whose committed symlinks must not reach the user's files: there only the
+# private directories may be links, since their files can only be copied to
+# the target's private, gitignored sources/external/.
+_MERGE_TARGET_DIRS = (".", "sources", "sources/data", "sources/notebooks") + _MERGE_PRIVATE_DIRS
 
 
 def _merge_inside(path: Path, root: Path, names: tuple[str, ...]) -> bool:
@@ -3453,17 +3463,24 @@ def _check_merge_copy(
     """Refuse copies that leave either crucible or publish private files."""
     if not source.is_file():
         raise _MergeConflict(f"Cannot safely merge '{source}': not a regular file.")
-    if not _merge_inside(source, source_root, _MERGE_LAYOUT_DIRS):
+    real_source = Path(os.path.realpath(source))
+    lexical_source = Path(os.path.normpath(os.path.abspath(source)))
+    if not (
+        (lexical_source.is_relative_to(
+            os.path.normpath(os.path.abspath(source_root / CRUCIBLE_DIR)))
+         and real_source.is_relative_to(
+             Path(os.path.realpath(source_root)) / CRUCIBLE_DIR))
+        or _merge_inside(source, source_root, _MERGE_PRIVATE_DIRS)
+    ):
         raise _MergeConflict(
             f"Cannot safely merge '{source}': it resolves outside the source crucible."
         )
-    if not _merge_inside(destination, target_root, _MERGE_LAYOUT_DIRS):
+    if not _merge_inside(destination, target_root, _MERGE_TARGET_DIRS):
         raise _MergeConflict(
             f"Cannot safely merge '{destination}': it resolves outside the target crucible."
         )
     # Private when stored under sources/external/, or linked to a file there.
     source_cdir = source_root / CRUCIBLE_DIR
-    real_source = Path(os.path.realpath(source))
     is_private = (
         private
         or Path(os.path.normpath(os.path.abspath(source))).is_relative_to(
