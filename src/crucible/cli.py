@@ -1598,14 +1598,15 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
             click.echo(f"    (absorbed: {', '.join(absorbed)})")
 
 
-def _project_path_candidates(root: Path, path: str) -> list[str]:
+def _project_path_candidates(root: Path, path: str, aliases: bool = True) -> list[str]:
     """Database paths (relative to the project root) that PATH may name.
 
     In order: PATH as given (normalized), relative to the current
     directory or absolute, relative to the wiki (``concepts/x.org``), and
     relative to ``.crucible/`` (``wiki/concepts/x.org``,
     ``sources/data/x.csv``). Raises a ClickException for an empty PATH,
-    which would otherwise match everything.
+    which would otherwise match everything. With aliases=False, a path
+    through a symlink alias in the wiki is not mapped to its article.
     """
     if not path or not path.strip():
         raise click.ClickException("The path is empty.")
@@ -1634,21 +1635,22 @@ def _project_path_candidates(root: Path, path: str) -> list[str]:
     # A path through a symlink alias in the wiki (dft.org ->
     # concepts/density-functional-theory.org) names the article indexed
     # under its own path; those come last, after every literal match.
-    for candidate in list(candidates):
+    for candidate in (list(candidates) if aliases else []):
         target = Path(os.path.normpath(root / candidate))
         if _alias_target(root, target) != target:
             add(_target_rel(root, target))
     return candidates
 
 
-def _lookup_project_path(root: Path, path: str, lookup) -> dict | None:
+def _lookup_project_path(root: Path, path: str, lookup,
+                         aliases: bool = True) -> dict | None:
     """The row lookup(candidate) returns for the first candidate PATH names.
 
     lookup is a database getter such as db.get_article_by_path or
     db.get_source_by_path. See _project_path_candidates for the path forms
     accepted. Returns None if no candidate matches.
     """
-    for candidate in _project_path_candidates(root, path):
+    for candidate in _project_path_candidates(root, path, aliases):
         row = lookup(candidate)
         if row:
             return row
@@ -2224,7 +2226,17 @@ def delete(path, yes, delete_file):
     # source, not an article whose path merely contains it. Paths may be
     # given relative to the cwd, the project, the wiki, or absolute.
     try:
-        article = _lookup_project_path(root, path, db.get_article_by_path)
+        article = _lookup_project_path(root, path, db.get_article_by_path,
+                                       aliases=False)
+        if not article:
+            # A symlink alias (dft.org -> concepts/dft-theory.org) is not
+            # the article: deleting through it would remove the real one.
+            real = _lookup_project_path(root, path, db.get_article_by_path)
+            if real:
+                raise click.ClickException(
+                    f"{path} is a symlink alias of {real['path']}. Delete the "
+                    "symlink by hand, or name the article's own path to "
+                    "delete the article.")
         src = None if article else _lookup_project_path(root, path, db.get_source_by_path)
         if not article and not src:
             src = _source_by_cite_key(db, path)

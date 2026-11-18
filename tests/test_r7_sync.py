@@ -116,6 +116,23 @@ def test_article_argument_through_alias_resolves(kb):  # noqa: F811
     assert "summaries/s.org" in result.output
 
 
+def test_delete_through_alias_refuses(kb):  # noqa: F811
+    alias_kb(kb)
+    real = wiki(kb) / "concepts" / "density-functional-theory.org"
+    result = run("delete", "dft.org", "--yes", "--file", ok=False)
+    assert result.exit_code != 0
+    assert "symlink alias" in result.output
+    assert real.exists() and (wiki(kb) / "dft.org").is_symlink()
+    db = CrucibleDB(kb / ".crucible" / "crucible.db")
+    try:
+        assert db.get_article_by_path(
+            ".crucible/wiki/concepts/density-functional-theory.org")
+    finally:
+        db.close()
+    # The article's own path still deletes it.
+    run("delete", "concepts/density-functional-theory.org", "--yes")
+
+
 def test_browse_resolves_relative_links_of_article_served_through_alias(kb):  # noqa: F811
     alias_kb(kb)
     db_path = kb / ".crucible" / "crucible.db"
