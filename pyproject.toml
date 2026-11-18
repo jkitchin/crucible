@@ -1,6 +1,6 @@
 [project]
 name = "crucible-llm"
-version = "0.2.0"
+version = "0.2.1"
 description = "LLM-compiled knowledge base with org-mode wiki and graph database"
 license = "MIT"
 requires-python = ">=3.11"
