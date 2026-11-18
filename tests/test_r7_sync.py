@@ -159,3 +159,19 @@ def test_browse_resolves_relative_links_of_article_served_through_alias(kb):  # 
         srv.shutdown()
         srv.server_close()
     assert '<a href="/concepts/basis.org">basis</a>' in body
+
+
+def test_delete_real_article_through_another_spelling_of_the_root(
+        kb, tmp_path, monkeypatch):  # noqa: F811
+    # /tmp for /private/tmp: the root through a symlink, not an alias.
+    alias_kb(kb)
+    other = tmp_path / "other-root"
+    os.symlink(kb, other)
+    real = wiki(kb) / "concepts" / "basis.org"
+    run("delete", str(other / ".crucible/wiki/concepts/basis.org"), "--yes", "--file")
+    assert not real.exists()
+    # The alias spelled through the other root is still refused.
+    result = run("delete", str(other / ".crucible/wiki/dft.org"), "--yes", "--file",
+                 ok=False)
+    assert result.exit_code != 0 and "symlink alias" in result.output
+    assert (wiki(kb) / "concepts" / "density-functional-theory.org").exists()

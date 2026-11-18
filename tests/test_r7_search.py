@@ -260,3 +260,29 @@ def test_sync_reindexes_old_rows_without_counting_an_edit(
         d.close()
     assert invoke("sync").exit_code == 0
     assert edits == []
+
+
+def test_prefix_on_a_snake_case_word(tmp_path, registry, monkeypatch):
+    monkeypatch.delenv("CRUCIBLE_OLLAMA_URL", raising=False)
+    root = _make_project(tmp_path / "kb", monkeypatch, {
+        "a.org": ("Runs", "See file_2024_report and run_2b, and CO_2 too.")})
+    d = CrucibleDB(root / ".crucible" / "crucible.db")
+    try:
+        for q in ("file_2024*", "run_2*", "CO2*", "CO_2*", "file*"):
+            assert titles(d.search(q)) == ["Runs"], q
+    finally:
+        d.close()
+
+
+@pytest.mark.parametrize("written", ["CO_2", "CO_{2}", "CO\u2082", "CO2"])
+@pytest.mark.parametrize("typed", ["CO2", "CO_2", "co\u2082"])
+def test_phrase_finds_each_way_of_writing_a_subscript(
+        tmp_path, registry, monkeypatch, written, typed):
+    monkeypatch.delenv("CRUCIBLE_OLLAMA_URL", raising=False)
+    root = _make_project(tmp_path / "kb", monkeypatch, {
+        "a.org": ("Red", f"Electrochemical {written} reduction on Cu.")})
+    d = CrucibleDB(root / ".crucible" / "crucible.db")
+    try:
+        assert titles(d.search(f'"{typed} reduction"')) == ["Red"]
+    finally:
+        d.close()

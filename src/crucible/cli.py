@@ -1629,7 +1629,16 @@ def _project_path_candidates(root: Path, path: str, aliases: bool = True) -> lis
     if not given.is_absolute():
         add(os.path.normpath(given.as_posix()).replace(os.sep, "/"))
     absolute = given if given.is_absolute() else Path.cwd() / given
-    for target in (Path(os.path.abspath(absolute)), absolute.resolve()):
+    lexical = Path(os.path.abspath(absolute))
+    # The root spelled another way (/tmp for /private/tmp, a symlinked
+    # ~/Dropbox): the ancestor that is the root, with the rest of the path
+    # kept as typed, so a symlink alias inside the wiki is still seen.
+    real_root = os.path.realpath(root)
+    for ancestor in reversed(lexical.parents):
+        if os.path.realpath(ancestor) == real_root:
+            add(lexical.relative_to(ancestor).as_posix())
+            break
+    for target in (lexical, absolute.resolve()):
         for base in (root, root.resolve()):
             rel = _safe_relative_to(target, base)
             if rel is not None:
@@ -2240,6 +2249,11 @@ def delete(path, yes, delete_file):
         # however it is named (wiki-relative, project-relative, absolute).
         article = None
         for candidate in _project_path_candidates(root, path, aliases=False):
+            if os.path.isabs(candidate):
+                # The path as typed; its root-relative forms follow. An
+                # absolute path spells the root its own way (/tmp for
+                # /private/tmp), which is no alias.
+                continue
             named = Path(os.path.normpath(root / candidate))
             real = _alias_target(root, named)
             if real != named:

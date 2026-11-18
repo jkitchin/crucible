@@ -198,31 +198,41 @@ def _title_key(title: str) -> str:
     return "".join(ch for ch in title.casefold() if ch.isalnum())
 
 
-# Where a page title puts the site or journal name: "Title | ACS Catalysis",
-# "Title - Wiley Online Library", "Title — Nature". Also arXiv's
-# "Title:" label before the title itself.
-_TITLE_SITE_SEP = re.compile(r"\s+(?:\||-|\u2013|\u2014|::|\u00b7)\s+")
+# arXiv's abstract pages label the title: "Title:Oxygen evolution ...".
 _TITLE_LABEL = re.compile(r"^\s*title\s*:\s*", re.IGNORECASE)
+
+# The metadata a publisher's page carries for its own article. A page
+# that only discusses a paper (a forum thread, a video, a blog post)
+# does not declare its DOI this way.
+_OWN_DOI_META = re.compile(
+    r"""<meta\s[^>]*?name\s*=\s*["']?(?:citation_doi|dc\.identifier|prism\.doi)["']?"""
+    r"""[^>]*?content\s*=\s*["']\s*(?:doi:\s*|https?://(?:dx\.)?doi\.org/)?([^"'\s]+)""",
+    re.IGNORECASE)
 
 
 def _declares_title(declared: str, title: str) -> bool:
     """Whether a file declaring `declared` names the paper titled `title`.
 
-    The titles must be the same, except that a web page's title may carry
-    the site's or journal's name before or after it, set off by a
-    separator, and arXiv's pages label it "Title:". A title that merely
-    contains the other one in a sentence ("Notes on ...") is not the same.
+    The titles must be the same, apart from an arXiv "Title:" label. A
+    site or journal name beside the title ("Title | ACS Catalysis") is
+    not stripped: "Title | Hacker News" and "Paper summary - Title" are
+    pages about the paper. A publisher's page is recognised by its
+    citation_doi metadata instead (see _page_declares_doi).
     """
     want = _title_key(title)
-    if not want:
+    return bool(want) and _title_key(_TITLE_LABEL.sub("", declared)) == want
+
+
+def _page_declares_doi(path: Path, doi: str) -> bool:
+    """Whether an HTML page's citation metadata names `doi` as its own."""
+    if path.suffix.lower() not in (".html", ".htm", ".xhtml"):
         return False
-    declared = _TITLE_LABEL.sub("", declared)
-    if _title_key(declared) == want:
-        return True
-    parts = [_TITLE_LABEL.sub("", p) for p in _TITLE_SITE_SEP.split(declared)]
-    # The title is a run of whole parts (a title may itself contain " - ").
-    return any(_title_key(" ".join(parts[i:j])) == want
-               for i in range(len(parts)) for j in range(i + 1, len(parts) + 1))
+    try:
+        head = path.read_bytes()[:200_000].decode("utf-8", "replace")
+    except OSError:
+        return False
+    return any(m.group(1).rstrip(".").casefold() == doi.casefold()
+               for m in _OWN_DOI_META.finditer(head))
 
 
 # Files that never carry their own DOI: a DOI in a deck or a Word document
@@ -1749,7 +1759,9 @@ def ingest_source(
     # describes this file, so it is dropped for a generated one.
     if bib_entry is not None and supplied_entry is None and not doi_given:
         declared = title or declared_title(source_path, text)
-        if declared and not _declares_title(declared, known.get("title", "")):
+        if _page_declares_doi(source_path, doi):
+            pass  # a publisher's page, whose metadata names its own DOI
+        elif declared and not _declares_title(declared, known.get("title", "")):
             warnings.append(
                 f"Ignored DOI {doi} found in the text: it belongs to "
                 f"\"{known.get('title', '')}\", not \"{declared}\""

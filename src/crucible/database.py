@@ -208,6 +208,10 @@ _UNICODE_SUBSCRIPTS = str.maketrans("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\
                                     "0123456789")
 
 
+_TO_SUBSCRIPTS = str.maketrans("0123456789",
+                               "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089")
+
+
 def join_subscripts(text: str) -> str:
     """TEXT with chemical subscripts joined: CO_2, CO_{2} and CO\u2082 become CO2."""
     if not text:
@@ -307,10 +311,13 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     for is_phrase, token, orig in _query_terms(raw):
         if is_phrase:
             # As typed, joined, and with a word's trailing digits read as a
-            # subscript ("CO2 reduction" finds CO_2 reduction), since the
-            # joined forms are indexed apart from the sentence.
-            split = re.sub(r"(?<=[A-Za-z)])(\d+)(?![\w])", r"_\1", orig)
-            alts = list(dict.fromkeys((orig, token, split)))
+            # subscript, written _N (CO_2, CO_{2}) or as a subscript digit
+            # (CO\u2082), since the joined forms are indexed apart from the
+            # sentence: "CO2 reduction" finds each way of writing it.
+            digits = r"(?<=[A-Za-z)])(\d+)(?![\w])"
+            split = re.sub(digits, r"_\1", token)
+            sub = re.sub(digits, lambda m: m.group(1).translate(_TO_SUBSCRIPTS), token)
+            alts = list(dict.fromkeys((orig, token, split, sub)))
             terms.append(_fts_literal(alts[0]) if len(alts) == 1 else
                          "(" + " OR ".join(_fts_literal(a) for a in alts) + ")")
             continue
@@ -344,17 +351,25 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
-def _fts_prefix_res(raw: str) -> list[re.Pattern]:
-    """For each prefix token (catal*) in a query, a pattern for a word starting with it."""
+def _fts_prefix_res(raw: str) -> list[list[re.Pattern]]:
+    """For each prefix token (catal*) in a query, patterns for a word starting with it.
+
+    A row matches the token if any of its patterns matches: the token
+    joined as in fts_text (CO2*) or as typed (file_2024*, which fts_text
+    leaves alone), as _fts_query asks for both.
+    """
     patterns = []
-    for is_phrase, token, _orig in _query_terms(raw):
-        stem = token.rstrip("*")
-        if not is_phrase and stem != token:
+    for is_phrase, token, orig in _query_terms(raw):
+        if is_phrase or token.rstrip("*") == token:
+            continue
+        alts = []
+        for tok in dict.fromkeys((token, orig)):
             # A word starts after anything that is not a letter or digit
             # (unicode61 splits words there, underscores included).
             # A quote left open ("catal*) is not part of the word.
-            stem = re.sub(r"^[\W_]+", "", stem)
-            patterns.append(re.compile(r"(?<![^\W_])" + re.escape(_fold(stem))))
+            stem = re.sub(r"^[\W_]+", "", tok.rstrip("*"))
+            alts.append(re.compile(r"(?<![^\W_])" + re.escape(_fold(stem))))
+        patterns.append(alts)
     return patterns
 
 
@@ -390,7 +405,8 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
             # fts_text: the index may predate joined subscripts (a peer's).
             text = _fold(fts_text(
                 f"{r.pop('_fts_title') or ''}\n{r.pop('_fts_content') or ''}"))
-            if r["id"] in seen or not all(p.search(text) for p in prefixes):
+            if r["id"] in seen or not all(any(p.search(text) for p in alts)
+                                             for alts in prefixes):
                 continue
             seen.add(r["id"])
             rows.append(r)

@@ -95,19 +95,38 @@ TITLE = "Oxygen evolution on perovskite oxides"
 
 @pytest.mark.parametrize("name, text", [
     ("article.html",
-     f"<html><head><title>{TITLE} | ACS Catalysis</title></head><body>"
+     f"<html><head><title>{TITLE} | ACS Catalysis</title>"
+     f'<meta name="citation_doi" content="{DOI}"></head><body>'
      f"<h1>{TITLE}</h1><p>https://doi.org/{DOI}</p></body></html>"),
-    ("article2.html",
-     f"<html><head><title>ACS Catalysis - {TITLE}</title></head><body>"
-     f"<p>https://doi.org/{DOI}</p></body></html>"),
+    ("article2.htm",
+     f"<html><head><meta name='dc.identifier' content='doi:{DOI.upper()}'>"
+     f"<title>ACS Catalysis - {TITLE}</title></head><body>doi:{DOI}</body></html>"),
     ("abs.md", f"Computer Science\n\n# Title:{TITLE}\n\nhttps://doi.org/{DOI}\n"),
 ])
-def test_page_title_with_site_name_keeps_its_own_doi(kb, tmp_path, doi_lookup, name, text):  # noqa: F811
+def test_page_that_declares_its_own_doi_keeps_it(kb, tmp_path, doi_lookup, name, text):  # noqa: F811
     p = tmp_path / name
     p.write_text(text)
     result = run("ingest", str(p))
     assert result.exit_code == 0, result.output
     assert DOI in bib(kb)
+
+
+@pytest.mark.parametrize("name, text", [
+    ("hn.html", f"<html><head><title>{TITLE} | Hacker News</title></head>"
+                f"<body><a href='https://doi.org/{DOI}'>{TITLE}</a></body></html>"),
+    ("yt.html", f"<html><head><title>{TITLE} - YouTube</title></head>"
+                f"<body>https://doi.org/{DOI}</body></html>"),
+    ("summary.md", f"# Paper summary - {TITLE}\n\nhttps://doi.org/{DOI}\n"),
+    ("other.html", f"<html><head><title>Something else</title>"
+                   f'<meta name="citation_doi" content="10.1000/other"></head>'
+                   f"<body>https://doi.org/{DOI}</body></html>"),
+])
+def test_page_about_a_paper_does_not_take_its_doi(kb, tmp_path, doi_lookup, name, text):  # noqa: F811
+    p = tmp_path / name
+    p.write_text(text)
+    result = run("ingest", str(p))
+    assert result.exit_code == 0, result.output
+    assert DOI not in bib(kb)
 
 
 def test_note_titled_about_a_paper_does_not_take_its_doi(kb, tmp_path, doi_lookup):  # noqa: F811
