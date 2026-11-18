@@ -862,7 +862,17 @@ def _link_target_rel(root: Path, org_path: Path, link: str) -> str | None:
     name the real location of a symlinked wiki or project, so the resolved
     path is also tried against the resolved wiki and root.
     """
-    target = _alias_target(root, _link_path(org_path, link))
+    return _target_rel(root, _link_path(org_path, link))
+
+
+def _target_rel(root: Path, target: Path) -> str | None:
+    """The project-relative path normalised `target` names, or None.
+
+    A path through a symlink alias in the wiki maps to the article's own
+    path (see _alias_target). None means the target lies outside the
+    project.
+    """
+    target = _alias_target(root, target)
     rel = _safe_relative_to(target, root)
     if rel is not None:
         return rel
@@ -1013,9 +1023,7 @@ def _resolve_derived_from(db: CrucibleDB, root: Path, org_path: Path, ref: str) 
         within = ref[len("wiki/"):] if ref.startswith("wiki/") else ref
         article = _find_linked_article(
             db, root,
-            _safe_relative_to(
-                Path(os.path.normpath(cdir(root) / "wiki" / within)), root
-            ),
+            _target_rel(root, Path(os.path.normpath(cdir(root) / "wiki" / within))),
         )
     return article
 
@@ -1623,6 +1631,13 @@ def _project_path_candidates(root: Path, path: str) -> list[str]:
             # Never let ../ climb out of the project.
             if not normalized.startswith(".."):
                 add(Path(normalized).as_posix())
+    # A path through a symlink alias in the wiki (dft.org ->
+    # concepts/density-functional-theory.org) names the article indexed
+    # under its own path; those come last, after every literal match.
+    for candidate in list(candidates):
+        target = Path(os.path.normpath(root / candidate))
+        if _alias_target(root, target) != target:
+            add(_target_rel(root, target))
     return candidates
 
 
@@ -1992,7 +2007,7 @@ def _write_viz(root: Path, db: CrucibleDB,
     if output is None:
         output = cdir(root) / "wiki" / "viz.html"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(html, encoding="utf-8")
+    _replace_file(output, html)
     return output, n_nodes, n_edges
 
 
@@ -3703,11 +3718,47 @@ def _render_manifest(root: Path, db: CrucibleDB) -> str:
 _GENERATED_DATE_RE = re.compile(r"^(#\+DATE:|Updated:) .*$", re.MULTILINE)
 
 
+def _replace_file(path: Path, text: str) -> None:
+    """Write a generated file by renaming a temporary file onto `path`.
+
+    Writing in place would follow a symlink, or write into the inode a hard
+    link shares, and so overwrite whatever article `path` was linked to.
+    Renaming replaces the link itself. The file gets the mode a plain
+    write would give it (0666 less the umask), not mkstemp's 0600.
+    """
+    umask = os.umask(0)
+    os.umask(umask)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _is_link(path: Path) -> bool:
+    """True if `path` is a symlink, or a file with other hard links."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink > 1)
+
+
 def _write_generated(path: Path, text: str) -> None:
     """Write a generated page unless only its date line would change.
 
     MANIFEST.md and index.org are rewritten on every sync; leaving them
     alone when the content is unchanged keeps the date out of git churn.
+    A link at `path` is replaced by the generated file (with a warning on
+    stderr), never written through, so the file it shares is untouched.
     """
     if path.exists():
         try:
@@ -3718,7 +3769,10 @@ def _write_generated(path: Path, text: str) -> None:
             _GENERATED_DATE_RE.sub("", old) == _GENERATED_DATE_RE.sub("", text)
         ):
             return
-    path.write_text(text, encoding="utf-8")
+    if _is_link(path):
+        click.echo(f"crucible: {path} was a link; replaced it with the "
+                   "generated file and left the linked file alone", err=True)
+    _replace_file(path, text)
 
 
 def _write_manifest(root: Path, db: CrucibleDB) -> Path:
@@ -3742,7 +3796,7 @@ def manifest():
     text = _render_manifest(root, db)
     db.close()
     manifest_path = cdir(root) / "wiki" / "MANIFEST.md"
-    manifest_path.write_text(text, encoding="utf-8")
+    _write_generated(manifest_path, text)
     click.echo(text)
     click.echo(f"Written to {manifest_path}")
 
@@ -4833,7 +4887,7 @@ def publish(output, init_only):
     }
 
     config_path = wiki_dir / ".org-publish.json"
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    _replace_file(config_path, json.dumps(config, indent=2))
     click.echo(f"Publish config: {config_path}")
 
     if init_only:
