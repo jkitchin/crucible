@@ -282,7 +282,8 @@ def _query_terms(raw: str) -> list[tuple[bool, str, str]]:
     return terms
 
 
-def _fts_query(raw: str, broad: bool = False, joined: bool = False) -> str:
+def _fts_query(raw: str, broad: bool = False, joined: bool = False,
+               joined_column: bool | None = None) -> str:
     """Turn a raw user query into a safe FTS5 MATCH expression.
 
     A "quoted phrase" is searched as a phrase: its words in that order,
@@ -306,9 +307,13 @@ def _fts_query(raw: str, broad: bool = False, joined: bool = False) -> str:
     A token with no letter or digit in it ("&", "-", "/", an en dash) is
     dropped: the tokenizer reads it as an empty phrase, which, ANDed with
     the rest, would make every search return nothing.
-    Chemical subscripts are joined as in article_fts_joined (see
-    fts_joined), which is searched with `joined`. A term that changes is
-    also asked for as typed, so CO_2 still finds CO_2 in article_fts.
+    Without `joined` the terms are asked for as typed, for article_fts,
+    which then finds and ranks rows exactly as it always has. With
+    `joined` (for article_fts_joined, see fts_joined) a term with a
+    chemical subscript is asked for both as typed and joined, so CO_2,
+    CO_{2}, CO\u2082 and CO2 each find all four. The match covers
+    article_fts_joined's joined column when `joined_column` (by default
+    `joined`) is set.
 
     The match is limited to the title and content columns: the path column
     holds ".crucible/wiki/concepts/x.org", whose words would otherwise match
@@ -323,12 +328,12 @@ def _fts_query(raw: str, broad: bool = False, joined: bool = False) -> str:
         if is_phrase:
             # As typed, and joined, which matches article_fts_joined
             # (fts_joined): "CO2 reduction" finds each way of writing it.
-            alts = list(dict.fromkeys((orig, token)))
+            alts = list(dict.fromkeys((orig, token) if joined else (orig,)))
             terms.append(_fts_literal(alts[0]) if len(alts) == 1 else
                          "(" + " OR ".join(_fts_literal(a) for a in alts) + ")")
             continue
         alts = []
-        for tok in dict.fromkeys((token, orig)):
+        for tok in dict.fromkeys((token, orig) if joined else (orig,)):
             stem = tok.rstrip("*")
             if stem == tok:
                 alts.append(_fts_literal(tok))
@@ -348,7 +353,9 @@ def _fts_query(raw: str, broad: bool = False, joined: bool = False) -> str:
     if not terms:
         return ""
     # Explicit AND: FTS5 allows implicit AND only between plain phrases.
-    columns = "{title content joined}" if joined else "{title content}"
+    if joined_column is None:
+        joined_column = joined
+    columns = "{title content joined}" if joined_column else "{title content}"
     return columns + " : (" + " AND ".join(terms) + ")"
 
 
@@ -358,19 +365,19 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
-def _fts_prefix_res(raw: str) -> list[list[re.Pattern]]:
+def _fts_prefix_res(raw: str, joined: bool = False) -> list[list[re.Pattern]]:
     """For each prefix token (catal*) in a query, patterns for a word starting with it.
 
-    A row matches the token if any of its patterns matches: the token
-    joined as in fts_joined (CO2*) or as typed (file_2024*, which fts_joined
-    leaves alone), as _fts_query asks for both.
+    A row matches the token if any of its patterns matches: the token as
+    typed (file_2024*, which fts_joined leaves alone), or, with `joined`,
+    also joined as in fts_joined (CO2*), as _fts_query asks.
     """
     patterns = []
     for is_phrase, token, orig in _query_terms(raw):
         if is_phrase or token.rstrip("*") == token:
             continue
         alts = []
-        for tok in dict.fromkeys((token, orig)):
+        for tok in dict.fromkeys((token, orig) if joined else (orig,)):
             # A word starts after anything that is not a letter or digit
             # (unicode61 splits words there, underscores included).
             # A quote left open ("catal*) is not part of the word.
@@ -380,7 +387,7 @@ def _fts_prefix_res(raw: str) -> list[list[re.Pattern]]:
     return patterns
 
 
-def fts_rows(conn, query: str, limit: int) -> list[dict]:
+def fts_rows(conn, query: str, limit: int, tiers: bool = False) -> list[dict]:
     """Rows of articles matching a raw search query, best first, at most limit.
 
     Each row is an article with its FTS rank. A prefix token is matched
@@ -389,11 +396,15 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
     content has a word that starts with it. The broad query, which can
     reach most of the wiki, is run only when the plain one finds fewer
     than `limit` rows; the rows only it finds come after the others.
+    With `tiers`, each row has "_fts_tier": 0 for a row article_fts finds,
+    as it always has, and 1 for one only the joined subscripts find, so
+    results from several crucibles can be merged with the tier-1 rows last.
     """
     match = _fts_query(query)
     if not match:
         return []
     prefixes = _fts_prefix_res(query)
+    joined_prefixes = _fts_prefix_res(query, joined=True)
     sql = """
         SELECT a.*, rank, fts.title AS _fts_title, fts.content AS _fts_content
         FROM {table} fts
@@ -401,20 +412,31 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
         WHERE {table} MATCH ?
         ORDER BY rank
     """
-    # article_fts first, which finds and ranks rows as it always has; then
-    # the rows only the joined subscripts find (see fts_joined).
-    searches = [("article_fts", match)]
+    # (table, match, tier): article_fts first, which finds and ranks rows
+    # as it always has (tier 0); then the rows only the joined subscripts
+    # find (tier 1, see fts_joined): CO2 written in an article, for CO_2
+    # typed, from article_fts; CO_2 written, for CO2 typed, from
+    # article_fts_joined.
+    searches = [("article_fts", match, 0)]
     if prefixes:
-        searches.append(("article_fts", _fts_query(query, broad=True)))
+        searches.append(("article_fts", _fts_query(query, broad=True), 0))
+    searches.append(("article_fts", _fts_query(query, joined=True, joined_column=False), 1))
+    if prefixes:
+        searches.append(("article_fts", _fts_query(query, broad=True, joined=True,
+                                                   joined_column=False), 1))
     if fts_has_joined(conn) and conn.execute(
             "SELECT 1 FROM article_fts_joined LIMIT 1").fetchone():
-        searches.append(("article_fts_joined", _fts_query(query, joined=True)))
+        searches.append(("article_fts_joined", _fts_query(query, joined=True), 1))
         if prefixes:
             searches.append(("article_fts_joined",
-                             _fts_query(query, broad=True, joined=True)))
+                             _fts_query(query, broad=True, joined=True), 1))
     rows: list[dict] = []
     seen: set = set()
-    for table, query_match in dict.fromkeys(searches):
+    done = set()
+    for table, query_match, tier in searches:
+        if (table, query_match) in done:
+            continue  # the query has no subscript: tier 1 asks the same
+        done.add((table, query_match))
         if prefixes:
             found = conn.execute(sql.format(table=table), (query_match,))
         else:
@@ -428,9 +450,16 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
             if r["id"] in seen:
                 continue
             if prefixes:
-                text = _fold(title + "\n" + content + "\n" + fts_joined(title, content))
-                if not all(any(p.search(text) for p in alts) for alts in prefixes):
+                if tier == 0:
+                    text, wanted = _fold(title + "\n" + content), prefixes
+                else:
+                    text = _fold(title + "\n" + content + "\n"
+                                 + fts_joined(title, content))
+                    wanted = joined_prefixes
+                if not all(any(p.search(text) for p in alts) for alts in wanted):
                     continue
+            if tiers:
+                r["_fts_tier"] = tier
             seen.add(r["id"])
             rows.append(r)
             if len(rows) >= limit:
@@ -573,7 +602,7 @@ class CrucibleDB:
             return []
         results = []
         # Local
-        for r in self.search(query, limit=limit):
+        for r in fts_rows(self.conn, query, limit, tiers=True):
             r["_crucible"] = "local"
             results.append(r)
         # Peers (separate connections, since FTS5 MATCH doesn't work via ATTACH)
@@ -584,13 +613,16 @@ class CrucibleDB:
             name = peer["name"]
 
             def do_search(conn, _name=name):
-                rows = fts_rows(conn, query, limit)
+                rows = fts_rows(conn, query, limit, tiers=True)
                 for r in rows:
                     r["_crucible"] = _name
                 return rows
 
             results.extend(self._query_peer(peer_db, do_search))
-        results.sort(key=lambda x: x.get("rank", 0))
+        # Rows article_fts finds, ranked as they always were, then the rows
+        # only the joined subscripts find: their ranks come from another
+        # table and do not compare with the others.
+        results.sort(key=lambda x: (x.pop("_fts_tier", 0), x.get("rank", 0)))
         return results[:limit]
 
     def concepts_all(self, peers: list[dict] | None = None) -> list[dict]:

@@ -472,3 +472,22 @@ def test_front_matter_title_is_read_as_yaml(tmp_path, front, want):
     text = f"---\n{front}\n---\n\n# Heading\n\nBody.\n"
     p.write_text(text)
     assert ingest_module.declared_title(p, text) == want
+
+
+def test_url_page_with_a_bibtex_url_is_restored_by_the_same_ingest(kb, web):  # noqa: F811
+    # --bibtex sets the source's url field to its own url; running the same
+    # command again on a fresh clone restores the page, as on main.
+    url = "https://ex.example.com/canon"
+    web[url] = b"<html><head><title>Canon page</title></head><body>Canon.</body></html>"
+    entry = "@misc{canon, title={Canon page}, url={https://canonical.example.org/canon}}"
+    run("ingest", url, "--bibtex", entry)
+    _fresh_clone(kb)
+    result = run("ingest", url, "--bibtex", entry)
+    assert "restored" in result.output
+    assert list((kb / WEB).glob("*.html"))
+    # Another site's page under the same name is still refused.
+    other = "https://other.example.com/canon"
+    web[other] = b"<html><head><title>Canon page</title></head><body>Other.</body></html>"
+    _fresh_clone(kb)
+    result = run("ingest", other, ok=False)
+    assert result.exit_code != 0 and "comes from" in result.output

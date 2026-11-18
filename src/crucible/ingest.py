@@ -1538,7 +1538,8 @@ def _norm_title(title: str | None) -> str:
 
 def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str,
                       title: str | None, doi: str | None, text: str,
-                      url: str | None = None) -> str | None:
+                      url: str | None = None,
+                      bib_url: str | None = None) -> str | None:
     """Why source_path may not be the missing file of the row src, or None.
 
     The row was rebuilt from its bib entry, so it has no hash to compare.
@@ -1553,7 +1554,9 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     page is the source, and a different one shows it is not, when the row
     has no DOI. A row with a DOI got its url field from the fetched entry
     (a doi.org link, say), not from the page that was ingested, so there
-    the DOI and title decide. A Markdown note is matched by its front-matter
+    the DOI and title decide. A --bibtex entry's url field sets the row's
+    url, so when the entry given now has the row's url (the same command
+    run again) the URL matches too. A Markdown note is matched by its front-matter
     title or by its first heading, which is what older versions used.
     """
     key = _source_metadata(src).get("cite_key") or src["path"]
@@ -1561,10 +1564,11 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
               "rename the file before ingesting it.")
     row_doi = _norm_doi(_source_metadata(src).get("doi"))
     cited = None
-    row_url, file_url = (u.strip().rstrip("/") if u else None for u in (src.get("url"), url))
+    row_url, file_url, entry_url = (u.strip().rstrip("/") if u else None
+                                    for u in (src.get("url"), url, bib_url))
+    if row_url and row_url in (file_url, entry_url):
+        return None
     if row_url and file_url:
-        if row_url == file_url:
-            return None
         if not row_doi:
             return (f"{source_path.name} would be stored as {src['path']}, the missing "
                     f"file of source {key}, but it comes from {file_url}, not that "
@@ -1783,7 +1787,9 @@ def ingest_source(
         text = extract_text(source_path)
         if not restore:
             problem = _restore_mismatch(root, holder, source_path, source_type,
-                                        title, doi, text, url)
+                                        title, doi, text, url,
+                                        supplied_entry.get("url")
+                                        if supplied_entry is not None else None)
             if problem:
                 raise ValueError(problem)
         return _restore_source(root, db, holder, source_path, content_hash, text)

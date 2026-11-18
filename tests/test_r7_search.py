@@ -389,3 +389,72 @@ def test_migration_after_sync_does_not_reindex_twice(
     result = invoke("sync")
     assert "0 updated" in result.output
     assert edits == []
+
+
+# -- regressions against main found after the merge ------------------------------
+
+def _plain_fts(arts):
+    """main's article_fts, for ARTS (title, content), rowids from 1."""
+    plain = sqlite3.connect(":memory:")
+    plain.execute("CREATE VIRTUAL TABLE article_fts USING fts5("
+                  "path, title, content, tokenize='porter unicode61')")
+    for i, (t, c) in enumerate(arts, start=1):
+        plain.execute("INSERT INTO article_fts (rowid, path, title, content)"
+                      " VALUES (?, ?, ?, ?)", (i, f"a{i}.org", t, c))
+    return plain
+
+
+@pytest.mark.parametrize("q", ["CO_2", "CO_{2}", "CO₂", "H_2O", "CO_2 reduction"])
+def test_subscript_query_keeps_mains_rows_and_ranks_first(tmp_path, q):
+    # A query with a subscript asks article_fts for it as typed, as main
+    # did; the articles only its joined form finds (CO2, H2O) come after,
+    # not above main's rows.
+    arts = [("Literal", "CO_2 reduction and H_2O splitting, written out in a long"
+             " sentence with many other words about electrodes and cells."),
+            ("Unicode", "CO₂ reduction and H₂O splitting, written out in a long"
+             " sentence with many other words about electrodes and cells."),
+            ("Joined", "CO2 reduction. CO2. H2O. H2O.")]
+    arts += [(f"Filler {i}", "Unrelated words about polymers and heat.") for i in range(8)]
+    d = CrucibleDB(tmp_path / "c.db")
+    d.initialize()
+    plain = _plain_fts(arts)
+    try:
+        for i, (t, c) in enumerate(arts, start=1):
+            d.add_article(path=f"a{i}.org", title=t, article_type="concept", content=c)
+        match = "{title content} : (" + " AND ".join(
+            '"' + w + '"' for w in q.split()) + ")"
+        want = [(arts[r[0] - 1][0], r[1]) for r in plain.execute(
+            "SELECT rowid, rank FROM article_fts WHERE article_fts MATCH ?"
+            " ORDER BY rank", (match,))]
+        got = [(r["title"], r["rank"]) for r in d.search(q)]
+        assert got[:len(want)] == want
+        assert "Joined" in [t for t, _ in got[len(want):]]
+    finally:
+        plain.close()
+        d.close()
+
+
+def test_search_all_puts_joined_only_rows_after_every_crucibles_rows(tmp_path):
+    # Ranks from article_fts_joined do not compare with article_fts's, so
+    # a local row only the joined form finds must not take a peer's place.
+    def crucible(name, arts):
+        root = tmp_path / name
+        (root / ".crucible").mkdir(parents=True)
+        d = CrucibleDB(root / ".crucible/crucible.db")
+        d.initialize()
+        for t, c in arts:
+            d.add_article(path=f"{t}.org", title=t, article_type="concept", content=c)
+        return root, d
+    _, local = crucible("loc", [("plain", "CO2 emissions."), ("sub", "CO_2 capture.")]
+                        + [(f"w{i}", "H_2O water vapour.") for i in range(6)])
+    peer_root, peer = crucible("peer", [
+        (f"p{i}", "CO2 mentioned once among many other filler words " * 3)
+        for i in range(5)])
+    peer.close()
+    peers = [{"name": "peer", "path": str(peer_root)}]
+    try:
+        assert [r["title"] for r in local.search_all("CO2", limit=5, peers=peers)] == [
+            "plain", "p0", "p1", "p2", "p3"]
+        assert [r["title"] for r in local.search_all("CO2", limit=7, peers=peers)][-1] == "sub"
+    finally:
+        local.close()
