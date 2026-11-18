@@ -191,7 +191,9 @@ web sources are stored in =sources/data/=: a =.pdf= there is a PDF, and an
 
 Parses: =#+TITLE=, =#+FILETAGS=, =:ARTICLE_TYPE:=, =:SOURCE_KEYS:=,
 =:DERIVED_FROM:=, =:CREATED:=, =:MODIFIED:=, =[[file:...]]= links, and
-full text for FTS.
+full text for FTS. Properties come from the top heading's drawer, or from
+file-wide =#+PROPERTY: NAME value= lines when no drawer sets them.
+=:SOURCE_KEYS:= are space-separated; commas between keys are accepted too.
 
 An article's dates come from its =:CREATED:= and =:MODIFIED:= properties
 (an ISO date, optionally with a time, or an org timestamp). =:MODIFIED:=
@@ -433,7 +435,7 @@ Each issue has a type and a severity (error, warning or info):
 | =malformed_bib_entry= | warning | A =references.bib= entry is never closed and is ignored |
 | =missing_property= | warning/info | No =:ARTICLE_TYPE:= (warning); neither =:CREATED:= nor =:MODIFIED:=, or no =:SOURCE_KEYS:= (info) |
 | =invalid_date= | warning | An unreadable =:CREATED:= or =:MODIFIED:=, or =:MODIFIED:= earlier than =:CREATED:= |
-| =unresolved_source_key= | warning | A =:SOURCE_KEYS:= value matches no source (the message says when the key is in =references.bib= but its entry has no =file= field) |
+| =unresolved_source_key= | warning/info | A =:SOURCE_KEYS:= value matches no source (warning). It is info when the key is in =references.bib= with no =file= field: a work cited without its file |
 | =ambiguous_source_key= | warning | A =:SOURCE_KEYS:= value matches more than one source |
 | =missing_tags= | warning | The article has no =#+FILETAGS:= |
 | =untracked= | warning | A wiki file is not in the database (run =crucible sync=) |
