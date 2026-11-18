@@ -904,10 +904,9 @@ def reconcile_sources(root: Path, db, on_warning=None, lock: bool = True) -> int
 
     # The bib lock is taken before the database write lock, the order merge
     # uses, so a sync and a merge never each hold one lock while waiting
-    # for the other. The bibliography is read inside the transaction: ingest
-    # appends its entry before it adds its row, and the row cannot be added
-    # while this transaction holds the write lock, so every ingested row
-    # seen here has its entry in what is read.
+    # for the other. Ingest appends its entry and adds its row under the
+    # bib lock, so every ingested row seen here has its entry in what is
+    # read, and no entry is seen whose ingest has yet to add its row.
     with _bib_lock(root) if lock else nullcontext(), db.conn.transaction():
         entries, malformed = _read_bib_entries(root, lock=lock)
         bib_keys = {entry["cite_key"] for entry in entries}
@@ -1144,8 +1143,9 @@ def _bib_lock(root: Path) -> FileLock:
     bib reads and rewrites inside it take it again.
 
     Lock order: every writer takes this lock before the database write lock
-    (sync's transaction, merge's row inserts). Ingest takes it only to
-    append its entry, and adds its row after releasing it.
+    (sync's transaction, merge's row inserts). Ingest holds it while it
+    appends its entry and adds its row, so a sync never sees one without
+    the other.
     """
     lock_path = os.path.abspath(root / CRUCIBLE_DIR / "references.bib.lock")
     lock = _BIB_LOCKS.get(lock_path)
@@ -1393,6 +1393,22 @@ def _keys_cited_in_wiki(root: Path) -> set[str]:
     return keys
 
 
+def _sidecar_path(path: Path) -> Path:
+    """Where the extracted text of the stored file `path` goes: <stem>.txt,
+    or `path` itself for a .txt file, which is its own text.
+
+    The suffix is compared without case: NOTES.TXT and NOTES.txt are one
+    file on a case-insensitive filesystem (macOS, Windows), so a sidecar
+    beside NOTES.TXT would be the source itself.
+    """
+    return path if path.suffix.lower() == ".txt" else path.with_suffix(".txt")
+
+
+# How many numbered names (<stem>_1, <stem>_2, ...) ingest tries before
+# giving up on storing a file.
+_MAX_NAME_TRIES = 10000
+
+
 def _dest_taken(dest_path: Path) -> bool:
     """Whether storing a source at dest_path would collide with an existing file.
 
@@ -1466,16 +1482,21 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     file_doi = _norm_doi(doi or (extract_doi_from_text(text)
                                  if may_carry_own_doi(source_type, source_path) else None))
     if row_doi and file_doi:
-        if row_doi == file_doi:
+        if row_doi != file_doi:
+            return (f"{source_path.name} would be stored as {src['path']}, the missing "
+                    f"file of source {key}, but its DOI {file_doi} differs from that "
+                    f"source's DOI {row_doi}. {advice}")
+        # A DOI found in the text may be one the file cites: it shows the
+        # file is the source only when the source's title is near the start
+        # too, as ingest requires before using such a DOI. Otherwise the
+        # title or text below must show it.
+        if doi or _title_on_first_page(src.get("title") or "", text):
             return None
-        return (f"{source_path.name} would be stored as {src['path']}, the missing "
-                f"file of source {key}, but its DOI {file_doi} differs from that "
-                f"source's DOI {row_doi}. {advice}")
     row_title = _norm_title(src.get("title"))
     file_title = _norm_title(title or declared_title(source_path, text))
     if row_title and file_title and row_title == file_title:
         return None
-    sidecar = (root / src["path"]).with_suffix(".txt")
+    sidecar = _sidecar_path(root / src["path"])
     if text and sidecar != root / src["path"] and sidecar.is_file():
         try:
             if sidecar.read_text(encoding="utf-8", errors="replace") == text:
@@ -1485,6 +1506,26 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     return (f"{source_path.name} would be stored as {src['path']}, the missing "
             f"file of source {key}, but nothing shows it is that source (no "
             f"matching DOI, title or text). {advice}")
+
+
+def _add_or_adopt_source(db: CrucibleDB, cite_key: str, **fields) -> int:
+    """Add ingest's row for fields["path"], or take over the row a sync made for it.
+
+    Called under the bib lock, right after the entry `cite_key` was
+    appended. A sync that ran after the file was copied but before the
+    entry was appended may have indexed the file from the disk scan
+    (sources/notebooks/, sources/data/); a row under this entry's own key
+    can only come from a sync that read the entry. Either row is this
+    source, so it is updated in place rather than the insert failing on
+    its path and the ingest being undone. Any other row at the path is
+    not ours, and the insert's error stands.
+    """
+    row = db.get_source_by_path(fields["path"])
+    if row is not None and (_from_disk_scan(row)
+                            or _source_metadata(row).get("cite_key") == cite_key):
+        db.update_source(row["id"], **{k: v for k, v in fields.items() if k != "path"})
+        return row["id"]
+    return db.add_source(**fields)
 
 
 def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
@@ -1497,6 +1538,21 @@ def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
     bib entry is left alone; the file (and its text sidecar, unless one is
     there) is copied back and the content hash recorded.
     """
+    # The row keeps its cite key and leaves the bibliography alone, so the
+    # key must have an entry there: a row whose entry is gone (left by an
+    # interrupted ingest, or an entry removed by hand) is dropped by the
+    # next sync, and restoring into it would report a source that then
+    # disappears. A disk-scan row is keyed by the scan and needs no entry.
+    key = _source_metadata(src).get("cite_key")
+    if isinstance(key, str) and key and not _from_disk_scan(src):
+        entries, malformed = _read_bib_entries(root)
+        if not malformed and key not in {entry["cite_key"] for entry in entries}:
+            raise ValueError(
+                f"{source_path.name} would be restored as {src['path']}, the "
+                f"missing file of source {key}, but references.bib has no entry "
+                f"{key}, so the next sync drops that source. Run `crucible sync`, "
+                "then ingest the file again."
+            )
     dest = root / src["path"]
     dest.parent.mkdir(parents=True, exist_ok=True)
     created: list[Path] = []
@@ -1511,7 +1567,7 @@ def _restore_source(root: Path, db: CrucibleDB, src: dict, source_path: Path,
         metadata = _source_metadata(src)
         if text is None:
             text = extract_text(source_path)
-        text_path = dest.with_suffix(".txt")
+        text_path = _sidecar_path(dest)
         wrote_text = False
         if text and text_path != dest and _claim(text_path, created):
             atomic_write_text(text_path, text)
@@ -1672,11 +1728,12 @@ def ingest_source(
                 f"\"{known.get('title', '')}\", not \"{declared}\""
             )
             bib_entry, known, doi = None, {}, None
-        elif (not declared and source_type == "pdf"
-              and not _title_on_first_page(known.get("title", ""), text)):
-            # Nothing to compare with: a paper prints its own title near
-            # the top, next to its DOI. A report or thesis that cites a DOI
-            # there does not carry the cited paper's title with it.
+        elif not declared and not _title_on_first_page(known.get("title", ""), text):
+            # Nothing to compare with: a paper or web page prints its own
+            # title near the top, next to its DOI. A report, thesis or
+            # markdown note (titled in YAML front matter, or by a ## heading,
+            # or not at all) that cites a DOI there does not carry the cited
+            # paper's title with it.
             warnings.append(
                 f"Ignored DOI {doi} found in the text: its title "
                 f"\"{known.get('title', '')}\" is not near the start of the document"
@@ -1746,18 +1803,24 @@ def ingest_source(
     try:
         write_sidecar = False
         if in_place:
-            text_path = dest_path.with_suffix(".txt")
+            text_path = _sidecar_path(dest_path)
             if text and text_path != dest_path:
                 write_sidecar = _claim(text_path, created)
         else:
             stem, suffix = dest_path.stem, dest_path.suffix
             counter = 1
             while True:
+                if counter > _MAX_NAME_TRIES:
+                    raise ValueError(
+                        f"Cannot find a free name to store {source_path.name} in "
+                        f"{dest_dir}: {stem}{suffix} and {_MAX_NAME_TRIES} numbered "
+                        "variants (and their .txt sidecars) are all taken"
+                    )
                 # A path a row holds is taken even when its file is missing.
                 if (not _dest_taken(dest_path)
                         and _project_rel(root, dest_path) not in held
                         and _claim(dest_path, created)):
-                    text_path = dest_path.with_suffix(".txt")
+                    text_path = _sidecar_path(dest_path)
                     if not text or text_path == dest_path:
                         break
                     if _claim(text_path, created):
@@ -1777,36 +1840,43 @@ def ingest_source(
         if write_sidecar:
             atomic_write_text(text_path, text)
 
-        cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
-        bib_entry = replace_cite_key(bib_entry, cite_key)
+        # The entry and the row are written under one hold of the bib lock.
+        # A sync reconciles under that lock, so it never sees the entry
+        # without the row: it would insert a row from the entry, and this
+        # insert would then fail on the path and undo the ingest, leaving
+        # the sync's row with no entry and no file.
+        with _bib_lock(root):
+            cite_key = append_bib_entry_unique_key(root, db, base_key, bib_entry)
+            bib_entry = replace_cite_key(bib_entry, cite_key)
 
-        # Describe the source exactly as a rebuild from the entry would.
-        first = bibtex_mod.first_entry(bib_entry)
-        rebuilt = _fields_from_bib(
-            {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
-        )
-        title = rebuilt["title"]
-        authors = rebuilt["authors"] or authors
-        date = rebuilt["date"] or date
-        url = rebuilt["url"] or url
+            # Describe the source exactly as a rebuild from the entry would.
+            first = bibtex_mod.first_entry(bib_entry)
+            rebuilt = _fields_from_bib(
+                {"entry_type": first.entry_type, "cite_key": cite_key, **first.as_dict()}, rel_path,
+            )
+            title = rebuilt["title"]
+            authors = rebuilt["authors"] or authors
+            date = rebuilt["date"] or date
+            url = rebuilt["url"] or url
 
-        # Register in database (store cite_key and content hash in metadata)
-        metadata = {"cite_key": cite_key, "content_hash": content_hash}
-        if write_sidecar:
-            # Lets delete tell this sidecar from a user's own <stem>.txt.
-            metadata["text_hash"] = file_sha256(text_path)
-        if doi:
-            metadata["doi"] = doi
-        source_id = db.add_source(
-            path=rel_path,
-            title=title,
-            source_type=source_type,
-            shareable=shareable,
-            url=url,
-            authors=authors,
-            date=date,
-            metadata=metadata,
-        )
+            # Register in database (store cite_key and content hash in metadata)
+            metadata = {"cite_key": cite_key, "content_hash": content_hash}
+            if write_sidecar:
+                # Lets delete tell this sidecar from a user's own <stem>.txt.
+                metadata["text_hash"] = file_sha256(text_path)
+            if doi:
+                metadata["doi"] = doi
+            source_id = _add_or_adopt_source(
+                db, cite_key,
+                path=rel_path,
+                title=title,
+                source_type=source_type,
+                shareable=shareable,
+                url=url,
+                authors=authors,
+                date=date,
+                metadata=metadata,
+            )
     except BaseException:
         # Leave nothing behind: no orphan copy, sidecar or bib entry.
         if cite_key is not None:

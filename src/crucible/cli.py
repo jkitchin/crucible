@@ -2179,7 +2179,10 @@ def _is_own_sidecar(root: Path, db, src: dict, disk_path: Path, sidecar: Path) -
     """
     from crucible.ingest import extract_text, file_sha256
 
-    if sidecar == disk_path or not sidecar.is_file():
+    # NOTES.TXT's sidecar name NOTES.txt is the source itself on a
+    # case-insensitive filesystem, so the suffix is compared without case.
+    if (sidecar == disk_path or disk_path.suffix.lower() == ".txt"
+            or not sidecar.is_file()):
         return False
     sidecar_rel = _safe_relative_to(sidecar, root)
     if sidecar_rel is not None and db.get_source_by_path(sidecar_rel) is not None:
