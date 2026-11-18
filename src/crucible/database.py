@@ -406,7 +406,7 @@ def fts_rows(conn, query: str, limit: int, tiers: bool = False) -> list[dict]:
     prefixes = _fts_prefix_res(query)
     joined_prefixes = _fts_prefix_res(query, joined=True)
     sql = """
-        SELECT a.*, rank, fts.title AS _fts_title, fts.content AS _fts_content
+        SELECT a.*, rank, fts.title AS _fts_title, fts.content AS _fts_content{extra}
         FROM {table} fts
         JOIN articles a ON a.id = fts.rowid
         WHERE {table} MATCH ?
@@ -420,41 +420,62 @@ def fts_rows(conn, query: str, limit: int, tiers: bool = False) -> list[dict]:
     searches = [("article_fts", match, 0)]
     if prefixes:
         searches.append(("article_fts", _fts_query(query, broad=True), 0))
-    searches.append(("article_fts", _fts_query(query, joined=True, joined_column=False), 1))
-    if prefixes:
-        searches.append(("article_fts", _fts_query(query, broad=True, joined=True,
+    # Joining only glues subscript digits to the word before them, so a
+    # query with no digit finds nothing new in the joined text: it gets
+    # tier 0 alone, as on older versions.
+    if any(ch.isdigit() for ch in query):
+        searches.append(("article_fts", _fts_query(query, joined=True,
                                                    joined_column=False), 1))
-    if fts_has_joined(conn) and conn.execute(
-            "SELECT 1 FROM article_fts_joined LIMIT 1").fetchone():
-        searches.append(("article_fts_joined", _fts_query(query, joined=True), 1))
         if prefixes:
-            searches.append(("article_fts_joined",
-                             _fts_query(query, broad=True, joined=True), 1))
+            searches.append(("article_fts", _fts_query(
+                query, broad=True, joined=True, joined_column=False), 1))
+        if fts_has_joined(conn) and conn.execute(
+                "SELECT 1 FROM article_fts_joined LIMIT 1").fetchone():
+            searches.append(("article_fts_joined", _fts_query(query, joined=True), 1))
+            if prefixes:
+                searches.append(("article_fts_joined",
+                                 _fts_query(query, broad=True, joined=True), 1))
     rows: list[dict] = []
     seen: set = set()
-    done = set()
+    # With prefixes, each query's rows are kept: a tier-1 search that asks
+    # the same (a query with no subscript) re-checks the rows tier 0
+    # rejected against the joined text, without running the query again.
+    # Folded text is kept per article, as several searches can reach it.
+    fetched: dict = {}
+    folded: dict = {}
+    # article_fts_joined stores the joined text, so it is not made again.
+    extra = {"article_fts": "", "article_fts_joined": ", fts.joined AS _fts_joined"}
     for table, query_match, tier in searches:
-        if (table, query_match) in done:
-            continue  # the query has no subscript: tier 1 asks the same
-        done.add((table, query_match))
-        if prefixes:
-            found = conn.execute(sql.format(table=table), (query_match,))
+        if (table, query_match) in fetched:
+            if not prefixes:
+                continue  # the query has no subscript: tier 1 asks the same
+            found = fetched[(table, query_match)]
+        elif prefixes:
+            found = fetched[(table, query_match)] = [dict(row) for row in conn.execute(
+                sql.format(table=table, extra=extra[table]), (query_match,))]
         else:
+            fetched[(table, query_match)] = None
             # The FTS match is exact, so SQL can stop at limit, past the
             # rows already found.
-            found = conn.execute(sql.format(table=table) + " LIMIT ?",
+            found = conn.execute(sql.format(table=table, extra=extra[table]) + " LIMIT ?",
                                  (query_match, limit + len(seen)))
         for row in found:
             r = dict(row)
             title, content = r.pop("_fts_title") or "", r.pop("_fts_content") or ""
+            stored_joined = r.pop("_fts_joined", None)
             if r["id"] in seen:
                 continue
             if prefixes:
-                if tier == 0:
-                    text, wanted = _fold(title + "\n" + content), prefixes
-                else:
-                    text = _fold(title + "\n" + content + "\n"
-                                 + fts_joined(title, content))
+                key = r["id"]  # both tables hold the same title and content
+                if key not in folded:
+                    folded[key] = [_fold(title + "\n" + content), None]
+                text = folded[key][0]
+                wanted = prefixes
+                if tier:
+                    if folded[key][1] is None:
+                        folded[key][1] = _fold(stored_joined if stored_joined is not None
+                                               else fts_joined(title, content))
+                    text = text + "\n" + folded[key][1]
                     wanted = joined_prefixes
                 if not all(any(p.search(text) for p in alts) for alts in wanted):
                     continue

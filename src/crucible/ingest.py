@@ -1555,8 +1555,10 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     has no DOI. A row with a DOI got its url field from the fetched entry
     (a doi.org link, say), not from the page that was ingested, so there
     the DOI and title decide. A --bibtex entry's url field sets the row's
-    url, so when the entry given now has the row's url (the same command
-    run again) the URL matches too. A Markdown note is matched by its front-matter
+    url, so a page whose entry given now has the row's url (the same
+    command run again) is not refused for its own URL; it must still pass
+    the DOI and title checks, as the entry says nothing about the file.
+    A Markdown note is matched by its front-matter
     title or by its first heading, which is what older versions used.
     """
     key = _source_metadata(src).get("cite_key") or src["path"]
@@ -1566,9 +1568,9 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     cited = None
     row_url, file_url, entry_url = (u.strip().rstrip("/") if u else None
                                     for u in (src.get("url"), url, bib_url))
-    if row_url and row_url in (file_url, entry_url):
+    if row_url and row_url == file_url:
         return None
-    if row_url and file_url:
+    if row_url and file_url and row_url != entry_url:
         if not row_doi:
             return (f"{source_path.name} would be stored as {src['path']}, the missing "
                     f"file of source {key}, but it comes from {file_url}, not that "

@@ -458,3 +458,18 @@ def test_search_all_puts_joined_only_rows_after_every_crucibles_rows(tmp_path):
         assert [r["title"] for r in local.search_all("CO2", limit=7, peers=peers)][-1] == "sub"
     finally:
         local.close()
+
+
+@pytest.mark.parametrize("q", ["CO2*", "CO2* capture"])
+def test_unmigrated_database_finds_subscripts_after_mains_rows(tmp_path, q):
+    # With no article_fts_joined (a peer never updated), a prefix query's
+    # broad candidates are still checked against the joined forms, after
+    # the rows found as typed. (Plain CO2 needs `crucible update`.)
+    _v2_db(tmp_path / "c.db", "Amines bind CO_2 strongly; CO_2 capture.")
+    d = CrucibleDB(tmp_path / "c.db")
+    try:
+        d.add_article(path="p.org", title="Plain", article_type="concept",
+                      content="CO2 capture with amines.")
+        assert [r["title"] for r in d.search(q)] == ["Plain", "Capture"]
+    finally:
+        d.close()
