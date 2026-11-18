@@ -247,6 +247,9 @@ def _page_declares_doi(path: Path, doi: str) -> bool:
 # is one it cites.
 _NO_OWN_DOI_SUFFIXES = frozenset({".docx", ".pptx"})
 
+# Notes: text a person wrote, which cites papers by DOI rather than being one.
+_NOTE_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".text", ".org", ".rst"})
+
 # How much of a document's text is its front matter: where a paper prints
 # its own title and DOI, before any reference list.
 FRONT_MATTER_CHARS = 4000
@@ -289,6 +292,20 @@ def _title_on_first_page(title: str, text: str | None,
     return found >= 0.7 * len(words) or (len(words) >= 3 and found >= len(words) - 1)
 
 
+def _yaml_scalar(value: str) -> str | None:
+    """A one-line YAML scalar's text: 'It''s', "a \\"b\\"" or plain (a "#"
+    after a space starts a comment). None for a block scalar (| or >),
+    whose text is on the lines below, so the caller uses the heading."""
+    value = value.strip()
+    if not value or value[0] in "|>":
+        return None
+    if len(value) > 1 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'").strip() or None
+    if len(value) > 1 and value[0] == value[-1] == '"':
+        return re.sub(r'\\(.)', r"\1", value[1:-1]).strip() or None
+    return re.split(r"\s+#", value, 1)[0].strip() or None
+
+
 def declared_title(path: Path, text: str, front_matter: bool = True) -> str | None:
     """The title the file itself declares (#+TITLE, a # heading, <title>), or None.
 
@@ -307,8 +324,9 @@ def declared_title(path: Path, text: str, front_matter: bool = True) -> str | No
                          text or "", re.DOTALL)
         if front and front_matter:
             m = re.search(r"^title\s*:\s*(.+?)\s*$", front.group(1), re.MULTILINE)
-            if m and m.group(1).strip("\"' "):
-                return m.group(1).strip().strip("\"'").strip()
+            value = _yaml_scalar(m.group(1)) if m else None
+            if value:
+                return value
         for line in text.split("\n"):
             line = line.strip()
             if line.startswith("# "):
@@ -1525,9 +1543,9 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
 
     The row was rebuilt from its bib entry, so it has no hash to compare.
     The file is taken to be that source when its DOI (given, or found in a
-    paper's or web page's text) equals the row's, or failing a DOI on both
-    sides, when its title (given, or declared by the file) equals the
-    row's, or when its text equals the row's committed text sidecar. A
+    paper's or web page's text, but not a note's) equals the row's, or
+    when its title (given, or declared by the file) equals the row's, or
+    when its text equals the row's committed text sidecar. A
     disagreeing DOI, or no evidence at all, is a problem.
 
     URL ingest names pages from a title with the site cut off, so the
@@ -1542,6 +1560,7 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
     advice = ("If it is that source, run again with --restore; if not, "
               "rename the file before ingesting it.")
     row_doi = _norm_doi(_source_metadata(src).get("doi"))
+    cited = None
     row_url, file_url = (u.strip().rstrip("/") if u else None for u in (src.get("url"), url))
     if row_url and file_url:
         if row_url == file_url:
@@ -1557,12 +1576,13 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
             return (f"{source_path.name} would be stored as {src['path']}, the missing "
                     f"file of source {key}, but its DOI {file_doi} differs from that "
                     f"source's DOI {row_doi}. {advice}")
-        # A DOI found in the text may be one the file cites: it shows the
-        # file is the source only when the source's title is near the start
-        # too, as ingest requires before using such a DOI. Otherwise the
-        # title or text below must show it.
-        if doi or _title_on_first_page(src.get("title") or "", text):
+        # A paper's or saved web page's DOI shows it, as on main. A note
+        # (Markdown, text) that has the DOI may only cite it, so there the
+        # title must be near the start, or the title or text below match.
+        if (doi or source_path.suffix.lower() not in _NOTE_SUFFIXES
+                or _title_on_first_page(src.get("title") or "", text)):
             return None
+        cited = row_doi
     row_title = _norm_title(src.get("title"))
     file_titles = {_norm_title(t) for t in
                    ((title,) if title else (declared_title(source_path, text),
@@ -1577,6 +1597,12 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
                 return None
         except OSError:
             pass
+    if cited:
+        return (f"{source_path.name} would be stored as {src['path']}, the missing "
+                f"file of source {key}. Its text has that source's DOI {cited}, but "
+                f"it may only cite it, and its title and text do not match. If it is "
+                f"that source, run again with --doi {cited} or --restore; if not, "
+                f"rename the file before ingesting it.")
     return (f"{source_path.name} would be stored as {src['path']}, the missing "
             f"file of source {key}, but nothing shows it is that source (no "
             f"matching DOI, title or text). {advice}")

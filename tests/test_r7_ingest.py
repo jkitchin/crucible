@@ -428,3 +428,47 @@ def test_note_titled_by_its_heading_is_restored(kb, tmp_path):  # noqa: F811
     result = run("ingest", str(p))
     assert "restored" in result.output
     assert (kb / WEB / "notes.md").is_file()
+
+
+def test_saved_page_ingested_with_its_doi_is_restored(kb, tmp_path, doi_lookup):  # noqa: F811
+    # The page's <title> is the site's and the paper's title is far down;
+    # its DOI, given at ingest and in its text, shows it, as on main.
+    nav = "".join(f"<li>Menu item number {i} journals books</li>" for i in range(150))
+    p = tmp_path / "article.html"
+    p.write_text(f"<html><head><title>Journal</title></head><body>"
+                 f"<p>https://doi.org/{DOI}</p><ul>{nav}</ul>"
+                 f"<h1>Oxygen evolution on perovskite oxides</h1></body></html>")
+    run("ingest", str(p), "--doi", DOI)
+    _fresh_clone(kb)
+    result = run("ingest", str(p))
+    assert "restored" in result.output
+    assert (kb / WEB / "article.html").is_file()
+
+
+def test_note_with_the_doi_is_told_to_give_it(kb, tmp_path, doi_lookup):  # noqa: F811
+    p = tmp_path / "notes.md"
+    # A note that has the source's DOI may only cite it: it is not taken
+    # for the source without --doi, and the error says so.
+    p.write_text(f"# Reading log\n\nSee doi:{DOI}.\n")
+    run("ingest", str(p), "--doi", DOI)
+    _fresh_clone(kb)
+    result = run("ingest", str(p), ok=False)
+    assert result.exit_code != 0
+    assert f"--doi {DOI}" in result.output
+    result = run("ingest", str(p), "--doi", DOI)
+    assert "restored" in result.output
+
+
+@pytest.mark.parametrize("front, want", [
+    ("title: >-\n  A Folded\n  Title", "Heading"),
+    ("title: |\n  Literal", "Heading"),
+    ("title: 'It''s a Title'", "It's a Title"),
+    ('title: "A \\"quoted\\" title"', 'A "quoted" title'),
+    ("title: Plain title # a comment", "Plain title"),
+    ("title: C# in practice", "C# in practice"),
+])
+def test_front_matter_title_is_read_as_yaml(tmp_path, front, want):
+    p = tmp_path / "n.md"
+    text = f"---\n{front}\n---\n\n# Heading\n\nBody.\n"
+    p.write_text(text)
+    assert ingest_module.declared_title(p, text) == want

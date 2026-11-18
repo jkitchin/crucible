@@ -175,6 +175,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS article_fts USING fts5(
     path, title, content, tokenize='porter unicode61'
 );
 
+-- The articles with chemical subscripts, once more with them joined
+-- (see fts_joined), so CO2 finds CO_2
+CREATE VIRTUAL TABLE IF NOT EXISTS article_fts_joined USING fts5(
+    title, content, joined, tokenize='porter unicode61'
+);
+
 -- Derivation chain (article Y was synthesized from articles A, B, C)
 CREATE TABLE IF NOT EXISTS article_derivations (
     derived_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
@@ -216,40 +222,37 @@ def join_subscripts(text: str) -> str:
     return _SUBSCRIPT_RE.sub(lambda m: m.group(1) or m.group(2), text)
 
 
-# Separates a row's text from the joined copy fts_text adds. It is a
-# private-use character, which unicode61 indexes as a word of its own, so a
-# phrase cannot run from the end of the text into the copy, and no query
-# asks for it.
-FTS_JOINED_SEP = "\n\ue000\n"
-
-
-def fts_base(text: str) -> str:
-    """The text fts_text was given, from what it returned."""
-    return text.split(FTS_JOINED_SEP, 1)[0] if text else text
-
-
-def fts_text(text: str) -> str:
-    """Text as it is put in the FTS index: TEXT plus its paragraphs with subscripts joined.
+def fts_joined(title: str, content: str) -> str:
+    """The paragraphs of TITLE and CONTENT that have a chemical subscript,
+    with it joined.
 
     The unicode61 tokenizer splits words at "_", so CO_2 is indexed as "co"
-    and "2" and a search for CO2 would miss it. The text is indexed as
-    written, and each paragraph with a subscript is added once more, joined,
-    after FTS_JOINED_SEP: CO2 and the phrase "CO2 reduction" then find
-    CO_2, CO_{2} and CO\u2082, while step_1 is still found by step, and
-    "CO_2 reduction" still matches the words as written. Since the text is
-    kept, any edit to the file changes the indexed text. Text already
-    passed through fts_text is returned unchanged.
+    and "2" and a search for CO2 would miss it. article_fts holds the title
+    and content as written, as it always has; an article with a subscript
+    also has a row in article_fts_joined, which holds its title, content
+    and these paragraphs (in the "joined" column). CO2 and the phrase "CO2
+    reduction" then find CO_2, CO_{2} and CO\u2082, while step_1 is still
+    found by step. Since article_fts is unchanged, so are the rows it finds
+    and their ranking: the rows only article_fts_joined finds come after.
     """
-    if not text or FTS_JOINED_SEP in text:
-        return text
     joined = []
-    for para in re.split(r"\n\s*\n", text):
-        j = join_subscripts(para)
-        if j != para:
-            joined.append(j)
-    if not joined:
-        return text
-    return text + FTS_JOINED_SEP + "\n\n".join(joined)
+    for text in (title, content):
+        for para in re.split(r"\n\s*\n", text or ""):
+            j = join_subscripts(para)
+            if j != para:
+                joined.append(j)
+    return "\n\n".join(joined)
+
+
+def fts_has_joined(conn) -> bool:
+    """Whether conn's database has article_fts_joined (schema v3).
+
+    A database made by an older version has none until `crucible update`
+    migrates it, and a peer's may never be migrated.
+    """
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'article_fts_joined'"
+    ).fetchone() is not None
 
 
 # A query term: a "quoted phrase" (straight or curly quotes) starting a
@@ -279,7 +282,7 @@ def _query_terms(raw: str) -> list[tuple[bool, str, str]]:
     return terms
 
 
-def _fts_query(raw: str, broad: bool = False) -> str:
+def _fts_query(raw: str, broad: bool = False, joined: bool = False) -> str:
     """Turn a raw user query into a safe FTS5 MATCH expression.
 
     A "quoted phrase" is searched as a phrase: its words in that order,
@@ -303,9 +306,9 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     A token with no letter or digit in it ("&", "-", "/", an en dash) is
     dropped: the tokenizer reads it as an empty phrase, which, ANDed with
     the rest, would make every search return nothing.
-    Chemical subscripts are joined as in the index (see fts_text). A term
-    that changes is also asked for as typed, so CO_2 still finds articles
-    in an index built before subscripts were joined.
+    Chemical subscripts are joined as in article_fts_joined (see
+    fts_joined), which is searched with `joined`. A term that changes is
+    also asked for as typed, so CO_2 still finds CO_2 in article_fts.
 
     The match is limited to the title and content columns: the path column
     holds ".crucible/wiki/concepts/x.org", whose words would otherwise match
@@ -318,8 +321,8 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     terms = []
     for is_phrase, token, orig in _query_terms(raw):
         if is_phrase:
-            # As typed, and joined, which matches the joined copy of the
-            # text (fts_text): "CO2 reduction" finds each way of writing it.
+            # As typed, and joined, which matches article_fts_joined
+            # (fts_joined): "CO2 reduction" finds each way of writing it.
             alts = list(dict.fromkeys((orig, token)))
             terms.append(_fts_literal(alts[0]) if len(alts) == 1 else
                          "(" + " OR ".join(_fts_literal(a) for a in alts) + ")")
@@ -345,7 +348,8 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     if not terms:
         return ""
     # Explicit AND: FTS5 allows implicit AND only between plain phrases.
-    return "{title content} : (" + " AND ".join(terms) + ")"
+    columns = "{title content joined}" if joined else "{title content}"
+    return columns + " : (" + " AND ".join(terms) + ")"
 
 
 def _fold(text: str) -> str:
@@ -358,7 +362,7 @@ def _fts_prefix_res(raw: str) -> list[list[re.Pattern]]:
     """For each prefix token (catal*) in a query, patterns for a word starting with it.
 
     A row matches the token if any of its patterns matches: the token
-    joined as in fts_text (CO2*) or as typed (file_2024*, which fts_text
+    joined as in fts_joined (CO2*) or as typed (file_2024*, which fts_joined
     leaves alone), as _fts_query asks for both.
     """
     patterns = []
@@ -392,37 +396,46 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
     prefixes = _fts_prefix_res(query)
     sql = """
         SELECT a.*, rank, fts.title AS _fts_title, fts.content AS _fts_content
-        FROM article_fts fts
+        FROM {table} fts
         JOIN articles a ON a.id = fts.rowid
-        WHERE article_fts MATCH ?
+        WHERE {table} MATCH ?
         ORDER BY rank
     """
-    if not prefixes:
-        # The FTS match is exact, so SQL can stop at limit.
-        return [_strip_fts(dict(row)) for row in conn.execute(sql + " LIMIT ?", (match, limit))]
+    # article_fts first, which finds and ranks rows as it always has; then
+    # the rows only the joined subscripts find (see fts_joined).
+    searches = [("article_fts", match)]
+    if prefixes:
+        searches.append(("article_fts", _fts_query(query, broad=True)))
+    if fts_has_joined(conn) and conn.execute(
+            "SELECT 1 FROM article_fts_joined LIMIT 1").fetchone():
+        searches.append(("article_fts_joined", _fts_query(query, joined=True)))
+        if prefixes:
+            searches.append(("article_fts_joined",
+                             _fts_query(query, broad=True, joined=True)))
     rows: list[dict] = []
     seen: set = set()
-    for query_match in dict.fromkeys((match, _fts_query(query, broad=True))):
-        for row in conn.execute(sql, (query_match,)):
+    for table, query_match in dict.fromkeys(searches):
+        if prefixes:
+            found = conn.execute(sql.format(table=table), (query_match,))
+        else:
+            # The FTS match is exact, so SQL can stop at limit, past the
+            # rows already found.
+            found = conn.execute(sql.format(table=table) + " LIMIT ?",
+                                 (query_match, limit + len(seen)))
+        for row in found:
             r = dict(row)
-            # fts_text: the index may predate joined subscripts (a peer's).
-            text = _fold(fts_text(r.pop("_fts_title") or "") + "\n"
-                         + fts_text(r.pop("_fts_content") or ""))
-            if r["id"] in seen or not all(any(p.search(text) for p in alts)
-                                             for alts in prefixes):
+            title, content = r.pop("_fts_title") or "", r.pop("_fts_content") or ""
+            if r["id"] in seen:
                 continue
+            if prefixes:
+                text = _fold(title + "\n" + content + "\n" + fts_joined(title, content))
+                if not all(any(p.search(text) for p in alts) for alts in prefixes):
+                    continue
             seen.add(r["id"])
             rows.append(r)
             if len(rows) >= limit:
                 return rows
     return rows
-
-
-def _strip_fts(row: dict) -> dict:
-    """An fts_rows row without the FTS text columns it was selected with."""
-    row.pop("_fts_title", None)
-    row.pop("_fts_content", None)
-    return row
 
 
 class CrucibleDB:
@@ -493,18 +506,12 @@ class CrucibleDB:
         self.conn.commit()
 
     def _migrate_v3(self):
-        """v3: Reindex article text with chemical subscripts joined (fts_text)."""
+        """v3: Fill article_fts_joined (see fts_joined); article_fts is unchanged."""
         with self.conn.transaction():
-            rows = self.conn.execute(
-                "SELECT rowid, title, content FROM article_fts").fetchall()
-            for row in rows:
-                title = fts_text(fts_base(row["title"]))
-                content = fts_text(fts_base(row["content"]))
-                if (title, content) != (row["title"], row["content"]):
-                    self.conn.execute(
-                        "UPDATE article_fts SET title = ?, content = ? WHERE rowid = ?",
-                        (title, content, row["rowid"]),
-                    )
+            self.conn.execute("DELETE FROM article_fts_joined")
+            for row in self.conn.execute(
+                    "SELECT rowid, title, content FROM article_fts").fetchall():
+                self._insert_joined(row["rowid"], row["title"], row["content"])
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (3)"
             )
@@ -730,10 +737,7 @@ class CrucibleDB:
         article_id = cur.lastrowid
         # Index for FTS even when content is empty: sync compares the indexed
         # row with the file, and a missing row reads as a change.
-        self.conn.execute(
-            "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
-            (article_id, path, fts_text(title), fts_text(content)),
-        )
+        self._insert_fts(article_id, path, title, content)
         self.conn.commit()
         return article_id
 
@@ -776,23 +780,54 @@ class CrucibleDB:
 
     def update_article_fts(self, article_id: int, path: str, title: str, content: str):
         """Update FTS index for an article (delete old, insert new)."""
-        self.conn.execute("DELETE FROM article_fts WHERE rowid = ?", (article_id,))
+        self._delete_fts(article_id)
+        self._insert_fts(article_id, path, title, content)
+        self.conn.commit()
+
+    def _insert_fts(self, article_id: int, path: str, title: str, content: str):
+        """Index an article in article_fts, and in article_fts_joined if
+        the database has it and the article has a subscript."""
         self.conn.execute(
             "INSERT INTO article_fts (rowid, path, title, content) VALUES (?, ?, ?, ?)",
-            (article_id, path, fts_text(title), fts_text(content)),
+            (article_id, path, title, content),
         )
-        self.conn.commit()
+        if fts_has_joined(self.conn):
+            self._insert_joined(article_id, title, content)
+
+    def _insert_joined(self, article_id: int, title: str, content: str):
+        joined = fts_joined(title, content)
+        if joined:
+            self.conn.execute(
+                "INSERT INTO article_fts_joined (rowid, title, content, joined)"
+                " VALUES (?, ?, ?, ?)", (article_id, title, content, joined))
+
+    def _delete_fts(self, article_id: int):
+        self.conn.execute("DELETE FROM article_fts WHERE rowid = ?", (article_id,))
+        if fts_has_joined(self.conn):
+            self.conn.execute("DELETE FROM article_fts_joined WHERE rowid = ?",
+                              (article_id,))
 
     def get_article_fts(self, article_id: int) -> dict | None:
         """Return the indexed path, title and content of an article.
 
-        The title and content are as indexed, so passed through fts_text.
+        With schema v3 the row also has "joined": the article's row in
+        article_fts_joined as (title, content, joined), or None if it has
+        none.
         """
         row = self.conn.execute(
             "SELECT path, title, content FROM article_fts WHERE rowid = ?",
             (article_id,),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        row = dict(row)
+        if fts_has_joined(self.conn):
+            j = self.conn.execute(
+                "SELECT title, content, joined FROM article_fts_joined WHERE rowid = ?",
+                (article_id,),
+            ).fetchone()
+            row["joined"] = (j["title"], j["content"], j["joined"]) if j else None
+        return row
 
     def delete_embedding(self, article_id: int):
         """Drop an article's embedding so `crucible embed` regenerates it."""
@@ -806,7 +841,7 @@ class CrucibleDB:
 
     def delete_article(self, article_id: int):
         """Delete an article and all its relationships."""
-        self.conn.execute("DELETE FROM article_fts WHERE rowid = ?", (article_id,))
+        self._delete_fts(article_id)
         self.delete_embedding(article_id)
         self.conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
         self.conn.commit()

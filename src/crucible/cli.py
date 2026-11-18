@@ -16,7 +16,7 @@ import click
 
 from crucible import package_version
 from crucible import registry as registry_module
-from crucible.database import CrucibleDB, fts_base, fts_text
+from crucible.database import CrucibleDB, fts_joined
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source, read_bib_text, write_bib_text
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
@@ -1161,18 +1161,20 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
                     "abstract": meta.properties.get("ABSTRACT", ""),
                 }
                 indexed = db.get_article_fts(article_id)
-                current = {"path": rel_path, "title": fts_text(meta.title),
-                           "content": fts_text(meta.content)}
-                # A row indexed before subscripts were joined (fts_text)
-                # holds the file's text as is: the file is unchanged, but
-                # the row is reindexed below.
-                stale_index = indexed != current and indexed is not None and {
-                    "path": indexed["path"], "title": fts_base(indexed["title"]),
-                    "content": fts_base(indexed["content"])} == {
-                    "path": rel_path, "title": meta.title, "content": meta.content}
+                current = {"path": rel_path, "title": meta.title,
+                           "content": meta.content}
+                text_changed = indexed is None or {
+                    k: indexed[k] for k in current} != current
+                # A row of article_fts_joined that is out of date or
+                # missing (the article was indexed by an older version) is
+                # reindexed below, though the file is unchanged.
+                want = fts_joined(meta.title, meta.content)
+                stale_index = (not text_changed and "joined" in indexed
+                               and indexed["joined"] != ((meta.title, meta.content, want)
+                                                         if want else None))
                 changed = (
                     any(existing[k] != v for k, v in fields.items())
-                    or (indexed != current and not stale_index)
+                    or text_changed
                 )
                 # Only rewrite articles whose file changed, so updated_at
                 # records real edits and unchanged articles keep their
@@ -5364,9 +5366,10 @@ def _remove_marker_blocks(text: str, marker: str) -> tuple[str, int]:
     """text without the marker...marker blocks, and how many were removed.
 
     A block on lines of its own goes with its line end, so the lines before
-    and after it stay separate lines, and a blank line on each side (the one
-    install puts before the block, say) becomes one blank line, not two. A
-    block that shares a line with other text leaves that text's line end.
+    and after it stay separate lines, and so does the blank line before it
+    (install puts one there), so text added after the block follows the
+    text before it as it did before install. A block that shares a line
+    with other text leaves that text's line end.
     """
     pattern = re.compile(re.escape(marker) + r".*?" + re.escape(marker), re.DOTALL)
     pieces, pos, count = [], 0, 0
@@ -5381,11 +5384,11 @@ def _remove_marker_blocks(text: str, marker: str) -> tuple[str, int]:
                 after_start += 2
             elif text.startswith("\n", after_start):
                 after_start += 1
-            # A blank line on both sides (or one at the start) collapses.
-            if (before == "" or before.endswith(("\n\n", "\n\r\n"))) and (
-                text.startswith("\n", after_start)
-                or text.startswith("\r\n", after_start)
-            ):
+            if before.endswith(("\n\n", "\n\r\n")):
+                # The blank line before the block goes with it.
+                before = before[:-2] if before.endswith("\r\n") else before[:-1]
+            elif before == "" and text.startswith(("\n", "\r\n"), after_start):
+                # A block at the start takes the blank line after it.
                 after_start += 2 if text.startswith("\r\n", after_start) else 1
         pieces, pos, count = [before], after_start, count + 1
     return "".join(pieces) + text[pos:], count

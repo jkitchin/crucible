@@ -229,6 +229,18 @@ def test_install_and_uninstall_keep_the_users_lines(project):  # noqa: F811
     assert claude_md.read_text() == "- never use --no-verify\n- merge commits\n"
 
 
+def test_uninstall_after_text_added_below_the_block(project):  # noqa: F811
+    # Install puts a blank line before its block; uninstall takes it too,
+    # so a line added after the block follows the user's text, as on main.
+    claude_md = Path.home() / ".claude/CLAUDE.md"
+    claude_md.parent.mkdir(parents=True, exist_ok=True)
+    claude_md.write_text("# My rules\n\n- be nice\n")
+    assert invoke("install").exit_code == 0
+    claude_md.write_text(claude_md.read_text() + "- added later\n")
+    assert invoke("uninstall").exit_code == 0
+    assert claude_md.read_text() == "# My rules\n\n- be nice\n- added later\n"
+
+
 # -- 6. a .TXT source is its own text -----------------------------------------
 
 

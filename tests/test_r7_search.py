@@ -9,8 +9,7 @@ import pytest
 from test_embeddings import FakeOllama, _make_project, invoke
 
 from crucible.browse import start_server
-from crucible.database import (CrucibleDB, FTS_JOINED_SEP, fts_base, fts_text,
-                               join_subscripts)
+from crucible.database import CrucibleDB, fts_joined, join_subscripts
 from crucible.embeddings import EmbeddingIndex
 
 DFT = ("DFT", "Density functional theory computes ground states.")
@@ -134,16 +133,43 @@ def test_join_subscripts(text, want):
     assert join_subscripts(want) == want
 
 
-def test_fts_text_keeps_the_words_as_written():
-    # The joined forms are added; the text itself is indexed unchanged.
-    # The paragraphs that change are added, joined, after a separator.
+def test_fts_joined_holds_the_paragraphs_with_subscripts():
+    # The title and content are indexed as written; the paragraphs that
+    # change are indexed once more, joined, in a column of their own.
     text = "Amines bind CO_2 on TiO_{2}.\n\nNo subscript.\n\nThen H_2O."
-    assert fts_text(text) == (
-        text + FTS_JOINED_SEP + "Amines bind CO2 on TiO2.\n\nThen H2O.")
-    assert fts_text("no subscripts here") == "no subscripts here"
-    # Indexed text is not indexed twice (a migration after a sync).
-    assert fts_text(fts_text(text)) == fts_text(text)
-    assert fts_base(fts_text(text)) == text
+    assert fts_joined("On CO_2", text) == (
+        "On CO2\n\nAmines bind CO2 on TiO2.\n\nThen H2O.")
+    assert fts_joined("Plain", "no subscripts here") == ""
+
+
+def test_joined_column_does_not_change_the_ranking(tmp_path):
+    # Rows are found and ranked by article_fts as on main: an article with
+    # a subscript (sample_3) is not ranked by its joined copy as well.
+    arts = [("Catalysis review", "Catalysis on oxide surfaces is reviewed here"
+             " in some detail with examples."),
+            ("Run log", "Catalysis on oxide surfaces is reviewed here in some"
+             " detail with sample_3.")]
+    arts += [(f"Filler {i}", "Unrelated words about polymers and heat.") for i in range(8)]
+    d = CrucibleDB(tmp_path / "c.db")
+    d.initialize()
+    plain = sqlite3.connect(":memory:")
+    plain.execute("CREATE VIRTUAL TABLE article_fts USING fts5("
+                  "path, title, content, tokenize='porter unicode61')")
+    try:
+        for i, (t, c) in enumerate(arts, start=1):
+            path = f".crucible/wiki/concepts/a{i}.org"
+            d.add_article(path=path, title=t, article_type="concept", content=c)
+            plain.execute("INSERT INTO article_fts (rowid, path, title, content)"
+                          " VALUES (?, ?, ?, ?)", (i, path, t, c))
+        for q in ("catalysis", "oxide surfaces", "detail"):
+            want = [(arts[r[0] - 1][0], r[1]) for r in plain.execute(
+                "SELECT rowid, rank FROM article_fts WHERE article_fts MATCH ? ORDER BY rank",
+                ("{title content} : (" + q + ")",))]
+            assert [(r["title"], r["rank"]) for r in d.search(q)] == want, q
+        assert titles(d.search("sample3")) == ["Run log"]
+    finally:
+        plain.close()
+        d.close()
 
 
 def test_words_with_digit_subscripts_are_still_found_by_their_parts(
@@ -200,19 +226,25 @@ def test_snake_case_is_not_mangled(db):
     assert titles(db.search("H_2O")) == ["Snake"]
 
 
-def _v2_db(path, content):
-    """A schema v2 database whose FTS row holds the text unjoined."""
-    d = CrucibleDB(path)
-    d.initialize()
-    d.add_article(path=".crucible/wiki/concepts/c.org", title="Capture",
-                  article_type="concept", content="x")
-    d.close()
+def _as_v2(path):
+    """Make the database at PATH a schema v2 one, as main builds it, with
+    no article_fts_joined."""
     c = sqlite3.connect(path)
-    c.execute("UPDATE article_fts SET content = ?", (content,))
+    c.execute("DROP TABLE article_fts_joined")
     c.execute("DELETE FROM schema_version")
     c.execute("INSERT INTO schema_version (version) VALUES (2)")
     c.commit()
     c.close()
+
+
+def _v2_db(path, content):
+    """A schema v2 database with one article."""
+    d = CrucibleDB(path)
+    d.initialize()
+    d.add_article(path=".crucible/wiki/concepts/c.org", title="Capture",
+                  article_type="concept", content=content)
+    d.close()
+    _as_v2(path)
 
 
 def test_old_database_is_reindexed(tmp_path):
@@ -226,7 +258,9 @@ def test_old_database_is_reindexed(tmp_path):
         assert titles(d.search("TiO_{2}")) == ["Capture"]
         d.initialize()
         assert d.schema_version() >= 3
-        assert d.get_article_fts(1)["content"] == fts_text(CAPTURE[1])
+        row = d.get_article_fts(1)
+        assert row["content"] == CAPTURE[1]
+        assert row["joined"] == ("Capture", CAPTURE[1], fts_joined("Capture", CAPTURE[1]))
         assert titles(d.search("CO2")) == ["Capture"]
         assert titles(d.search("TiO2")) == ["Capture"]
         assert titles(d.search("TiO_{2}")) == ["Capture"]
@@ -243,10 +277,9 @@ def test_sync_reindexes_old_rows_without_counting_an_edit(
     try:
         aid = d.get_article_by_path(".crucible/wiki/concepts/c.org")["id"]
         row = d.get_article_fts(aid)
-        assert "CO2" in row["content"]
-        # Put the row back as an index built before subscripts were joined.
-        d.conn.execute("UPDATE article_fts SET content = ? WHERE rowid = ?",
-                       (fts_base(row["content"]), aid))
+        assert "CO2" in row["joined"][2]
+        # An article indexed without its row in article_fts_joined.
+        d.conn.execute("DELETE FROM article_fts_joined WHERE rowid = ?", (aid,))
         d.conn.commit()
         assert titles(d.search("CO2")) == []
     finally:
@@ -325,8 +358,8 @@ def test_phrase_with_a_subscript_inside_the_word(phrase_db, q):
 
 def test_migration_after_sync_does_not_reindex_twice(
         tmp_path, registry, monkeypatch):
-    # New sync on a v2 database reindexes it; a later migration (update,
-    # init) must leave those rows alone, or the next sync counts an edit.
+    # A v2 database is migrated by sync; a later migration (update, init)
+    # must leave the rows alone, and sync must not count an edit.
     monkeypatch.delenv("CRUCIBLE_OLLAMA_URL", raising=False)
     root = _make_project(tmp_path / "kb", monkeypatch, {"c.org": CAPTURE})
     db_path = root / ".crucible" / "crucible.db"
@@ -334,24 +367,25 @@ def test_migration_after_sync_does_not_reindex_twice(
     try:
         aid = d.get_article_by_path(".crucible/wiki/concepts/c.org")["id"]
         row = d.get_article_fts(aid)
-        d.conn.execute("UPDATE article_fts SET content = ? WHERE rowid = ?",
-                       (fts_base(row["content"]), aid))
-        d.conn.execute("DELETE FROM schema_version")
-        d.conn.execute("INSERT INTO schema_version (version) VALUES (2)")
-        d.conn.commit()
     finally:
         d.close()
-    assert invoke("sync").exit_code == 0
-    d = CrucibleDB(db_path)
-    try:
-        assert d.schema_version() == 2
-        d.initialize()
-        assert d.get_article_fts(aid) == row
-    finally:
-        d.close()
+    _as_v2(db_path)
     edits = []
     monkeypatch.setattr(CrucibleDB, "delete_embedding",
                         lambda self, article_id: edits.append(article_id))
+    result = invoke("sync")
+    assert result.exit_code == 0 and "0 updated" in result.output, result.output
+    assert edits == []
+    d = CrucibleDB(db_path)
+    try:
+        # Sync leaves the v2 index as it is, and searches it as such.
+        assert "joined" not in d.get_article_fts(aid)
+        assert titles(d.search("CO_2")) == ["Capture"]
+        d.initialize()
+        assert d.get_article_fts(aid) == row
+        assert titles(d.search("CO2")) == ["Capture"]
+    finally:
+        d.close()
     result = invoke("sync")
     assert "0 updated" in result.output
     assert edits == []
