@@ -9,7 +9,7 @@ import pytest
 from test_embeddings import FakeOllama, _make_project, invoke
 
 from crucible.browse import start_server
-from crucible.database import CrucibleDB, fts_text
+from crucible.database import CrucibleDB, fts_text, join_subscripts
 from crucible.embeddings import EmbeddingIndex
 
 DFT = ("DFT", "Density functional theory computes ground states.")
@@ -128,9 +128,60 @@ def test_phrase_in_browse_search(tmp_path, registry, monkeypatch):
     ("file_2024_report", "file_2024_report"), ("my_var", "my_var"),
     ("x_2b", "x_2b"), ("_2", "_2"), ("a_{x}", "a_{x}"),
 ])
-def test_fts_text(text, want):
-    assert fts_text(text) == want
-    assert fts_text(want) == want
+def test_join_subscripts(text, want):
+    assert join_subscripts(text) == want
+    assert join_subscripts(want) == want
+
+
+def test_fts_text_keeps_the_words_as_written():
+    # The joined forms are added; the text itself is indexed unchanged.
+    assert fts_text("Amines bind CO_2 on TiO_{2}.") == (
+        "Amines bind CO_2 on TiO_{2}.\nCO2 TiO2.")
+    assert fts_text("step_1 and report_2024") == (
+        "step_1 and report_2024\nstep1 report2024")
+    assert fts_text("no subscripts here") == "no subscripts here"
+
+
+def test_words_with_digit_subscripts_are_still_found_by_their_parts(
+        tmp_path, registry, monkeypatch):
+    monkeypatch.delenv("CRUCIBLE_OLLAMA_URL", raising=False)
+    root = _make_project(tmp_path / "kb", monkeypatch, {
+        "a.org": ("Steps", "See step_1 of report_2024 and $x_2$.")})
+    d = CrucibleDB(root / ".crucible" / "crucible.db")
+    try:
+        for q in ("step", "2024", "report 2024", "x", "step_1", "step1",
+                  '"report_2024"'):
+            assert titles(d.search(q)) == ["Steps"], q
+    finally:
+        d.close()
+
+
+def test_phrase_with_joined_subscript_finds_text_written_with_one(
+        tmp_path, registry, monkeypatch):
+    monkeypatch.delenv("CRUCIBLE_OLLAMA_URL", raising=False)
+    root = _make_project(tmp_path / "kb", monkeypatch, {"c.org": CAPTURE})
+    d = CrucibleDB(root / ".crucible" / "crucible.db")
+    try:
+        assert titles(d.search('"bind CO2 strongly"')) == ["Capture"]
+        assert titles(d.search('"bind CO_2 strongly"')) == ["Capture"]
+        assert titles(d.search('"strongly CO2"')) == []
+    finally:
+        d.close()
+
+
+def test_sync_counts_an_edit_that_only_changes_a_subscript(
+        tmp_path, registry, monkeypatch):
+    monkeypatch.delenv("CRUCIBLE_OLLAMA_URL", raising=False)
+    root = _make_project(tmp_path / "kb", monkeypatch, {"c.org": CAPTURE})
+    f = root / ".crucible" / "wiki" / "concepts" / "c.org"
+    f.write_text(f.read_text().replace("CO_2", "CO2"))
+    edits = []
+    monkeypatch.setattr(CrucibleDB, "delete_embedding",
+                        lambda self, article_id: edits.append(article_id))
+    result = invoke("sync")
+    assert result.exit_code == 0
+    assert "1 updated" in result.output
+    assert len(edits) == 1
 
 
 @pytest.mark.parametrize("q", ["CO2", "TiO2", "CO_2", "TiO_{2}", "CO2*",
@@ -191,8 +242,7 @@ def test_sync_reindexes_old_rows_without_counting_an_edit(
         assert "CO2" in row["content"]
         # Put the row back as an index built before subscripts were joined.
         d.conn.execute("UPDATE article_fts SET content = ? WHERE rowid = ?",
-                       (row["content"].replace("CO2", "CO_2")
-                        .replace("TiO2", "TiO_{2}"), aid))
+                       (row["content"].rsplit("\n", 1)[0], aid))
         d.conn.commit()
         assert titles(d.search("CO2")) == []
     finally:

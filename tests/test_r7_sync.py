@@ -1,3 +1,4 @@
+import pytest
 """Regression tests: generated files never write through links, and wiki
 paths through a symlink alias resolve everywhere."""
 
@@ -116,10 +117,16 @@ def test_article_argument_through_alias_resolves(kb):  # noqa: F811
     assert "summaries/s.org" in result.output
 
 
-def test_delete_through_alias_refuses(kb):  # noqa: F811
+@pytest.mark.parametrize("spelling", [
+    "dft.org", "wiki/dft.org", ".crucible/wiki/dft.org", "ABS", "CWD"])
+def test_delete_through_alias_refuses(kb, spelling, monkeypatch):  # noqa: F811
     alias_kb(kb)
     real = wiki(kb) / "concepts" / "density-functional-theory.org"
-    result = run("delete", "dft.org", "--yes", "--file", ok=False)
+    given = {"ABS": str(wiki(kb) / "dft.org"), "CWD": "dft.org"}.get(
+        spelling, spelling)
+    if spelling == "CWD":
+        monkeypatch.chdir(wiki(kb))
+    result = run("delete", given, "--yes", "--file", ok=False)
     assert result.exit_code != 0
     assert "symlink alias" in result.output
     assert real.exists() and (wiki(kb) / "dft.org").is_symlink()
@@ -130,7 +137,9 @@ def test_delete_through_alias_refuses(kb):  # noqa: F811
     finally:
         db.close()
     # The article's own path still deletes it.
-    run("delete", "concepts/density-functional-theory.org", "--yes")
+    monkeypatch.chdir(kb)
+    run("delete", "concepts/density-functional-theory.org", "--yes", "--file")
+    assert not real.exists()
 
 
 def test_browse_resolves_relative_links_of_article_served_through_alias(kb):  # noqa: F811

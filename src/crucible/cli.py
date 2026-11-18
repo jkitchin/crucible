@@ -2234,17 +2234,22 @@ def delete(path, yes, delete_file):
     # source, not an article whose path merely contains it. Paths may be
     # given relative to the cwd, the project, the wiki, or absolute.
     try:
-        article = _lookup_project_path(root, path, db.get_article_by_path,
-                                       aliases=False)
-        if not article:
-            # A symlink alias (dft.org -> concepts/dft-theory.org) is not
-            # the article: deleting through it would remove the real one.
-            real = _lookup_project_path(root, path, db.get_article_by_path)
-            if real:
+        # A symlink alias (dft.org -> concepts/dft-theory.org) is not the
+        # article: deleting through it would remove the real one. Each
+        # spelling of PATH is checked in turn, so the alias is refused
+        # however it is named (wiki-relative, project-relative, absolute).
+        article = None
+        for candidate in _project_path_candidates(root, path, aliases=False):
+            named = Path(os.path.normpath(root / candidate))
+            real = _alias_target(root, named)
+            if real != named:
                 raise click.ClickException(
-                    f"{path} is a symlink alias of {real['path']}. Delete the "
-                    "symlink by hand, or name the article's own path to "
-                    "delete the article.")
+                    f"{path} is a symlink alias of {_target_rel(root, real)}. "
+                    "Delete the symlink by hand, or name the article's own "
+                    "path to delete the article.")
+            article = db.get_article_by_path(candidate)
+            if article:
+                break
         src = None if article else _lookup_project_path(root, path, db.get_source_by_path)
         if not article and not src:
             src = _source_by_cite_key(db, path)

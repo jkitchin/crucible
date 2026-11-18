@@ -208,18 +208,36 @@ _UNICODE_SUBSCRIPTS = str.maketrans("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\
                                     "0123456789")
 
 
-def fts_text(text: str) -> str:
-    """Text as it is put in the FTS index: chemical subscripts joined.
-
-    The unicode61 tokenizer splits words at "_", so CO_2 would be indexed as
-    "co" and "2" and a search for CO2 would miss it. Indexed text and
-    queries both go through this, so CO2, CO_2, CO_{2} and CO\u2082 all
-    find each other. It is idempotent.
-    """
+def join_subscripts(text: str) -> str:
+    """TEXT with chemical subscripts joined: CO_2, CO_{2} and CO\u2082 become CO2."""
     if not text:
         return text
     text = text.translate(_UNICODE_SUBSCRIPTS)
     return _SUBSCRIPT_RE.sub(lambda m: m.group(1) or m.group(2), text)
+
+
+def fts_text(text: str) -> str:
+    """Text as it is put in the FTS index: TEXT plus its joined subscripts.
+
+    The unicode61 tokenizer splits words at "_", so CO_2 is indexed as "co"
+    and "2" and a search for CO2 would miss it. The text is indexed as
+    written, and each word with a subscript is added once more, joined, at
+    the end: CO2 then finds CO_2, CO_{2} and CO\u2082, while step_1 is
+    still found by step, and phrases ("CO_2 reduction") still match the
+    words as written. Since the text is kept, any edit to the file changes
+    the indexed text.
+    """
+    if not text:
+        return text
+    joined = []
+    for word in text.split():
+        if "_" in word or any("\u2080" <= ch <= "\u2089" for ch in word):
+            j = join_subscripts(word)
+            if j != word:
+                joined.append(j)
+    if not joined:
+        return text
+    return text + "\n" + " ".join(dict.fromkeys(joined))
 
 
 # A query term: a "quoted phrase" (straight or curly quotes) starting a
@@ -245,7 +263,7 @@ def _query_terms(raw: str) -> list[tuple[bool, str, str]]:
             orig = " ".join(orig.split())
         if not any(ch.isalnum() for ch in orig.rstrip("*")):
             continue  # "*", "&", "--", "": nothing the tokenizer would index
-        terms.append((phrase is not None, fts_text(orig), orig))
+        terms.append((phrase is not None, join_subscripts(orig), orig))
     return terms
 
 
@@ -288,10 +306,13 @@ def _fts_query(raw: str, broad: bool = False) -> str:
     terms = []
     for is_phrase, token, orig in _query_terms(raw):
         if is_phrase:
-            term = _fts_literal(token)
-            if orig != token:
-                term = f"({term} OR {_fts_literal(orig)})"
-            terms.append(term)
+            # As typed, joined, and with a word's trailing digits read as a
+            # subscript ("CO2 reduction" finds CO_2 reduction), since the
+            # joined forms are indexed apart from the sentence.
+            split = re.sub(r"(?<=[A-Za-z)])(\d+)(?![\w])", r"_\1", orig)
+            alts = list(dict.fromkeys((orig, token, split)))
+            terms.append(_fts_literal(alts[0]) if len(alts) == 1 else
+                         "(" + " OR ".join(_fts_literal(a) for a in alts) + ")")
             continue
         alts = []
         for tok in dict.fromkeys((token, orig)):
