@@ -27,6 +27,7 @@ from filelock import FileLock
 from crucible import bibtex as bibtex_mod
 from crucible.database import CrucibleDB
 from crucible.orgparse import parse_org_file
+from crucible.wikiwalk import wiki_article_files
 
 
 def detect_source_type(path: Path) -> str:
@@ -201,22 +202,46 @@ def _title_key(title: str) -> str:
 # is one it cites.
 _NO_OWN_DOI_SUFFIXES = frozenset({".docx", ".pptx"})
 
+# How much of a document's text is its front matter: where a paper prints
+# its own title and DOI, before any reference list.
+FRONT_MATTER_CHARS = 4000
 
-def _title_on_first_page(title: str, text: str | None, scan_chars: int = 4000) -> bool:
+
+def may_carry_own_doi(source_type: str, path: Path) -> bool:
+    """Whether a DOI in this file's text may be the file's own.
+
+    Only a paper (a PDF) or a web page carries its own DOI near the top; a
+    notebook, data file, slide deck or Word document that mentions a DOI is
+    citing someone else's paper, and must not become that paper.
+    """
+    return (source_type in ("pdf", "web")
+            and path.suffix.lower() not in _NO_OWN_DOI_SUFFIXES)
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[^\W_]{4,}", text.casefold()))
+
+
+def _title_on_first_page(title: str, text: str | None,
+                         scan_chars: int = FRONT_MATTER_CHARS) -> bool:
     """Whether `title` appears near the start of `text`, where a paper prints it.
 
     The window is the one extract_doi_from_text scans. Words are compared,
     not the whole string: a fetched title carries markup (CO<sub>2</sub>,
-    {\\"u}) and a PDF's text line breaks and hyphenation, so most of the
-    title's words of four or more letters must be there. A title with no
-    such words is accepted.
+    {\\"u}) and a PDF's text line breaks and hyphenation. A word broken
+    across lines (Electro-/catalytic) is read both joined and as two words.
+    Most of the title's words of four or more letters must be there, and a
+    title of three or more such words may miss one (a word set in Greek or
+    math, say). A title with no such words is accepted.
     """
     title = re.sub(r"<[^>]*>|\\[a-zA-Z]+|[{}]", " ", title)
-    words = set(re.findall(r"[^\W_]{4,}", title.casefold()))
+    words = _words(title)
     if not words:
         return True
-    page = set(re.findall(r"[^\W_]{4,}", (text or "")[:scan_chars].casefold()))
-    return len(words & page) >= 0.7 * len(words)
+    front = (text or "")[:scan_chars]
+    page = _words(front) | _words(re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", front))
+    found = len(words & page)
+    return found >= 0.7 * len(words) or (len(words) >= 3 and found >= len(words) - 1)
 
 
 def declared_title(path: Path, text: str) -> str | None:
@@ -1085,7 +1110,8 @@ def _trim_doi(doi: str) -> str:
     return doi
 
 
-def extract_doi_from_text(text: str | None, scan_chars: int = 4000) -> str | None:
+def extract_doi_from_text(text: str | None,
+                          scan_chars: int = FRONT_MATTER_CHARS) -> str | None:
     """Best-effort extraction of a document's own DOI from its text.
 
     Only the first ``scan_chars`` characters are scanned (title page / header),
@@ -1333,17 +1359,37 @@ def _unique_cite_key(base: str, db: CrucibleDB, root: Path | None = None) -> str
     return f"{base}{i}"
 
 
+# {article path: ((mtime_ns, size), cite keys)}, so ingesting many files
+# parses each article once, not once per file (see _keys_cited_in_wiki).
+_cited_keys_cache: dict[Path, tuple[tuple[int, int], frozenset[str]]] = {}
+
+
 def _keys_cited_in_wiki(root: Path) -> set[str]:
-    """Cite keys the wiki's articles name, in :SOURCE_KEYS: or citations."""
-    keys: set[str] = set()
+    """Cite keys the wiki's articles name, in :SOURCE_KEYS: or citations.
+
+    The articles are the ones sync indexes (wiki_article_files), symlinked
+    directories included. An article is parsed again only when its size or
+    mtime changed since the last call. One that cannot be read or decoded
+    is skipped; one it cannot list is an error, since a missed article could
+    hand its key to a new source.
+    """
     wiki = root / CRUCIBLE_DIR / "wiki"
-    for path in wiki.rglob("*.org"):
+    if not wiki.is_dir():
+        return set()
+    keys: set[str] = set()
+    for path in wiki_article_files(wiki):
         try:
-            meta = parse_org_file(path)
+            st = path.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+            cached = _cited_keys_cache.get(path)
+            if cached is None or cached[0] != stamp:
+                meta = parse_org_file(path)
+                cached = (stamp, frozenset(
+                    meta.properties.get("SOURCE_KEYS", "").split()) | frozenset(meta.cite_keys))
+                _cited_keys_cache[path] = cached
         except (OSError, UnicodeDecodeError):
             continue
-        keys.update(meta.properties.get("SOURCE_KEYS", "").split())
-        keys.update(meta.cite_keys)
+        keys.update(cached[1])
     return keys
 
 
@@ -1418,7 +1464,7 @@ def _restore_mismatch(root: Path, src: dict, source_path: Path, source_type: str
               "rename the file before ingesting it.")
     row_doi = _norm_doi(_source_metadata(src).get("doi"))
     file_doi = _norm_doi(doi or (extract_doi_from_text(text)
-                                 if source_type in ("pdf", "web") else None))
+                                 if may_carry_own_doi(source_type, source_path) else None))
     if row_doi and file_doi:
         if row_doi == file_doi:
             return None
@@ -1592,12 +1638,8 @@ def ingest_source(
 
     # If no DOI was supplied, try to recover one from the document text so we
     # can fetch a complete, correctly-typed entry instead of a bare @misc.
-    # Only a paper (a PDF) or a web page carries its own DOI near the top; a
-    # notebook, data file, slide deck or Word document that mentions a DOI
-    # is citing someone else's paper, and must not become that paper.
     doi_given = bool(doi)
-    if (not doi and source_type in ("pdf", "web")
-            and source_path.suffix.lower() not in _NO_OWN_DOI_SUFFIXES):
+    if not doi and may_carry_own_doi(source_type, source_path):
         doi = extract_doi_from_text(text)
 
     # The bib entry. Preference order:

@@ -159,9 +159,9 @@ always match the database after a sync. An article that cannot be read
 (for example, one that is not valid UTF-8) is skipped and reported on
 stderr rather than aborting the sync. Symlinked directories under the
 wiki, and a wiki directory that is itself a symlink, are followed. A
-symlink that points to another file or directory inside the wiki is an
-alias: it is not indexed again, and links to it count as links to the
-article it points at.
+symlink to a directory or an article inside the wiki is an alias: it is
+not indexed again, and links through it count as links to the article
+it points at. A symlink to any other file in the wiki is indexed.
 
 Sources are tied to bibliography entries by the entry's standard =file=
 field, which =crucible ingest= writes with the stored file's path. An

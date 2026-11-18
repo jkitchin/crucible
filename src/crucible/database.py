@@ -197,7 +197,7 @@ def _fts_literal(token: str) -> str:
     return '"' + token.replace('"', '""') + '"'
 
 
-def _fts_query(raw: str) -> str:
+def _fts_query(raw: str, broad: bool = False) -> str:
     """Turn a raw user query into a safe FTS5 MATCH expression.
 
     Each whitespace-separated token is wrapped as a quoted string literal so
@@ -209,10 +209,11 @@ def _fts_query(raw: str) -> str:
     so oxidat* finds nothing) or differ from it ("catalys" stems to
     "catali", not a prefix of the indexed "catalysi"). Stemming only
     rewrites the end of a word, and leaves words of two letters alone, so
-    the query asks for the prefix's first two characters, which every
-    matching word's stem starts with (of the last word, in a token the
-    tokenizer splits, such as a-b*). That over-matches, so callers run it
-    through fts_rows, which keeps only rows that really contain a word
+    with `broad` the query also asks for the prefix's first two characters,
+    which every matching word's stem starts with (of the last word, in a
+    token the tokenizer splits, such as a-b*). That over-matches, often
+    most of the wiki, so fts_rows asks for it only when the plain prefix
+    finds too few rows, and keeps only rows that really contain a word
     starting with each prefix.
     A token with no letter or digit in it ("&", "-", "/", an en dash) is
     dropped: the tokenizer reads it as an empty phrase, which, ANDed with
@@ -243,7 +244,7 @@ def _fts_query(raw: str) -> str:
             # The full prefix is asked for too, so rows that match it rank
             # as they would without the short one.
             last = re.search(r"[^\W_]+$", stem)
-            if last and len(last.group(0)) > 2:
+            if broad and last and len(last.group(0)) > 2:
                 short = stem[:last.start() + 2]
                 terms.append(f"({_fts_literal(stem)}* OR {_fts_literal(short)}*)")
             else:
@@ -277,9 +278,11 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
     """Rows of articles matching a raw search query, best first, at most limit.
 
     Each row is an article with its FTS rank. A prefix token is matched
-    exactly: the FTS query for it is broader than the prefix (see
-    _fts_query), so rows are kept only when their title or content has a
-    word that starts with it.
+    exactly: the FTS query for it can be broader or narrower than the
+    prefix (see _fts_query), so rows are kept only when their title or
+    content has a word that starts with it. The broad query, which can
+    reach most of the wiki, is run only when the plain one finds fewer
+    than `limit` rows; the rows only it finds come after the others.
     """
     match = _fts_query(query)
     if not match:
@@ -292,20 +295,29 @@ def fts_rows(conn, query: str, limit: int) -> list[dict]:
         WHERE article_fts MATCH ?
         ORDER BY rank
     """
-    # Without prefixes the FTS match is exact, so SQL can stop at limit.
-    params: tuple = (match,)
     if not prefixes:
-        sql += " LIMIT ?"
-        params = (match, limit)
-    rows = []
-    for row in conn.execute(sql, params):
-        r = dict(row)
-        text = _fold(f"{r.pop('_fts_title') or ''}\n{r.pop('_fts_content') or ''}")
-        if all(p.search(text) for p in prefixes):
+        # The FTS match is exact, so SQL can stop at limit.
+        return [_strip_fts(dict(row)) for row in conn.execute(sql + " LIMIT ?", (match, limit))]
+    rows: list[dict] = []
+    seen: set = set()
+    for query_match in dict.fromkeys((match, _fts_query(query, broad=True))):
+        for row in conn.execute(sql, (query_match,)):
+            r = dict(row)
+            text = _fold(f"{r.pop('_fts_title') or ''}\n{r.pop('_fts_content') or ''}")
+            if r["id"] in seen or not all(p.search(text) for p in prefixes):
+                continue
+            seen.add(r["id"])
             rows.append(r)
             if len(rows) >= limit:
-                break
+                return rows
     return rows
+
+
+def _strip_fts(row: dict) -> dict:
+    """An fts_rows row without the FTS text columns it was selected with."""
+    row.pop("_fts_title", None)
+    row.pop("_fts_content", None)
+    return row
 
 
 class CrucibleDB:

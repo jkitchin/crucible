@@ -220,7 +220,7 @@ def test_ingest_an_unreadable_file_is_a_clean_error(kb, tmp_path):  # noqa: F811
     finally:
         secret.chmod(0o644)
     assert result.exit_code == 1
-    assert "Cannot read" in result.output
+    assert result.output.strip() == f"Error: Cannot ingest {secret}: Permission denied"
 
 
 def test_bibtex_file_in_windows_1252(kb, tmp_path):  # noqa: F811
@@ -240,3 +240,171 @@ def test_ingest_keeps_a_latin1_references_bib(kb, tmp_path):  # noqa: F811
     data = (kb / ".crucible/references.bib").read_bytes()
     assert "Müller".encode("latin-1") in data
     assert data.count(b"@") == 2
+
+
+# --- review of #42 ------------------------------------------------------------
+
+from crucible import database as database_module  # noqa: E402
+from crucible.ingest import (  # noqa: E402
+    FRONT_MATTER_CHARS, _keys_cited_in_wiki, _restore_mismatch, _title_on_first_page,
+    extract_doi_from_text)
+
+
+def test_cited_keys_are_found_through_a_symlinked_wiki_directory(kb, tmp_path):  # noqa: F811
+    elsewhere = tmp_path / "dropbox-summaries"
+    elsewhere.mkdir()
+    (elsewhere / "old.org").write_text(article("Old", "See cite:smith2020.", keys="smith2020"))
+    try:
+        (kb / ".crucible/wiki/linked").symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Symlinks unavailable: {exc}")
+    (tmp_path / "zeolite.md").write_text("# Zeolite paper\nbody\n")
+    result = run("ingest", str(tmp_path / "zeolite.md"), "-a", "Smith", "--date", "2020")
+    assert "smith2020a" in result.output
+
+
+def test_cited_keys_parse_each_article_once(kb, monkeypatch):  # noqa: F811
+    concepts = kb / ".crucible/wiki/concepts"
+    (concepts / "a.org").write_text(article("A", "cite:a2020"))
+    (concepts / "b.org").write_text(article("B", "cite:b2020"))
+    parsed = []
+    real = ingest_module.parse_org_file
+    monkeypatch.setattr(ingest_module, "parse_org_file",
+                        lambda path: parsed.append(path.name) or real(path))
+    assert {"a2020", "b2020"} <= _keys_cited_in_wiki(kb)
+    assert {"a2020", "b2020"} <= _keys_cited_in_wiki(kb)
+    assert sorted(parsed) == ["a.org", "b.org"]
+    (concepts / "b.org").write_text(article("B", "cite:c2021 and more"))
+    assert "c2021" in _keys_cited_in_wiki(kb)
+    assert sorted(parsed) == ["a.org", "b.org", "b.org"]
+
+
+def test_restore_check_ignores_a_doi_a_deck_cites(tmp_path):
+    src = {"path": ".crucible/sources/external/web/deck.pptx", "title": "Group meeting",
+           "metadata": '{"cite_key": "group2026", "doi": "10.1021/aaa111"}'}
+    problem = _restore_mismatch(tmp_path, src, tmp_path / "deck.pptx", "web",
+                                "Group meeting", None, "Slide 1: see doi:10.1021/bbb222")
+    assert problem is None
+
+
+@pytest.mark.parametrize("text", [
+    "ACS Catal.\nElectro-\ncatalytic Ammonia Synthesis\nA. Smith",
+    "ACS Catal.\nElectro-\n  catalytic ammonia synthesis",
+    "Electrocatalytic NH3 Synthesis on Ru",
+])
+def test_title_check_tolerates_hyphenation_and_one_missing_word(text):
+    assert _title_on_first_page("Electrocatalytic Ammonia Synthesis", text)
+
+
+def test_title_check_still_rejects_a_document_without_the_title():
+    assert not _title_on_first_page("Electrocatalytic Ammonia Synthesis",
+                                    "PhD thesis: Zeolite synthesis\nAs shown in doi:10.1/x")
+
+
+def test_front_matter_window_is_shared():
+    import inspect
+    for func in (extract_doi_from_text, _title_on_first_page):
+        assert inspect.signature(func).parameters["scan_chars"].default == FRONT_MATTER_CHARS
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
+                    reason="needs POSIX permissions and a non-root user")
+def test_ingest_write_failure_names_what_could_not_be_written(kb, tmp_path):  # noqa: F811
+    (tmp_path / "paper.md").write_text("# Paper\nbody\n")
+    store = kb / ".crucible/sources/external/web"
+    store.mkdir(parents=True, exist_ok=True)
+    store.chmod(0o555)
+    try:
+        result = run("ingest", str(tmp_path / "paper.md"), ok=False)
+    finally:
+        store.chmod(0o755)
+    assert result.exit_code == 1
+    assert "Cannot read" not in result.output
+    assert "Permission denied" in result.output and str(store) in result.output
+
+
+def test_file_link_to_a_file_sync_does_not_collect_is_indexed(kb):  # noqa: F811
+    wiki = kb / ".crucible/wiki"
+    (wiki / "drafts").mkdir()
+    (wiki / "drafts/dft.org.bak").write_text(article("DFT draft", "body"))
+    try:
+        (wiki / "concepts/dft.org").symlink_to("../drafts/dft.org.bak")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Symlinks unavailable: {exc}")
+    run("sync")
+    db = db_of(kb)
+    try:
+        assert [a["path"] for a in db.list_articles()] == [".crucible/wiki/concepts/dft.org"]
+    finally:
+        db.close()
+
+
+def test_link_through_a_directory_alias_reaches_the_article(kb):  # noqa: F811
+    wiki = kb / ".crucible/wiki"
+    topics = wiki / "concepts/dft-topics"
+    topics.mkdir()
+    (topics / "basis-sets.org").write_text(article("Basis sets", "body"))
+    try:
+        (wiki / "dft").symlink_to("concepts/dft-topics", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Symlinks unavailable: {exc}")
+    (wiki / "concepts/b.org").write_text(article("B", "See [[file:../dft/basis-sets.org][sets]]."))
+    run("sync")
+    result = run("backlinks", ".crucible/wiki/concepts/dft-topics/basis-sets.org")
+    assert "b.org" in result.output
+    lint = run("lint", ok=False)
+    assert "broken" not in lint.output.lower()
+
+
+class _CountingConn:
+    """A connection that records the MATCH expressions fts_rows sends."""
+
+    def __init__(self, conn):
+        self.conn, self.matches = conn, []
+
+    def execute(self, sql, params=()):
+        if "MATCH" in sql:
+            self.matches.append(params[0])
+        return self.conn.execute(sql, params)
+
+
+def test_broad_prefix_query_runs_only_when_needed(tmp_path):
+    db = CrucibleDB(tmp_path / "c.db")
+    db.initialize()
+    try:
+        for i in range(3):
+            db.add_article(f"c{i}.org", f"Cobalt {i}", "concept", content="cobalt oxide")
+        db.add_article("o.org", "Oxidation", "concept", content="oxidation")
+        db.conn.commit()
+        conn = _CountingConn(db.conn)
+        assert len(database_module.fts_rows(conn, "coba*", 2)) == 2
+        assert conn.matches == [database_module._fts_query("coba*")]
+        conn.matches.clear()
+        assert [r["title"] for r in database_module.fts_rows(conn, "oxidat*", 5)] == ["Oxidation"]
+        assert len(conn.matches) == 2
+    finally:
+        db.close()
+
+
+def test_merge_of_a_latin1_entry_with_a_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    target, peer = make_crucible(tmp_path / "t"), make_crucible(tmp_path / "peer")
+    monkeypatch.chdir(peer)
+    (tmp_path / "m.md").write_text("# M\nbody\n")
+    result = CliRunner().invoke(cli, ["ingest", str(tmp_path / "m.md"), "--bibtex",
+                                      "@article{muller2020, title={Müller paper}, "
+                                      "author={Müller, Hans}, year={2020}}"])
+    assert result.exit_code == 0, result.output
+    peer_bib = peer / ".crucible/references.bib"
+    peer_bib.write_bytes(peer_bib.read_text(encoding="utf-8").encode("latin-1"))
+    monkeypatch.chdir(target)
+    result = CliRunner().invoke(cli, ["merge", str(peer), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "Müller".encode("latin-1") in (target / ".crucible/references.bib").read_bytes()
+    db = db_of(target)
+    try:
+        [src] = db.list_sources()
+        assert src["title"].endswith("ller paper")
+    finally:
+        db.close()
+    assert CliRunner().invoke(cli, ["source", "muller2020"]).exit_code == 0
