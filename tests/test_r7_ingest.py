@@ -21,7 +21,7 @@ WEB = ".crucible/sources/external/web"
 @pytest.fixture
 def doi_lookup(monkeypatch):
     monkeypatch.setattr(ingest_module, "fetch_bibtex_from_doi",
-                        lambda doi, timeout=10.0: FETCHED if doi == DOI else None)
+                        lambda doi, timeout=10.0: FETCHED if doi.casefold() == DOI.casefold() else None)
 
 
 def bib(root):
