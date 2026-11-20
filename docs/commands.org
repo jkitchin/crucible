@@ -139,6 +139,66 @@ shares the name is refused with an error, so it is not filed under
 another paper's key. If it really is that source (a retitled copy, say),
 pass =--restore=; otherwise rename the file before ingesting it.
 
+Every ingested source is sealed: its entry's =sha256= field records the
+hash of the stored file, and =crucible lint= reports a source whose file
+has changed since (=modified_source=). Sources are the record the wiki is
+distilled from, so they are never edited; a correction is a new source
+that amends the old one.
+
+** =crucible record=
+
+Write a sealed record: something worth remembering and finding later.
+
+#+BEGIN_SRC bash
+crucible record [SOURCE] [OPTIONS]
+#+END_SRC
+
+| Option | Description |
+|-------------------+-----------------------------------------------------------|
+| =SOURCE= | An org file, or =-= for stdin (the default) |
+| =-t, --title= | Title (default: the content's =#+TITLE=) |
+| =-a, --author= | Who is recording: an agent's exact model ID, or a person's name (repeatable; default: the content's =#+AUTHOR=) |
+| =--amends KEY= | Cite key of an earlier source this record corrects or updates (repeatable) |
+| =-j, --json= | JSON output: =cite_key=, =title=, =path=, =amends=, =duplicate= |
+
+The content is free-form org: a hypothesis, a method, a result, an
+interpretation, a decision or a negative result. A title and an author are
+required. Crucible adds =#+TITLE=, =#+AUTHOR= and =#+DATE= (the creation
+time, to the second) when the content lacks them, =#+AMENDS:= with
+=--amends=, and =#+RECORDED_WITH:= (the agent harness and session, from the
+=AI_AGENT= and =CLAUDE_CODE_SESSION_ID= environment variables) when those
+are set. An agent has no identity across sessions, so its author is its
+model ID and the session is what locates the record's context. The record
+is stored as =sources/notebooks/YYYY-MM-DD-<slug>.org= under a key made
+from the date and the first title words (=20261120-rate-onset-below=, then
+=...a=, =...b=), gets a =references.bib= entry (with an =amends= field naming
+the keys it amends) and is sealed like any ingested source. It shows up in
+=crucible undigested= and is distilled into the wiki with the literature;
+cite it with =citep:KEY=.
+
+A record is never edited. To correct or extend one, write a new record with
+=--amends KEY=.
+
+#+BEGIN_SRC bash
+echo "Rate doubled at 350 K, not 400 K." | crucible record -t "Rate onset below 400 K" -a claude-opus-5-5
+crucible record finding.org --amends ratestudy2026
+#+END_SRC
+
+** =crucible seal=
+
+Seal sources ingested before sealing existed.
+
+#+BEGIN_SRC bash
+crucible seal [KEYS...] [-j]
+#+END_SRC
+
+Writes the =sha256= of each source's stored file into its =references.bib=
+entry. With no keys, seals every entry whose file is present and that has
+no =sha256= yet. An entry that is already sealed is never resealed, so a
+changed file stays reported; to accept a change deliberately, remove the
+entry's =sha256= field by hand and seal it again. A key not in
+=references.bib= is an error (exit 1).
+
 * Database Commands
 
 ** =crucible sync=
@@ -428,6 +488,7 @@ Each issue has a type and a severity (error, warning or info):
 | =broken_link= | warning | A =[[file:...]]= link points to a missing file |
 | =orphan= | info | No other article links to this one |
 | =undigested= | warning | A source has no articles distilled from it |
+| =modified_source= | error | A sealed source's file no longer matches the =sha256= in its =references.bib= entry |
 | =missing_source_file= | warning | A notebook or data source's file is gone (external sources are gitignored, so they are not checked) |
 | =missing_concept_article= | info | A concept has no dedicated concept article: no concept article whose file name or title names it (=concepts/activation-energy.org= or "Activation Energy" covers the tag =activation_energy=) |
 | =duplicate_cite_key= | warning | Two or more sources share a cite key |

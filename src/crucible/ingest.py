@@ -1726,8 +1726,12 @@ def ingest_source(
     doi: str | None = None,
     bibtex: str | None = None,
     restore: bool = False,
+    key_base: str | None = None,
 ) -> dict:
     """Ingest a source file into Crucible.
+
+    key_base, when given, replaces the author-year base of the cite key
+    (it is still made unique with a, b, ... suffixes).
 
     A file stored under the name of an existing source whose file is
     missing is restored into that source when its DOI, title or text
@@ -1876,7 +1880,7 @@ def ingest_source(
             )
     else:
         key_date = date
-    base_key = generate_cite_key(title, key_authors, key_date)
+    base_key = key_base or generate_cite_key(title, key_authors, key_date)
 
     if bib_entry is None:
         bib_entry = generate_bib_entry(
@@ -1965,6 +1969,9 @@ def ingest_source(
 
         rel_path = str(dest_path.relative_to(root))
         bib_entry = set_bib_field(bib_entry, "file", rel_path)
+        # Seals the source: the bib travels with the project, so lint can
+        # tell on any clone that the stored file is not the one ingested.
+        bib_entry = set_bib_field(bib_entry, "sha256", content_hash)
 
         if not in_place:
             with open(source_path, "rb") as src, open(dest_path, "wb") as dst:
