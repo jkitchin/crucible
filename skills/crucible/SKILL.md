@@ -45,6 +45,9 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Ingest a source | `crucible ingest paper.pdf` |
 | Ingest with full BibTeX | `crucible ingest paper.pdf --doi 10.xxxx/yyyy` |
 | Ingest from stdin | `cat doc.md \| crucible ingest - -t "Title" --type web` |
+| Write a sealed record | `crucible record -t "Title" -a MODEL-ID < note.org` |
+| Correct an earlier record | `crucible record -t "Title" -a MODEL-ID --amends KEY < fix.org` |
+| Seal older sources | `crucible seal [KEYS...]` |
 | Sync wiki to database | `crucible sync` |
 | Search articles | `crucible search "query"` |
 | List concepts | `crucible concepts` |
@@ -234,6 +237,61 @@ synthesizes existing wiki content. This is how the crucible tracks the
 evolution of knowledge over time. If the article is distilled purely from
 an external source (not from other wiki articles), use `SOURCE_KEYS` only.
 
+### Recording What You Learn
+
+A record is the lab-notebook entry of the crucible: something a careful
+researcher would write down so it can be remembered and found later. Write
+one with `crucible record` when work produces something worth keeping: a
+hypothesis and why you hold it, a method or setup that worked (or did not),
+a result, an interpretation, a decision and its reasons, and above all a
+negative or surprising result, which is the kind most often lost. Do not
+record routine actions or transcripts; record what you would want to read
+in six months.
+
+The content is free-form org; use whatever structure fits. Give it a
+title, and be specific enough to reproduce or check: conditions, numbers,
+paths to data files, and the cite keys of the papers it relates to.
+
+**Identifying yourself.** You are the author of the records you write. You
+have no identity that persists across sessions, so do not invent a name or
+role ("agent-7", "the analysis agent"): later readers would take it for a
+continuity that does not exist. Pass your exact model ID as `--author`, the
+one your system prompt gives (for example `claude-opus-5-5`), not a marketing
+name and not a guess. Crucible adds the harness and session itself
+(`#+RECORDED_WITH:`, read from the `AI_AGENT` and `CLAUDE_CODE_SESSION_ID`
+environment variables), which is what lets a reader find the session a
+record came from. If your harness sets neither, say in the record what you
+were doing and for whom, so its context is not lost. A person recording
+their own work uses their name.
+
+```bash
+crucible record -t "PBE overbinds CO on Pt(111)" -a claude-opus-5-5 <<'END'
+* Result
+PBE gives -1.85 eV against -1.37 eV measured citep:smith2024 ...
+* Interpretation
+...
+END
+```
+
+Records are sealed. `crucible record` stores the file in
+`.crucible/sources/notebooks/` under a key made from the date and title
+(`20261120-pbe-overbinds-co`; it prints the key), writes its sha256 into
+`references.bib`, and
+`crucible lint` reports any later change as a `modified_source` error.
+**Never edit a record (or any file under `.crucible/sources/`)**, even to fix
+a typo. To correct, update or retract one, write a new record with
+`--amends KEY`; the old one stays as it was, and the history stays visible.
+
+A record is a source like any other: it appears in `crucible undigested`, and
+you distill it into the wiki together with the literature. That is where the
+two meet: a concept or comparison article cites the papers and the records
+side by side, says where our results agree with or contradict the
+literature, and carries the current state of a question (which hypotheses
+are open, supported or refuted). That state changes over time, so it lives
+in the wiki, which you keep up to date; a record only says what was known
+when it was written. When distilling a record that amends another, follow
+the chain and present the latest understanding, noting what changed.
+
 ## Org-Mode Article Format
 
 Every wiki article must follow this structure:
@@ -360,6 +418,10 @@ articles for trivial or self-evident terms.
 | notebook | .crucible/sources/notebooks/ | No | .org |
 | data | .crucible/sources/data/ | No | .csv, .json, .xlsx, .hdf5 |
 
+Every ingested source is sealed (its `references.bib` entry has a `sha256`
+field). Sources are never edited; `crucible seal` seals sources ingested
+before sealing existed.
+
 ## Answering Questions Against the Wiki
 
 When the user asks a question about the knowledge base:
@@ -390,7 +452,9 @@ crucible suggest       # find opportunities (new articles, missing links, compar
 ### Lint
 
 `crucible lint` reports issues at three severity levels:
-- **error**: article registered but file missing
+- **error**: article registered but file missing, and sealed sources whose
+  file has changed since ingest (`modified_source`; restore the file, for
+  example from git, and record the change as a new source that amends it)
 - **warning**: broken links, undigested sources, missing properties, untracked
   wiki files, unreadable or reversed `:CREATED:`/`:MODIFIED:` dates
   (`invalid_date`), `SOURCE_KEYS` values that match no source or several,

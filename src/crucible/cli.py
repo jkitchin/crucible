@@ -795,6 +795,227 @@ def _print_ingest_result(result: dict):
     click.echo("Ready for distillation. Use citep:{} in articles.".format(result['cite_key']))
 
 
+_ORG_KEYWORD_RE = r"^[ \t]*#\+{}:[ \t]*(.*?)[ \t]*$"
+_KEY_STOPWORDS = {"the", "a", "an", "of", "on", "in", "for", "and", "to", "with", "at", "by"}
+
+
+def _recorded_with() -> str | None:
+    """The agent harness and session this process runs in, from the environment.
+
+    An agent has no identity across sessions; the harness and session are
+    what locate a record's context later (a transcript, say). Only the
+    agent knows its model, so that goes in --author.
+    """
+    parts = []
+    if os.environ.get("AI_AGENT"):
+        parts.append(os.environ["AI_AGENT"].strip())
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        parts.append(f"session {os.environ['CLAUDE_CODE_SESSION_ID'].strip()}")
+    return ", ".join(parts) or None
+
+
+def _org_keyword(text: str, name: str) -> str | None:
+    """The value of the first #+NAME: line in org text, or None if absent or empty."""
+    m = re.search(_ORG_KEYWORD_RE.format(name), text, re.IGNORECASE | re.MULTILINE)
+    return (m.group(1) or None) if m else None
+
+
+@cli.command()
+@click.argument("source", default="-")
+@click.option("--title", "-t", default=None,
+              help="Record title (default: the content's #+TITLE)")
+@click.option("--author", "-a", multiple=True,
+              help="Who is recording: an agent's exact model ID, or a "
+                   "person's name (repeatable; default: the content's #+AUTHOR)")
+@click.option("--amends", multiple=True, metavar="KEY",
+              help="Cite key of an earlier source this record corrects or "
+                   "updates (repeatable)")
+@json_option
+def record(source, title, author, amends, json_output):
+    """Write a sealed record: something worth keeping, in your own words.
+
+    SOURCE is an org file, or - (the default) for stdin. The content is
+    free-form org: a hypothesis, a method, a result, an interpretation, a
+    decision, a negative result, whatever is worth remembering and finding
+    later. Crucible adds #+TITLE, #+AUTHOR and #+DATE (the creation time)
+    when the content lacks them, and #+RECORDED_WITH (the agent harness
+    and session, from the AI_AGENT and CLAUDE_CODE_SESSION_ID environment
+    variables) when they are set. It stores the record in
+    sources/notebooks/ under a key made from the date and title, and
+    seals it: its sha256 goes in references.bib and `crucible lint`
+    reports any later change.
+
+    A record is never edited. To correct or extend one, write a new record
+    with --amends KEY. Records are sources like any other: distil them
+    into the wiki alongside the literature and cite them with citep:KEY.
+
+    Examples:
+
+      echo "Rate doubled at 350 K, not 400 K as expected." | \\
+        crucible record -t "Rate onset below expected temperature" -a claude-opus-5-5
+
+      crucible record notes.org --amends smith2026rate
+    """
+    import sys
+    from datetime import datetime
+
+    from crucible.ingest import parse_bib_file, set_bib_fields, slugify
+
+    if source == "-":
+        content = sys.stdin.read()
+    else:
+        path = Path(source)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise click.ClickException(f"File not found: {source}")
+        except (OSError, UnicodeDecodeError) as e:
+            raise click.ClickException(f"Cannot read {source}: {e}")
+    if not content.strip():
+        raise click.ClickException("The record is empty.")
+
+    title = title or _org_keyword(content, "TITLE")
+    if not title:
+        raise click.ClickException("A record needs a title: pass --title or "
+                                   "start the content with #+TITLE:")
+    authors = list(author)
+    if not authors and _org_keyword(content, "AUTHOR"):
+        authors = [_org_keyword(content, "AUTHOR")]
+    if not authors:
+        raise click.ClickException("A record needs an author (a person or an "
+                                   "agent): pass --author or add #+AUTHOR:")
+
+    root = get_root()
+    if amends:
+        known = {e["cite_key"] for e in parse_bib_file(cdir(root) / "references.bib")}
+        unknown = [k for k in amends if k not in known]
+        if unknown:
+            raise click.ClickException(
+                f"--amends names no source in references.bib: {', '.join(unknown)}")
+
+    now = datetime.now().astimezone()
+    header = []
+    if not _org_keyword(content, "TITLE"):
+        header.append(f"#+TITLE: {title}")
+    if not _org_keyword(content, "AUTHOR"):
+        header.append(f"#+AUTHOR: {', '.join(authors)}")
+    if not _org_keyword(content, "DATE"):
+        header.append(f"#+DATE: {now.isoformat(timespec='seconds')}")
+    if amends:
+        header.append(f"#+AMENDS: {' '.join(amends)}")
+    recorded_with = _recorded_with()
+    if recorded_with and not _org_keyword(content, "RECORDED_WITH"):
+        header.append(f"#+RECORDED_WITH: {recorded_with}")
+    if header:
+        content = "\n".join(header) + "\n\n" + content.lstrip("\n")
+    if not content.endswith("\n"):
+        content += "\n"
+
+    day = now.strftime("%Y-%m-%d")
+    filename = f"{day}-{slugify(title) or now.strftime('%H%M%S')}.org"
+    # Records are many per author and day, so the key names the record,
+    # not the author: 20261120-rate-onset-below.
+    words = [w for w in slugify(title).split("-")
+             if w and w not in _KEY_STOPWORDS][:3]
+    key_base = "-".join([now.strftime("%Y%m%d"), *words])
+    db = get_db(root)
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        tmp = tmp_dir / filename
+        tmp.write_text(content, encoding="utf-8")
+        try:
+            result = ingest_source(
+                root=root, db=db, source_path=tmp, title=title,
+                source_type="notebook", shareable=True, date=day,
+                authors=authors, key_base=key_base,
+            )
+        except ValueError as e:
+            raise click.ClickException(str(e))
+        except OSError as e:
+            raise click.ClickException(f"Cannot store the record: {_os_error_text(e)}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        db.close()
+
+    if amends and not result.get("duplicate"):
+        set_bib_fields(root, "amends", {result["cite_key"]: ", ".join(amends)})
+
+    if json_output:
+        _emit_json({
+            "cite_key": result["cite_key"],
+            "title": result["title"],
+            "path": result["relative_path"],
+            "amends": list(amends),
+            "duplicate": result.get("duplicate", False),
+        })
+    elif result.get("duplicate"):
+        click.echo(f"Already recorded (identical content): {result['cite_key']} "
+                   f"({result['relative_path']})")
+    else:
+        click.echo(f"Recorded: {result['title']}")
+        click.echo(f"  Cite key: {result['cite_key']}")
+        click.echo(f"  Stored: {result['relative_path']} (sealed)")
+        if amends:
+            click.echo(f"  Amends: {', '.join(amends)}")
+
+
+@cli.command()
+@click.argument("keys", nargs=-1)
+@json_option
+def seal(keys, json_output):
+    """Seal sources ingested before sealing existed.
+
+    Records the sha256 of each source's stored file in its references.bib
+    entry, so `crucible lint` reports any later change. With no KEYS,
+    seals every entry whose file is present and that is not sealed yet.
+    A sealed entry is never resealed: to accept a changed file, remove
+    its sha256 field by hand first.
+    """
+    from crucible import bibtex as bibtex_mod
+    from crucible.ingest import _resolve_bib_file, _rewrite_bib, file_sha256, set_bib_field
+
+    root = get_root()
+    wanted = set(keys)
+    sealed: list[str] = []
+    skipped: list[dict] = []
+    seen: set[str] = set()
+
+    def repl(entry: bibtex_mod.Entry) -> str:
+        if wanted and entry.key not in wanted:
+            return entry.text
+        seen.add(entry.key)
+        file_value = (entry.get("file") or "").strip()
+        reason = None
+        if entry.get("sha256"):
+            reason = "already sealed"
+        elif not file_value:
+            reason = "no file field"
+        else:
+            stored = _resolve_bib_file(root, file_value)
+            if not stored.is_file():
+                reason = f"file not found: {file_value}"
+        if reason:
+            if wanted:
+                skipped.append({"key": entry.key, "reason": reason})
+            return entry.text
+        sealed.append(entry.key)
+        return set_bib_field(entry.text, "sha256", file_sha256(stored))
+
+    _rewrite_bib(root, repl)
+    for key in sorted(wanted - seen):
+        skipped.append({"key": key, "reason": "not in references.bib"})
+
+    if json_output:
+        _emit_json({"sealed": sealed, "skipped": skipped})
+        return
+    click.echo(f"Sealed {len(sealed)} source{'s' if len(sealed) != 1 else ''}"
+               + (f": {', '.join(sealed)}" if sealed and len(sealed) <= 20 else ""))
+    for s in skipped:
+        click.echo(f"  Skipped {s['key']}: {s['reason']}")
+    if any(s["reason"] == "not in references.bib" for s in skipped):
+        raise SystemExit(1)
+
+
 def _safe_relative_to(target: Path, root: Path) -> str | None:
     """Return ``target`` relative to ``root``, or None if it lies outside root.
 
@@ -4258,6 +4479,29 @@ def lint(strict, json_output):
                 "message": f"references.bib line {line}: entry is never closed and is ignored",
                 "line": line,
             })
+    from crucible.ingest import _resolve_bib_file, file_sha256
+    # Sealed sources: an entry's sha256 is the file as ingested (or sealed).
+    # Sources are the record the wiki is distilled from and are never
+    # edited; a change goes in a new source that amends the old one.
+    for e in bib_entries:
+        sealed, file_value = e.get("sha256"), e.get("file")
+        if not sealed or not file_value:
+            continue
+        stored = _resolve_bib_file(root, file_value)
+        if not stored.is_file():
+            continue  # a gitignored external copy, or missing_source_file
+        if file_sha256(stored) != sealed.strip().lower():
+            issues.append({
+                "type": "modified_source",
+                "severity": "error",
+                "message": (
+                    f"Sealed source '{e.key}' has changed since it was sealed: "
+                    f"{file_value.strip()} (restore it, e.g. from git, and put "
+                    "the change in a new source that amends it)"
+                ),
+                "path": file_value.strip(),
+                "key": e.key,
+            })
     bib_without_file = {e.key for e in bib_entries if not e.get("file")}
     # Ingested rows whose full date sync withheld from the bib (it may be
     # the day of ingest rather than a publication date): a rebuild keeps
@@ -4718,6 +4962,7 @@ TYPICAL WORKFLOW
 1. Ingest a source:
      crucible ingest paper.pdf
      crucible ingest notes.org --type notebook
+     crucible record -t "Title" -a me < finding.org   # a sealed record
      curl URL | pandoc -t org | crucible ingest - -t "Title" --type web
 
 2. Distill the source (done by the LLM):
@@ -4791,6 +5036,22 @@ cite key is made unique against existing sources and bib entries
 stored copy. The sources-table row is described by that entry, so a fresh
 clone rebuilds the same row. Ingest prints the cite key: put it in the
 SOURCE_KEYS of the articles you distill from the source.
+
+Sources are sealed: the entry's `sha256` field is the hash of the stored
+file, and `crucible lint` reports a source whose file has changed
+(modified_source, an error). Never edit a source; put a correction in a
+new one. `crucible seal` seals entries ingested before sealing existed.
+
+RECORDS
+
+  crucible record [FILE|-] -t TITLE -a AUTHOR [--amends KEY]
+
+A record is something worth keeping and finding later, written in free-form
+org: a hypothesis, a method, a result, an interpretation, a decision, a
+negative result. It is stored as a sealed notebook source (with #+TITLE,
+#+AUTHOR and #+DATE added when missing) and distilled into the wiki like any
+other source, alongside the literature. To correct or extend a record,
+write a new one with --amends KEY; never edit the old one.
 """,
         "distill": """
 DISTILLATION GUIDE (for LLM agents)
@@ -4921,6 +5182,7 @@ Lint (health checks):
                                  by several references.bib entries
                                - references.bib entries never closed
                                - Committed sources whose file is gone
+                               - Sealed sources whose file has changed
                                - Citations missing from references.bib
                                - Source dates not copied to
                                  references.bib (maybe the ingest day)
