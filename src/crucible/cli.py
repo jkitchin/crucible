@@ -2012,6 +2012,143 @@ def _pull_one(name: str, root: Path) -> None:
         _warn(f"Warning: pulled, but the registry was not updated: {exc}")
 
 
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _served_crucibles(names, warn):
+    """[Served] for `names` (registry names or crucible paths), or the
+    current crucible when there are none."""
+    from crucible.mcp_server import Served
+
+    instances = {i["name"]: i for i in registry_module.list_instances()}
+
+    def served_at(root: Path, name: str | None = None) -> Served:
+        root = root.resolve()
+        if not (cdir(root) / "crucible.db").exists():
+            _auto_rebuild_db(root)
+        name = name or registry_module.lookup_path(str(root)) or root.name
+        inst = instances.get(name) or {}
+        origin = inst.get("origin") or registry_module.git_origin(root)
+        return Served(name=name, root=root, origin=origin,
+                      description=inst.get("description", ""))
+
+    if not names:
+        return [served_at(get_root())]
+    out = []
+    for n in names:
+        if n in instances:
+            root = Path(instances[n]["path"])
+            if not _is_project_dir(cdir(root)):
+                raise click.ClickException(
+                    f"'{n}' is registered at {root}, but there is no crucible there.")
+            out.append(served_at(root, n))
+        elif _is_project_dir(cdir(Path(n).expanduser())):
+            out.append(served_at(Path(n).expanduser()))
+        else:
+            raise click.ClickException(
+                f"'{n}' is neither a registered crucible nor a crucible directory "
+                "(see `crucible registry list`).")
+    return out
+
+
+@cli.command("mcp")
+@click.argument("names", nargs=-1)
+@click.option("--http", "use_http", is_flag=True,
+              help="Serve over streamable HTTP instead of stdio")
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Address to listen on with --http")
+@click.option("--port", default=8765, show_default=True, help="Port for --http")
+@click.option("--token-env", metavar="VAR",
+              help="With --http, require `Authorization: Bearer $VAR`")
+@click.option("--no-token", "no_token", is_flag=True,
+              help="Allow --http on a non-loopback address without a token")
+@click.option("--include-notebooks", is_flag=True,
+              help="Also serve sources/notebooks/ (your ELN entries)")
+@click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
+              help="Ollama URL for semantic search (default: $CRUCIBLE_OLLAMA_URL "
+                   "or http://localhost:11434)")
+@click.option("--check", is_flag=True,
+              help="Print what would be served and exit")
+def mcp_command(names, use_http, host, port, token_env, no_token,
+                include_notebooks, url, check):
+    """Serve crucibles to other agents over MCP (read-only).
+
+    With no NAMES, serves the current crucible. NAMES are registered
+    crucible names or crucible directories; only those are served, never
+    the rest of the registry. The wiki and references.bib are served;
+    sources/external/ never is, and notebooks only with --include-notebooks.
+
+    \b
+    Tools: list_crucibles, overview, search, read_article, list_articles,
+           list_concepts, concept, links, sources
+    Resources: crucible://NAME/manifest, crucible://NAME/TYPE/SLUG
+
+    \b
+    Use from Claude Code on this machine:
+      claude mcp add discopt -- crucible mcp discopt
+    Share over the network (needs `pip install 'crucible-llm[mcp]'`):
+      export CRUCIBLE_MCP_TOKEN=$(openssl rand -hex 24)
+      crucible mcp discopt --http --host 0.0.0.0 --token-env CRUCIBLE_MCP_TOKEN
+      claude mcp add --transport http discopt http://HOST:8765/mcp \\
+        --header "Authorization: Bearer $CRUCIBLE_MCP_TOKEN"
+    """
+    import contextlib
+
+    from crucible.mcp_server import CrucibleService, ServeError
+
+    # Over stdio, stdout is the protocol: anything printed while the
+    # crucibles are resolved (a database rebuild, say) goes to stderr.
+    with contextlib.redirect_stdout(click.get_text_stream("stderr")):
+        served = _served_crucibles(names, _warn)
+    try:
+        service = CrucibleService(served, include_notebooks=include_notebooks,
+                                  ollama_url=url)
+    except ServeError as e:
+        raise click.ClickException(str(e))
+
+    token = None
+    if token_env:
+        token = os.environ.get(token_env)
+        if not token:
+            raise click.ClickException(f"--token-env {token_env}: it is not set or empty.")
+        if not use_http:
+            raise click.ClickException("--token-env applies only with --http.")
+    if use_http and host not in _LOOPBACK_HOSTS and not token and not no_token:
+        raise click.ClickException(
+            f"Serving on {host} without a token lets anyone who can reach it "
+            "read these crucibles. Pass --token-env VAR, or --no-token if the "
+            "network is trusted.")
+
+    if check:
+        click.echo("Would serve (read-only):")
+        for s in served:
+            click.echo(f"  {s.name}: {s.root}" + (f"  origin: {s.origin}" if s.origin else ""))
+        parts = "wiki, references.bib" + (", sources/notebooks" if include_notebooks else "")
+        click.echo(f"Content: {parts}; never sources/external/")
+        if use_http:
+            click.echo(f"Transport: http://{host}:{port}/mcp"
+                       + (" (bearer token required)" if token else " (no token)"))
+        else:
+            click.echo("Transport: stdio")
+        return
+
+    try:
+        from crucible.mcp_server import build_server, run_http
+        server = build_server(service, host=host, port=port)
+    except ImportError:
+        raise click.ClickException(
+            "The MCP server needs the mcp package: pip install 'crucible-llm[mcp]'")
+
+    names_text = ", ".join(s.name for s in served)
+    if use_http:
+        click.echo(f"Serving {names_text} at http://{host}:{port}/mcp"
+                   + (" (bearer token required)" if token else ""), err=True)
+        run_http(server, host, port, token)
+    else:
+        click.echo(f"crucible mcp: serving {names_text} over stdio", err=True)
+        server.run("stdio")
+
+
 @cli.command()
 @click.argument("names", nargs=-1)
 @click.option("--all", "pull_all", is_flag=True,
@@ -5635,6 +5772,12 @@ Crucibles from elsewhere:
   crucible pull NAME                Fast-forward a clone from upstream and sync it
   crucible pull --all               Pull every crucible made by `crucible clone`
   Example: crucible clone https://github.com/jkitchin/discopt.git
+
+Sharing without cloning:
+  crucible mcp [NAME...]            Serve crucibles read-only over MCP (stdio)
+  crucible mcp NAME --http --host 0.0.0.0 --token-env VAR
+                                    Serve to other machines (bearer token)
+  claude mcp add NAME -- crucible mcp NAME   Use one from Claude Code
 
 Cross-crucible search:
   crucible search "query" --all     Search across all registered crucibles

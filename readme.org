@@ -184,6 +184,7 @@ crucible delete wiki/concepts/old.org   # remove an article or source
 crucible merge other-crucible    # fold another crucible into this one
 crucible clone URL [DEST]        # clone a crucible from git and register it
 crucible pull NAME               # update a clone from upstream
+crucible mcp [NAME...]           # serve crucibles to other agents over MCP
 #+END_SRC
 
 * Documentation
@@ -395,6 +396,16 @@ crucible pull --all                                   # every crucible made by c
 [[https://github.com/jkitchin/discopt][discopt]] commits its crucible at the
 top level of its repository, so it works as an example of a shared one;
 the clone includes discopt's code as well as its wiki.
+
+A crucible can also be shared without being cloned: =crucible mcp=
+serves it, read-only, to any MCP client (=pip install 'crucible-llm[mcp]'=):
+
+#+BEGIN_SRC bash
+claude mcp add discopt -- crucible mcp discopt        # in Claude Code, on this machine
+crucible mcp discopt --http --host 0.0.0.0 --token-env CRUCIBLE_MCP_TOKEN   # for others
+#+END_SRC
+
+Only the crucibles named are served, and never =sources/external/=.
 
 =crucible registry list= shows each crucible's origin (its git remote, or
 one set with =registry add --origin=). A registered crucible that

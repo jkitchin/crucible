@@ -25,6 +25,10 @@ dependencies = [
     "libsql>=0.1.0",
 ]
 
+[project.optional-dependencies]
+# `crucible mcp`: serve crucibles to other agents over MCP.
+mcp = ["mcp>=1.2"]
+
 [project.urls]
 Homepage = "https://github.com/jkitchin/crucible"
 Repository = "https://github.com/jkitchin/crucible"

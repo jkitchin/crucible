@@ -33,6 +33,6 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . pytest
+          python -m pip install -e ".[mcp]" pytest
       - name: Run tests
         run: python -m pytest -q

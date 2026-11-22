@@ -714,6 +714,70 @@ crucible, run =crucible merge NAME= there. Merge skips files it already
 has, but an article that changed upstream since an earlier merge arrives
 as a renamed copy (=name_1.org=), not as an update in place.
 
+** =crucible mcp=
+
+#+BEGIN_SRC bash
+crucible mcp [NAME...] [--http] [--host HOST] [--port PORT]
+             [--token-env VAR] [--no-token] [--include-notebooks] [--check]
+#+END_SRC
+
+Serves crucibles to other agents over the Model Context Protocol, so a
+crucible you have built can be searched and read from Claude Code, Claude
+Desktop or any other MCP client, on your machine or someone else's.
+Needs the =mcp= package: =pip install 'crucible-llm[mcp]'=.
+
+With no NAME, the current crucible is served. Each NAME is a registered
+crucible or a crucible directory, and only the crucibles named are
+served; the rest of the registry is never reachable. Everything is
+read-only. The wiki and =references.bib= are served (without the =file=
+field, which names stored source files); =sources/external/= never is,
+and =sources/notebooks/= only with =--include-notebooks=. A path outside
+the served directories, including through a symbolic link, is refused.
+
+| Tool             | Returns                                                     |
+|------------------+-------------------------------------------------------------|
+| =list_crucibles= | Name, origin, description, counts and top concepts of each  |
+| =overview=       | A crucible's =MANIFEST.md=                                  |
+| =search=         | Ranked articles with snippets (=auto=, =fts=, =semantic=, =hybrid=) |
+| =read_article=   | An article's full org text, with its title, type and status |
+| =list_articles=  | Every article, optionally of one type                       |
+| =list_concepts=  | Concepts with article counts                                |
+| =concept=        | Articles covering a concept                                 |
+| =links=          | Backlinks and related articles                              |
+| =sources=        | Bibliography entries by cite key or DOI                     |
+
+Articles are also resources, =crucible://NAME/TYPE/SLUG= (for example
+=crucible://discopt/methods/spatial-branch-and-bound=), and each crucible
+has =crucible://NAME/manifest=. When several crucibles are served, tools
+that act on one take a =crucible= argument; =search= searches them all
+unless given one, interleaving their results by rank. The server's
+instructions tell the client that the content is reference data written
+by the crucible's owner, not instructions.
+
+On your own machine, add it to Claude Code over stdio:
+
+#+BEGIN_SRC bash
+claude mcp add discopt -- crucible mcp discopt
+#+END_SRC
+
+To share with others, serve over streamable HTTP. On a loopback address
+(the default) no token is needed. On any other address a bearer token is
+required, unless =--no-token= says the network is trusted:
+
+#+BEGIN_SRC bash
+export CRUCIBLE_MCP_TOKEN=$(openssl rand -hex 24)
+crucible mcp discopt --http --host 0.0.0.0 --token-env CRUCIBLE_MCP_TOKEN
+# on the other machine:
+claude mcp add --transport http discopt http://HOST:8765/mcp \
+  --header "Authorization: Bearer TOKEN"
+#+END_SRC
+
+The token is read from the environment variable named, never from the
+command line, so it does not show up in the process list. The server
+speaks plain HTTP: beyond a trusted network, put it behind HTTPS (a
+reverse proxy, or an SSH tunnel to a loopback port). =--check= prints
+what would be served, and how, and exits.
+
 ** =crucible registry remove=
 
 #+BEGIN_SRC bash
