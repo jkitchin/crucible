@@ -351,15 +351,24 @@ def _dump(value) -> str:
 
 def build_server(service: CrucibleService, host: str = "127.0.0.1",
                  port: int = 8765):
-    """A FastMCP server exposing `service` as tools and resources."""
-    from mcp.server.fastmcp import FastMCP
+    """An MCP server exposing `service` as tools and resources.
 
+    Works with mcp 1.x (FastMCP) and 2.x (MCPServer, which takes the host
+    when its HTTP app is made rather than in the constructor).
+    """
     names = ", ".join(sorted(service.served))
-    mcp = FastMCP(
-        name=f"crucible ({names})",
-        instructions=INSTRUCTIONS + f"\n\nCrucibles served: {names}.",
-        host=host, port=port, log_level="WARNING",
-    )
+    settings = dict(name=f"crucible ({names})",
+                    instructions=INSTRUCTIONS + f"\n\nCrucibles served: {names}.",
+                    log_level="WARNING")
+    try:
+        from mcp.server.mcpserver import MCPServer
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP(host=host, port=port, **settings)
+        mcp._crucible_http_kwargs = {}
+    else:
+        mcp = MCPServer(**settings)
+        mcp._crucible_http_kwargs = {"host": host}
 
     def run(fn, *args, **kwargs):
         try:
@@ -463,7 +472,7 @@ class _BearerAuth:
 def run_http(server, host: str, port: int, token: str | None):
     import uvicorn
 
-    app = server.streamable_http_app()
+    app = server.streamable_http_app(**getattr(server, "_crucible_http_kwargs", {}))
     if token:
         app = _BearerAuth(app, token)
     uvicorn.run(app, host=host, port=port, log_level="warning")

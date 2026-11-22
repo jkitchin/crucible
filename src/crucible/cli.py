@@ -2093,12 +2093,13 @@ def mcp_command(names, use_http, host, port, token_env, no_token,
         --header "Authorization: Bearer $CRUCIBLE_MCP_TOKEN"
     """
     import contextlib
+    import sys
 
     from crucible.mcp_server import CrucibleService, ServeError
 
     # Over stdio, stdout is the protocol: anything printed while the
     # crucibles are resolved (a database rebuild, say) goes to stderr.
-    with contextlib.redirect_stdout(click.get_text_stream("stderr")):
+    with contextlib.redirect_stdout(sys.stderr):
         served = _served_crucibles(names, _warn)
     try:
         service = CrucibleService(served, include_notebooks=include_notebooks,
@@ -2135,9 +2136,12 @@ def mcp_command(names, use_http, host, port, token_env, no_token,
     try:
         from crucible.mcp_server import build_server, run_http
         server = build_server(service, host=host, port=port)
-    except ImportError:
-        raise click.ClickException(
-            "The MCP server needs the mcp package: pip install 'crucible-llm[mcp]'")
+    except ImportError as e:
+        import importlib.util
+        if importlib.util.find_spec("mcp") is None:
+            raise click.ClickException(
+                "The MCP server needs the mcp package: pip install 'crucible-llm[mcp]'")
+        raise click.ClickException(f"The installed mcp package cannot be used: {e}")
 
     names_text = ", ".join(s.name for s in served)
     if use_http:
