@@ -1096,11 +1096,13 @@ def _build_about_html(wiki_dir: Path, db_path: Path, articles: list[dict],
     parts.append(f'<p>{len(instances)} crucible instance(s)</p>')
     if instances:
         parts.append('<table>')
-        parts.append('<tr><th>Name</th><th>Path</th></tr>')
+        parts.append('<tr><th>Name</th><th>Path</th><th>Origin</th></tr>')
         for inst in instances:
+            origin = inst.get("origin") or ""
             parts.append(
                 f'<tr><td>{html.escape(inst["name"])}</td>'
-                f'<td><code>{html.escape(inst["path"])}</code></td></tr>'
+                f'<td><code>{html.escape(inst["path"])}</code></td>'
+                f'<td><code>{html.escape(origin)}</code></td></tr>'
             )
         parts.append('</table>')
 

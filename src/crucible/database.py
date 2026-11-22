@@ -499,6 +499,8 @@ class CrucibleDB:
         raw_conn.execute("PRAGMA busy_timeout = 5000")
         self.conn = DictConnection(raw_conn)
         self._attached: dict[str, str] = {}
+        # Why peers were left out of the last cross-crucible query.
+        self.peer_warnings: list[str] = []
         # (stamp, {concept key: [concept ids]}); see _concept_ids_by_key.
         self._concept_key_cache: tuple | None = None
 
@@ -600,15 +602,29 @@ class CrucibleDB:
 
     # -- Cross-crucible queries --
 
-    def _query_peer(self, peer_db_path: str, query_fn):
-        """Open a separate connection to a peer and run a query function."""
+    def _query_peer(self, peer_db_path: str, query_fn, name: str = "?"):
+        """Open a separate connection to a peer and run a query function.
+
+        A peer that cannot be queried contributes nothing; why is recorded
+        in ``peer_warnings``.
+        """
         try:
             conn = DictConnection(libsql.connect(peer_db_path))
-            results = query_fn(conn)
-            conn.close()
-            return results
-        except Exception:
+            try:
+                return query_fn(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            self.peer_warnings.append(f"Peer '{name}' skipped: {e}")
             return []
+
+    def _peer_db_or_warn(self, peer: dict) -> str | None:
+        db = self._peer_db_path(peer["path"])
+        if not db:
+            self.peer_warnings.append(
+                f"Peer '{peer['name']}' skipped: no crucible database at {peer['path']}."
+            )
+        return db
 
     def search_all(self, query: str, limit: int = 20,
                    peers: list[dict] | None = None) -> list[dict]:
@@ -618,6 +634,7 @@ class CrucibleDB:
         """
         if peers is None:
             peers = []
+        self.peer_warnings = []
         match = _fts_query(query)
         if not match:
             return []
@@ -628,7 +645,7 @@ class CrucibleDB:
             results.append(r)
         # Peers (separate connections, since FTS5 MATCH doesn't work via ATTACH)
         for peer in peers:
-            peer_db = self._peer_db_path(peer["path"])
+            peer_db = self._peer_db_or_warn(peer)
             if not peer_db:
                 continue
             name = peer["name"]
@@ -639,7 +656,7 @@ class CrucibleDB:
                     r["_crucible"] = _name
                 return rows
 
-            results.extend(self._query_peer(peer_db, do_search))
+            results.extend(self._query_peer(peer_db, do_search, name))
         # Rows article_fts finds, ranked as they always were, then the rows
         # only the joined subscripts find: their ranks come from another
         # table and do not compare with the others.
@@ -653,12 +670,13 @@ class CrucibleDB:
         """
         if peers is None:
             peers = []
+        self.peer_warnings = []
         results = []
         for r in self.list_concepts():
             r["_crucible"] = "local"
             results.append(r)
         for peer in peers:
-            peer_db = self._peer_db_path(peer["path"])
+            peer_db = self._peer_db_or_warn(peer)
             if not peer_db:
                 continue
             name = peer["name"]
@@ -677,7 +695,7 @@ class CrucibleDB:
                     rows.append(r)
                 return rows
 
-            results.extend(self._query_peer(peer_db, do_concepts))
+            results.extend(self._query_peer(peer_db, do_concepts, name))
         return results
 
     # -- Derivations --

@@ -1,0 +1,202 @@
+#+TITLE: Federation: linking crucibles across machines and people
+#+DATE: [2026-11-22 Sun]
+
+* Goal
+
+Let crucibles find, follow and search each other beyond one machine, in the
+way peer networks linked files, but for distilled knowledge. A researcher
+should be able to follow a colleague's or a lab's crucible, keep it current,
+search it alongside their own, and see where every result came from, without
+a central server and without copyrighted sources ever leaving the machine
+that holds them.
+
+* Where we are
+
+Done (branch =feature/remote-crucibles=):
+
+- *Origins.* Every registry entry records where its crucible comes from: the
+  git =origin= remote, refreshed on every registration, or one given with
+  =registry add --origin=. URLs are stored without credentials.
+- *Clone.* =crucible clone URL [DEST]= clones a crucible from git, builds its
+  database from the committed wiki and =references.bib=, and registers it.
+- *Pull.* =crucible pull [NAME...] [--all]= fast-forwards clones and syncs
+  them, refusing a clone with changes or commits of its own.
+- *Visible gaps.* =search --all= and =concepts --all= warn about every peer
+  they leave out, where they used to drop it silently.
+- *Untrusted peer content* (step 1 below).
+
+Tested against a real remote: =https://github.com/jkitchin/discopt.git=,
+which commits its crucible at the top level (67 articles).
+
+* Design principles
+
+1. *Git is the transport.* Hosting, versioning, auth and mirroring are
+   solved by git hosts. Crucible adds discovery and search on top; it does
+   not add a protocol for moving data.
+2. *Only distilled content travels.* =sources/external/= is never
+   committed, so copyrighted PDFs and web clippings stay local. This is the
+   lesson of Napster: the content, not the index, is the liability.
+3. *Peer content is untrusted.* Another crucible's text is data written by
+   someone else. Agents read it; they never take instructions from it.
+4. *Opt-in, always previewed.* Nothing is cloned, followed or crawled
+   without the user seeing what it is first. No background crawling.
+5. *Provenance is never lost.* Every result, and every article that came
+   from a peer, can be traced to the crucible, origin and commit it came
+   from.
+6. *Catalogs, not a central index.* Discovery happens through lists anyone
+   can publish (like BitTorrent trackers or RSS feeds), so there is no
+   single point of failure.
+
+* Prior art and what we take from it
+
+| System          | Discovery                       | Taken                                   | Avoided                         |
+|-----------------+---------------------------------+-----------------------------------------+---------------------------------|
+| Napster         | Central index server            | Searchable index of what peers hold     | Single point of failure         |
+| Gnutella        | Query flooding through peers    | Peers naming their peers (step 4)       | Unbounded crawling, spam        |
+| BitTorrent      | Trackers, then a DHT            | Separating discovery from transfer      | A custom transport              |
+| AT Protocol     | Signed repos, relays, app views | Personal repos plus optional aggregators | (closest match; worth watching) |
+| sql.js-httpvfs  | None (static hosting)           | Querying a hosted SQLite file remotely  |                                 |
+
+* Plan
+
+** DONE 1. Mark peer content as untrusted
+CLOSED: [2026-11-22 Sun]
+
+Prerequisite for everything else: as soon as crucibles are shared, search
+output carries strangers' text into an agent's context.
+
+- Text output of =search --all= and =concepts --all= ends with a notice
+  whenever a peer contributed; a peer's article is shown by absolute path.
+- =--json= rows carry =_untrusted=, and a peer's rows =_origin= and
+  =_abs_path=.
+- The skill tells agents not to follow instructions in peer content, to
+  cite peer articles, and to keep copied claims at =:STATUS: draft=.
+- The About page of =crucible browse= shows each crucible's origin.
+
+Not yet done: =crucible related=, =backlinks= and =browse= do not show
+peer content today; any command that starts to must label it too.
+
+** TODO 2. Catalogs: =crucible catalog export=
+
+A catalog is the shareable form of a registry: only entries that have an
+origin, never local paths.
+
+#+BEGIN_SRC json
+{
+  "catalog_version": 1,
+  "name": "kitchin-group",
+  "description": "Crucibles of the Kitchin group at CMU",
+  "updated": "2026-11-22",
+  "crucibles": [
+    {
+      "name": "discopt",
+      "origin": "https://github.com/jkitchin/discopt.git",
+      "description": "Discrete and global optimization",
+      "articles": 67,
+      "top_concepts": ["branch-and-bound", "mixed-integer-programming"],
+      "commit": "3f2c1a9"
+    }
+  ]
+}
+#+END_SRC
+
+- =crucible catalog export [-o FILE] [--name N] [NAMES...]= writes the
+  entries with an origin (or the named ones), with summary fields computed
+  from each database.
+- Refuse entries whose origin is a local path unless =--include-local=,
+  since a path means nothing on another machine.
+- Never write a credential, a local path or a =sources/external/= name.
+- Tests: export round-trips through =subscribe=; no local paths leak.
+
+** TODO 3. Subscribe: =crucible subscribe CATALOG=
+
+- CATALOG is a URL (https, fetched with a User-Agent and timeout) or a file.
+- Shows the catalog's entries (name, origin, description, size, concepts)
+  and asks which to clone; =--all= / =--yes= for scripted use.
+- Clones each chosen entry with =crucible clone= into a chosen directory
+  (default =~/crucibles/<catalog-name>/=), recording in the registry which
+  catalog it came from (=catalog= field).
+- Entries already registered with the same origin are skipped, not cloned
+  twice.
+- =crucible pull --all= then keeps them current; =crucible subscribe
+  --update CATALOG= offers entries added to the catalog since.
+- Validate the catalog strictly (schema, sizes, name characters) and treat
+  every field as untrusted: names are sanitized before they become
+  directory names or registry names.
+
+** TODO 4. Followed peers: committed =.crucible/peers.json=
+
+A crucible may declare the crucibles it follows, in the same format as a
+catalog's =crucibles= list, committed with the wiki. This lets knowledge
+link transitively, friend-of-a-friend.
+
+- =crucible peers [--depth N]= shows the peers of the registered clones,
+  and their peers to depth N (default 1, maximum 3), without cloning them.
+- =crucible subscribe --from-peers NAME= offers them for cloning, with the
+  same preview as step 3.
+- Never followed automatically. Cycles and duplicates (same origin) are
+  collapsed; the path by which each was found is shown.
+- =crucible registry= gains a way to write the current follows to
+  =peers.json= (=crucible peers --write=).
+
+** TODO 5. Provenance through merge
+
+Today =crucible merge= copies a peer's articles in as local files and the
+peer marking is lost.
+
+- Merged articles get =:MERGED_FROM:= (registry name and origin) and
+  =:MERGED_COMMIT:= properties.
+- =lint= reports merged articles whose upstream has changed since
+  (compare with the clone's HEAD), and =search= keeps labelling them.
+- Prerequisite for updating merged articles in place on a later merge,
+  instead of adding =name_1.org= copies.
+
+** TODO 6. Search without cloning: hosted databases
+
+A crucible can be searched without being cloned by hosting its database
+as a static file (GitHub Pages, any web server) and querying it with HTTP
+range requests, as sql.js-httpvfs does. No server process is needed.
+
+- =crucible publish --db= writes a read-only copy of =crucible.db= (FTS
+  index, metadata; embeddings optional) plus a small JSON descriptor.
+- A catalog entry may give =db_url= alongside =origin=.
+- =search --all --remote= queries the registered remote databases.
+- Open questions: a range-request VFS for libsql from Python; caching;
+  how stale a hosted database may be relative to the repository.
+
+** TODO 7. Trust signals (later)
+
+- Show =:STATUS:= (draft/reviewed/verified) prominently for peer results.
+- Signed commits: record whether a clone's HEAD is signed and by whom.
+- Per-peer trust levels in the registry (=trusted=, =untrusted=), which
+  =merge= and the skill can consult.
+
+* Joining knowledge across crucibles
+
+Cite keys differ between crucibles, but DOIs are global. A query such as
+"which crucibles have distilled 10.1021/acscatal.xxxx?" can run across all
+peers today from their =sources= tables, and could be a =crucible who-has
+DOI= command. Concept names are local (=bnb= vs =branch-and-bound=); a
+later alignment step could use embeddings to suggest equivalences, which
+the user confirms.
+
+* Non-goals (for now)
+
+- A DHT, gossip protocol or any always-on peer process.
+- A central hosted index run by this project.
+- Sharing anything under =sources/external/=.
+- Writing to another crucible: every cross-crucible operation reads the
+  peer and writes only locally.
+
+* Example remote crucibles
+
+- =https://github.com/jkitchin/discopt.git= works today and is the example
+  used throughout the docs (readme, tutorial, commands, skill, help). It is
+  a full code repository (about 140 MB), which is fine for trying things
+  but too heavy for automated tests.
+- Proposed: a small dedicated public repo (e.g. =jkitchin/crucible-example=)
+  containing only a =.crucible/= of a dozen articles, to serve as the
+  tutorial example, the first entry of an example catalog, and the target
+  of an optional network test (skipped offline). Seed it from pounce's 15
+  articles (pounce currently gitignores =.crucible/=) or a subset of
+  discopt's.

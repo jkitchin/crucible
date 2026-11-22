@@ -232,11 +232,38 @@ path, with an optional description and the time it was registered.
 =crucible registry= lists, adds, removes and cleans entries (=clean= drops
 those with no database on disk).
 
+An entry also records its =origin=, where the crucible comes from. On
+every registration it is read from the git =origin= remote of the
+checkout the project is in (=git remote get-url origin=); without one, an
+origin given by hand (=registry add --origin=) is kept. URLs are scrubbed
+of credentials before they are stored. =crucible clone= sets the origin to
+the URL it cloned, and adds =cloned_at=; =crucible pull= sets =pulled_at=.
+
+Crucibles from elsewhere travel as git repositories: the wiki,
+=references.bib=, notebooks and data are committed, while the database
+and =sources/external/= are not. =clone= runs =git clone=, rebuilds the
+database from the committed files (the same rebuild =get_root()= does
+for a missing database) and registers the result. =pull= fetches and
+fast-forwards the clone, then syncs it. A clone is treated as a read-only
+peer: pull refuses one with tracked changes or commits of its own, except
+=MANIFEST.md= and =index.org=, which sync regenerates with the date and
+pull resets before updating. Folding a clone's content into another
+crucible is left to =merge=.
+
 When =--all= is used on =search= or =concepts=, crucible opens a separate
 connection to each other registered crucible's =.crucible/crucible.db=
-(entries with no database are skipped) and runs the query against it.
-Results are tagged with the crucible's registry name and merged with
-local results.
+and runs the query against it. Results are tagged with the crucible's
+registry name and merged with local results. A peer left out (no
+database on disk, or one that fails to open or query) is named in a
+warning on stderr; =get_peers(skipped=...)=, =CrucibleDB.peer_warnings=
+and =EmbeddingIndex.warnings= collect the reasons.
+
+Peer results are untrusted. A peer's wiki was written by someone else, and
+search output is often read by an agent, so a peer article is data to be
+read, never instructions. =_mark_peer_rows= tags every row of an =--all=
+listing with =_untrusted= (and a peer's with =_origin= and =_abs_path=),
+and the text output ends with a notice whenever a peer contributed. The
+skill tells agents not to act on instructions found in peer content.
 
 No data is written to other crucibles' databases. The connection is
 read-only by convention (SQLite's default mode allows writes, but

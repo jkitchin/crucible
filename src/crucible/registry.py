@@ -7,10 +7,12 @@ instances. Any crucible can discover all others without manual configuration.
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from filelock import FileLock
 
@@ -152,16 +154,68 @@ def _write_registry(data: dict) -> None:
         raise
 
 
+def scrub_url(url: str) -> str:
+    """`url` without credentials, safe to store and print.
+
+    An http(s) URL loses its whole user part (``https://TOKEN@host`` is as
+    secret as ``https://user:TOKEN@host``); other URLs keep the user name
+    (``ssh://git@host``) but lose any password. scp-style addresses
+    (``git@host:repo``) and local paths have no password and are kept.
+    """
+    url = url.strip()
+    if "://" not in url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if "@" not in parts.netloc:
+        return url
+    userinfo, host = parts.netloc.rsplit("@", 1)
+    if parts.scheme.lower() in ("http", "https"):
+        netloc = host
+    else:
+        netloc = f"{userinfo.split(':', 1)[0]}@{host}"
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
+def _git(path: str | Path, *args: str, timeout: float = 10) -> str | None:
+    """stdout of ``git -C path ARGS``, stripped; None if git fails or is absent."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def git_origin(path: str | Path) -> str | None:
+    """The (credential-free) URL of the ``origin`` remote of the git
+    checkout holding `path`, or None when there is none."""
+    url = _git(path, "remote", "get-url", "origin", timeout=5)
+    return scrub_url(url) if url else None
+
+
 def register(name: str, path: str, description: str = "",
-             rename: bool = False) -> str:
+             rename: bool = False, origin: str | None = None) -> str:
     """Add or update a crucible instance in the global registry.
 
     If `path` is already registered, its entry is updated in place and
     keeps its name, unless ``rename`` is true, in which case it moves to
     `name` (when `name` is free). If `name` already exists with a
     different path, appends -2, -3, etc. Returns the actual name used.
+
+    The entry's ``origin`` records where the crucible comes from: `origin`
+    when given, else the URL of its git ``origin`` remote, else whatever
+    origin the entry already had (one set by hand is kept).
     """
     path = str(Path(path).resolve())
+    found_origin = scrub_url(origin) if origin else git_origin(path)
     with _locked():
         data = _read_registry(strict=True)
         instances = data["instances"]
@@ -172,6 +226,8 @@ def register(name: str, path: str, description: str = "",
             if entry["path"] == path:
                 entry["description"] = description or entry.get("description", "")
                 entry["registered_at"] = now
+                if found_origin:
+                    entry["origin"] = found_origin
                 if rename and name != existing_name and name not in instances:
                     del instances[existing_name]
                     instances[name] = entry
@@ -192,8 +248,32 @@ def register(name: str, path: str, description: str = "",
             "description": description,
             "registered_at": now,
         }
+        if found_origin:
+            instances[actual_name]["origin"] = found_origin
         _write_registry(data)
         return actual_name
+
+
+def update_entry(name: str, **fields) -> bool:
+    """Set fields (e.g. ``cloned_at``, ``pulled_at``) on the entry `name`.
+
+    A field given as None is removed. Returns False if there is no such
+    entry. The ``path`` field cannot be changed this way.
+    """
+    if "path" in fields:
+        raise ValueError("update_entry cannot change an entry's path")
+    with _locked():
+        data = _read_registry(strict=True)
+        entry = data["instances"].get(name)
+        if entry is None:
+            return False
+        for key, value in fields.items():
+            if value is None:
+                entry.pop(key, None)
+            else:
+                entry[key] = value
+        _write_registry(data)
+        return True
 
 
 def lookup_path(path: str) -> str | None:
@@ -244,6 +324,12 @@ def list_instances() -> list[dict]:
             "path": entry["path"],
             "description": entry.get("description", ""),
             "registered_at": entry.get("registered_at", ""),
+            # Where it comes from (a git remote URL, or one set by hand),
+            # and, for a crucible made by `crucible clone`, when it was
+            # cloned and last pulled. None when not known.
+            "origin": entry.get("origin"),
+            "cloned_at": entry.get("cloned_at"),
+            "pulled_at": entry.get("pulled_at"),
         })
     return result
 
@@ -261,11 +347,13 @@ def resolve_db_path(instance: dict) -> Path | None:
     return None
 
 
-def get_peers(exclude_path: str | None = None) -> list[dict]:
+def get_peers(exclude_path: str | None = None,
+              skipped: list[str] | None = None) -> list[dict]:
     """Return registry entries as peer dicts, excluding the caller.
 
-    Each dict has 'name' and 'path' keys, matching the format used by
-    search_all/concepts_all. Stale entries (no DB file) are silently skipped.
+    Each dict has 'name', 'path' and 'origin' keys, matching the format
+    used by search_all/concepts_all. Stale entries (no DB file) are left out; when
+    `skipped` is a list, a message saying why is appended to it for each.
     """
     if exclude_path:
         exclude_path = str(Path(exclude_path).resolve())
@@ -274,7 +362,13 @@ def get_peers(exclude_path: str | None = None) -> list[dict]:
         if exclude_path and instance["path"] == exclude_path:
             continue
         if resolve_db_path(instance) is not None:
-            peers.append({"name": instance["name"], "path": instance["path"]})
+            peers.append({"name": instance["name"], "path": instance["path"],
+                          "origin": instance.get("origin")})
+        elif skipped is not None:
+            skipped.append(
+                f"Peer '{instance['name']}' skipped: no crucible database at "
+                f"{instance['path']} (`crucible registry clean` drops stale entries)."
+            )
     return peers
 
 

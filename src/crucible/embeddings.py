@@ -522,6 +522,9 @@ class EmbeddingIndex:
         for peer in peers:
             peer_db = _peer_db_path(peer)
             if not peer_db:
+                self.warnings.append(
+                    f"Peer '{peer['name']}' skipped: no crucible database at "
+                    f"{peer['path']}.")
                 continue
             try:
                 conn = DictConnection(libsql.connect(peer_db))
@@ -569,6 +572,9 @@ class EmbeddingIndex:
         for peer in peers:
             peer_db = _peer_db_path(peer)
             if not peer_db:
+                self.warnings.append(
+                    f"Peer '{peer['name']}' skipped: no crucible database at "
+                    f"{peer['path']}.")
                 continue
             name = peer["name"]
             try:

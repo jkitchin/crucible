@@ -284,7 +284,18 @@ shown; =--raw= returns every hit. =--all= also searches every other
 crucible in the global registry (see =crucible registry=); each result
 from another crucible is labelled with its registry name. A peer whose
 embeddings come from a different model contributes only keyword hits,
-with a warning on stderr.
+with a warning on stderr. So does any peer left out entirely: one with no
+database (a stale entry) or whose database cannot be read is named in a
+warning, rather than silently contributing nothing. =crucible concepts
+--all= warns the same way.
+
+Content from other crucibles is labelled as untrusted, since it was
+written by someone else and is often read by an agent. When any result
+comes from a peer, the text output ends with a note saying so, and a
+peer's article is shown by its absolute path (its =path= is relative to
+the peer). With =--json=, every row has =_untrusted= (=true= for a
+peer's), and a peer's rows also have =_origin= (its registry origin) and
+=_abs_path=. =crucible concepts --all= labels peer rows the same way.
 
 * Navigation Commands
 
@@ -549,7 +560,14 @@ nothing else changes.
 
 The global registry, =~/.crucible/registry.json=, lists every crucible on
 the machine. Each entry records a name, the project's absolute path, an
-optional description and when it was registered. =crucible init=,
+optional description, when it was registered, and its origin: where it
+comes from. The origin is the URL of the git =origin= remote when the
+crucible is in a git checkout (refreshed on every registration, so it
+follows a changed remote), or one given with =registry add --origin=,
+which is kept while there is no git remote. URLs are stored without
+credentials (=https://TOKEN@host/...= is stored as =https://host/...=).
+Crucibles made by =crucible clone= also record when they were cloned and
+last pulled. =crucible init=,
 =crucible sync= and =crucible update= register the current project
 automatically (a name already used by another path gets a =-2=, =-3=,
 ... suffix). =crucible search --all= and =crucible concepts --all= query
@@ -563,17 +581,77 @@ crucible registry list [--json]
 #+END_SRC
 
 Shows each crucible with its path and status (=ok=, or =MISSING= when
-there is no database there). =--json= includes each database's path
-(=null= if missing).
+there is no database there), and an =origin:= line for each one whose
+origin is known. =--json= includes each database's path (=null= if
+missing) and the =origin=, =cloned_at= and =pulled_at= fields (=null=
+when not known).
 
 ** =crucible registry add=
 
 #+BEGIN_SRC bash
-crucible registry add NAME PATH [-d DESCRIPTION]
+crucible registry add NAME PATH [-d DESCRIPTION] [--origin ORIGIN]
 #+END_SRC
 
 Registers a crucible by hand. PATH must contain a crucible database
-(=.crucible/crucible.db=).
+(=.crucible/crucible.db=). =--origin= records where it came from (a URL,
+a network share, any note); without it the git =origin= remote is used,
+if there is one.
+
+** =crucible clone=
+
+#+BEGIN_SRC bash
+crucible clone URL [DEST] [--name NAME] [-d DESCRIPTION]
+#+END_SRC
+
+Clones a crucible from a git repository, builds its database from the
+committed wiki and =references.bib=, and registers it with URL as its
+origin. URL is anything =git clone= accepts: https, ssh, a local path or
+a path on a network share. DEST defaults to a directory named after the
+repository in the current directory, as git does, and must not exist or
+be empty. The repository must have the crucible (=.crucible/wiki/=) at
+its top level; if it does not, the clone is removed and nothing is
+registered. The registry name is NAME, or DEST's directory name.
+
+The clone is then searched by =crucible search --all=, updated by
+=crucible pull=, and can be folded into another crucible with =crucible
+merge=. Sources under =sources/external/= are never committed, so a clone
+does not have them.
+
+For example, the discopt repository commits its crucible at its top level:
+
+#+BEGIN_SRC bash
+crucible clone https://github.com/jkitchin/discopt.git
+# Cloning ... into ./discopt
+# Registered 'discopt' -> ./discopt (67 articles, 1 sources)
+crucible search "branch and bound" --all
+#   [discopt] [method] Spatial Branch and Bound  (active)
+#     /path/to/discopt/.crucible/wiki/methods/spatial-branch-and-bound.org
+#+END_SRC
+
+** =crucible pull=
+
+#+BEGIN_SRC bash
+crucible pull [NAME...] [--all]
+#+END_SRC
+
+Updates crucibles from their git upstream and syncs them. NAMEs are
+registry names or paths; with none, the current crucible is pulled.
+=--all= pulls every registered crucible made by =crucible clone= (not
+every crucible that happens to have a git remote).
+
+Each crucible is fetched and fast-forwarded to the upstream of its
+current branch, then synced. Pull treats a clone as read-only: it refuses
+a crucible with uncommitted changes to tracked files, or with commits
+upstream does not have, and says which. The exception is =MANIFEST.md=
+and =index.org=, which every sync regenerates with the date; they are
+reset before the update and written again by the sync. With several
+crucibles, one that cannot be pulled is reported and the rest are still
+pulled.
+
+Pull updates the clone itself. To bring its changes into your own
+crucible, run =crucible merge NAME= there. Merge skips files it already
+has, but an article that changed upstream since an earlier merge arrives
+as a renamed copy (=name_1.org=), not as an update in place.
 
 ** =crucible registry remove=
 
