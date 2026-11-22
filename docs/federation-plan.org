@@ -24,6 +24,8 @@ Done (branch =feature/remote-crucibles=):
 - *Visible gaps.* =search --all= and =concepts --all= warn about every peer
   they leave out, where they used to drop it silently.
 - *Untrusted peer content* (step 1 below).
+- *MCP server* (step 2 below): =crucible mcp= serves chosen crucibles,
+  read-only, to any MCP client, over stdio or HTTP with a bearer token.
 
 Tested against a real remote: =https://github.com/jkitchin/discopt.git=,
 which commits its crucible at the top level (67 articles).
@@ -52,7 +54,7 @@ which commits its crucible at the top level (67 articles).
 | System          | Discovery                       | Taken                                   | Avoided                         |
 |-----------------+---------------------------------+-----------------------------------------+---------------------------------|
 | Napster         | Central index server            | Searchable index of what peers hold     | Single point of failure         |
-| Gnutella        | Query flooding through peers    | Peers naming their peers (step 4)       | Unbounded crawling, spam        |
+| Gnutella        | Query flooding through peers    | Peers naming their peers (step 5)       | Unbounded crawling, spam        |
 | BitTorrent      | Trackers, then a DHT            | Separating discovery from transfer      | A custom transport              |
 | AT Protocol     | Signed repos, relays, app views | Personal repos plus optional aggregators | (closest match; worth watching) |
 | sql.js-httpvfs  | None (static hosting)           | Querying a hosted SQLite file remotely  |                                 |
@@ -76,7 +78,30 @@ output carries strangers' text into an agent's context.
 Not yet done: =crucible related=, =backlinks= and =browse= do not show
 peer content today; any command that starts to must label it too.
 
-** TODO 2. Catalogs: =crucible catalog export=
+** DONE 2. Serve a crucible over MCP: =crucible mcp=
+CLOSED: [2026-11-22 Sun]
+
+Sharing without cloning: the owner runs a server, others query it live.
+This covers most of what step 7 (hosted databases) was for, at the cost
+of a running process, and it is far simpler.
+
+- =crucible mcp [NAME...]= serves the named crucibles (or the current
+  one) and nothing else; stdio by default, =--http= for other machines.
+- Read-only tools: =list_crucibles=, =overview=, =search=, =read_article=,
+  =list_articles=, =list_concepts=, =concept=, =links=, =sources=; articles
+  as =crucible://NAME/TYPE/SLUG= resources.
+- Only the wiki and =references.bib= (without =file= fields) are served;
+  notebooks with =--include-notebooks=; never =sources/external/=. Paths
+  are resolved and confined, symbolic links included.
+- =--http= on a non-loopback address requires =--token-env VAR= (bearer
+  token) or an explicit =--no-token=. HTTPS is left to a proxy or tunnel.
+- The server's instructions mark the content as reference data, not
+  instructions.
+
+Next: a catalog entry (step 3) may give an =mcp_url= alongside =origin=,
+so a subscriber can choose between cloning and connecting.
+
+** TODO 3. Catalogs: =crucible catalog export=
 
 A catalog is the shareable form of a registry: only entries that have an
 origin, never local paths.
@@ -108,7 +133,7 @@ origin, never local paths.
 - Never write a credential, a local path or a =sources/external/= name.
 - Tests: export round-trips through =subscribe=; no local paths leak.
 
-** TODO 3. Subscribe: =crucible subscribe CATALOG=
+** TODO 4. Subscribe: =crucible subscribe CATALOG=
 
 - CATALOG is a URL (https, fetched with a User-Agent and timeout) or a file.
 - Shows the catalog's entries (name, origin, description, size, concepts)
@@ -124,7 +149,7 @@ origin, never local paths.
   every field as untrusted: names are sanitized before they become
   directory names or registry names.
 
-** TODO 4. Followed peers: committed =.crucible/peers.json=
+** TODO 5. Followed peers: committed =.crucible/peers.json=
 
 A crucible may declare the crucibles it follows, in the same format as a
 catalog's =crucibles= list, committed with the wiki. This lets knowledge
@@ -133,13 +158,13 @@ link transitively, friend-of-a-friend.
 - =crucible peers [--depth N]= shows the peers of the registered clones,
   and their peers to depth N (default 1, maximum 3), without cloning them.
 - =crucible subscribe --from-peers NAME= offers them for cloning, with the
-  same preview as step 3.
+  same preview as step 4.
 - Never followed automatically. Cycles and duplicates (same origin) are
   collapsed; the path by which each was found is shown.
 - =crucible registry= gains a way to write the current follows to
   =peers.json= (=crucible peers --write=).
 
-** TODO 5. Provenance through merge
+** TODO 6. Provenance through merge
 
 Today =crucible merge= copies a peer's articles in as local files and the
 peer marking is lost.
@@ -151,7 +176,7 @@ peer marking is lost.
 - Prerequisite for updating merged articles in place on a later merge,
   instead of adding =name_1.org= copies.
 
-** TODO 6. Search without cloning: hosted databases
+** TODO 7. Search without cloning: hosted databases
 
 A crucible can be searched without being cloned by hosting its database
 as a static file (GitHub Pages, any web server) and querying it with HTTP
@@ -159,12 +184,14 @@ range requests, as sql.js-httpvfs does. No server process is needed.
 
 - =crucible publish --db= writes a read-only copy of =crucible.db= (FTS
   index, metadata; embeddings optional) plus a small JSON descriptor.
-- A catalog entry may give =db_url= alongside =origin=.
+- A catalog entry may give =db_url= alongside =origin=. (=crucible mcp=,
+  step 2, already allows live search without cloning when the owner can
+  run a server; this step is for when they cannot.)
 - =search --all --remote= queries the registered remote databases.
 - Open questions: a range-request VFS for libsql from Python; caching;
   how stale a hosted database may be relative to the repository.
 
-** TODO 7. Trust signals (later)
+** TODO 8. Trust signals (later)
 
 - Show =:STATUS:= (draft/reviewed/verified) prominently for peer results.
 - Signed commits: record whether a clone's HEAD is signed and by whom.

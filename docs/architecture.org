@@ -268,3 +268,24 @@ skill tells agents not to act on instructions found in peer content.
 No data is written to other crucibles' databases. The connection is
 read-only by convention (SQLite's default mode allows writes, but
 crucible never issues write queries against those connections).
+
+** MCP Server
+
+=crucible mcp= (=src/crucible/mcp_server.py=) serves crucibles to other
+agents. =CrucibleService= holds the queries and returns plain data, so it
+is tested without the MCP library; =build_server= wraps it in a FastMCP
+server with nine read-only tools and article resources, and the command
+runs it over stdio or, with =--http=, as a streamable HTTP app under
+uvicorn, behind a bearer-token ASGI middleware when =--token-env= is
+given.
+
+The crucibles served are fixed when the server starts, from the command
+line; a client cannot name another registry entry. Every file read goes
+through =_resolve_article=, which resolves the path (following symbolic
+links) and refuses anything outside =.crucible/wiki/= (and, with
+=--include-notebooks=, =.crucible/sources/notebooks/=). Bibliography
+entries are served without their =file= field. Each call opens its own
+database connection, so the server holds no connection between calls
+and sees a =crucible pull= or =sync= at once. Results carry the
+crucible's name, and the server's instructions tell the client the
+content is reference data, not instructions.
