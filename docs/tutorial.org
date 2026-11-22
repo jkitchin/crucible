@@ -276,6 +276,28 @@ Other crucibles are queried via separate database connections. Your data
 stays local, their data stays in their crucible. No writes cross
 boundaries.
 
+A crucible kept in a git repository (yours on another machine, or a
+colleague's) can be cloned and registered in one step, and updated later.
+The [[https://github.com/jkitchin/discopt][discopt]] repository commits its
+crucible (about 67 articles on discrete and global optimization), so it
+makes a working example:
+
+#+BEGIN_SRC bash
+crucible clone https://github.com/jkitchin/discopt.git
+crucible search "branch and bound" --all   # results marked [discopt]
+crucible pull discopt                      # fast-forward from upstream and sync
+crucible pull --all                        # every crucible made by clone
+crucible registry list                     # shows each entry's origin
+#+END_SRC
+
+discopt is a full code repository, so the clone brings its code along with
+the wiki (about 140 MB). A crucible meant mainly for sharing can live in a
+repository of its own.
+
+The registry records each crucible's origin: the git remote it came from,
+or one given with =crucible registry add --origin=. If =search --all=
+cannot search a registered crucible, it says so on stderr.
+
 To fold one crucible into another instead, use =crucible merge=:
 
 #+BEGIN_SRC bash
