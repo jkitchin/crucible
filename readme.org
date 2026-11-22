@@ -4,6 +4,7 @@
 
 [[https://pypi.org/project/crucible-llm/][https://img.shields.io/pypi/v/crucible-llm.svg]]
 [[https://github.com/jkitchin/crucible/actions/workflows/tests.yml][https://github.com/jkitchin/crucible/actions/workflows/tests.yml/badge.svg]]
+[[https://pepy.tech/projects/crucible-llm][https://static.pepy.tech/personalized-badge/crucible-llm?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads#.svg]]
 
 [[./crucible.png]]
 
