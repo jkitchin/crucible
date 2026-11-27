@@ -65,6 +65,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Check wiki health | `crucible lint` |
 | Get suggestions | `crucible suggest` |
 | Export link graph | `crucible graph -o wiki.dot` |
+| Graph as JSON (nodes, typed edges) | `crucible graph --json [--sources] [--article PATH --depth N]` |
 | Database stats | `crucible stats` |
 | Merge another crucible | `crucible merge SOURCE [-n] [-y]` |
 | Clone a crucible from git and register it | `crucible clone URL [DEST] [--name NAME]` |

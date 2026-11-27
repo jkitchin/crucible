@@ -907,3 +907,70 @@ def test_unparseable_dates_fall_back_to_sync_time(project):
         CONCEPT.replace("Activation energy", "New").replace("2026-01-01", "2026-02-30"))
     _sync()
     assert _dates(_db(project), ".crucible/wiki/concepts/new.org")[0] > "2026-01-01"
+
+
+def _graph_node(data, path):
+    return next(n for n in data["nodes"] if n.get("path") == path)
+
+
+def test_graph_json_has_articles_concepts_and_typed_edges(project):
+    data = run_json("graph")
+    assert data["root"] == str(project.resolve())
+    concept = _graph_node(data, CONCEPT_PATH)
+    summary = _graph_node(data, SUMMARY_PATH)
+    assert concept["type"] == "article" and concept["kind"] == "concept"
+    assert concept["title"] == "Activation energy"
+    assert summary["id"].startswith("a")
+    kinetics = next(n for n in data["nodes"]
+                    if n["type"] == "concept" and n["name"] == "kinetics")
+    assert kinetics["id"].startswith("c") and kinetics["article_count"] == 2
+    edges = {(e["source"], e["target"], e["type"]) for e in data["edges"]}
+    assert (concept["id"], summary["id"], "link") in edges
+    assert (summary["id"], concept["id"], "link") in edges
+    assert (concept["id"], kinetics["id"], "concept") in edges
+    # As in viz: from the article to the one derived from it.
+    assert (concept["id"], summary["id"], "derivation") in edges
+    ids = {n["id"] for n in data["nodes"]}
+    assert all(e["source"] in ids and e["target"] in ids for e in data["edges"])
+    assert not any(n["type"] == "source" for n in data["nodes"])
+
+
+def test_graph_json_article_neighbourhood(project):
+    whole = run_json("graph")
+    concept = _graph_node(whole, CONCEPT_PATH)
+    data = run_json("graph", "--article", "concepts/activation-energy.org",
+                    "--depth", "0")
+    assert [n["id"] for n in data["nodes"]] == [concept["id"]]
+    assert data["edges"] == []
+    data = run_json("graph", "--article", CONCEPT_PATH)
+    assert {n["path"] for n in data["nodes"] if n["type"] == "article"} == {
+        CONCEPT_PATH, SUMMARY_PATH}
+    result = CliRunner().invoke(cli, ["graph", "--json", "--article", "nope.org"])
+    assert result.exit_code == 1
+
+
+def test_graph_json_sources(project):
+    db = CrucibleDB(project / ".crucible" / "crucible.db")
+    sid = db.add_source(".crucible/sources/data/smith.csv", "Smith data", "data",
+                        metadata={"cite_key": "smith-2024"})
+    aid = db.get_article_by_path(SUMMARY_PATH)["id"]
+    db.link_article_source(aid, sid)
+    db.conn.commit()
+    db.close()
+    data = run_json("graph", "--sources")
+    src = next(n for n in data["nodes"] if n["type"] == "source")
+    assert src == {"id": f"s{sid}", "type": "source", "title": "Smith data",
+                   "path": ".crucible/sources/data/smith.csv",
+                   "source_type": "data", "key": "smith-2024"}
+    assert {"source": f"s{sid}", "target": f"a{aid}", "type": "source"} in data["edges"]
+
+
+def test_graph_json_output_file_and_dot_default(project):
+    result = CliRunner().invoke(cli, ["graph", "-j", "-o", "g.json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads((project / "g.json").read_text())
+    assert len(data["nodes"]) >= 2
+    result = CliRunner().invoke(cli, ["graph"])
+    assert result.stdout.startswith("digraph crucible")
+    result = CliRunner().invoke(cli, ["graph", "--sources"])
+    assert result.exit_code == 2

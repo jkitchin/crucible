@@ -842,13 +842,56 @@ must be on =PATH=).
 
 ** =crucible graph=
 
-Export the article link graph in DOT format.
+Export the knowledge graph, in DOT format (the default) or as JSON.
 
 #+BEGIN_SRC bash
 crucible graph [-o wiki.dot]
+crucible graph --json [--sources] [--article PATH [--depth N]] [-o graph.json]
 #+END_SRC
 
-Outputs to stdout or file. Render with graphviz: =dot -Tpng wiki.dot -o wiki.png=.
+| Option | Description |
+|-------------------+--------------------------------------------------------------|
+| =-o=, =--output= | Output file (default: stdout) |
+| =-j=, =--json= | Output the graph as JSON (alias =--json-output=) |
+| =--sources= | JSON only: add source nodes and source-to-article edges |
+| =--article PATH= | JSON only: just the neighbourhood of one article |
+| =--depth N= | Hops from =--article= to include (default 1) |
+
+DOT holds only article-to-article links. Render it with graphviz:
+=dot -Tpng wiki.dot -o wiki.png=.
+
+JSON holds the same graph =crucible viz= draws, for editors that draw
+their own (scimax-vscode, for one):
+
+#+BEGIN_SRC json
+{
+  "root": "/home/me/kb",
+  "nodes": [
+    {"id": "a115", "type": "article", "kind": "concept", "status": "draft",
+     "title": "Agentic AI for science",
+     "path": ".crucible/wiki/concepts/agentic-ai-for-science.org"},
+    {"id": "c12", "type": "concept", "name": "catalysis", "article_count": 7},
+    {"id": "s3", "type": "source", "title": "...", "key": "smith-2024",
+     "source_type": "pdf", "path": ".crucible/sources/external/pdfs/smith.pdf"}
+  ],
+  "edges": [
+    {"source": "a115", "target": "a116", "type": "link"},
+    {"source": "a115", "target": "c12", "type": "concept"},
+    {"source": "a115", "target": "a120", "type": "derivation"},
+    {"source": "s3", "target": "a115", "type": "source"}
+  ]
+}
+#+END_SRC
+
+Node ids are =a=, =c= or =s= and the database id. Paths are relative to
+=root=, the absolute project root. A "link" edge goes from the article
+that holds the link, a "concept" edge from an article to a tag it carries,
+a "derivation" edge from an article to one derived from it, and a "source"
+edge (only with =--sources=) from a source to an article distilled from
+it; a source's =key= is its cite key, or null. =--article= keeps the
+nodes within =--depth= hops of that article, following edges either way
+(a concept or source node is a hop, so =--depth 2= reaches the articles
+that share a tag), and the edges among them.
 
 ** =crucible viz=
 
