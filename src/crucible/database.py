@@ -1340,6 +1340,91 @@ class CrucibleDB:
         lines.append("}")
         return "\n".join(lines)
 
+    def graph_json(self, include_sources: bool = False,
+                   article_path: str | None = None,
+                   depth: int = 1) -> dict:
+        """The knowledge graph as JSON-ready nodes and edges.
+
+        Nodes are articles (id ``a<id>``), concepts (``c<id>``) and, with
+        include_sources, sources (``s<id>``). Edges are typed "link"
+        (article to article it links), "concept" (article to concept it is
+        tagged with), "derivation" (article to one derived from it, as in
+        `crucible viz`) and "source" (source to article distilled from it).
+
+        With article_path, only the nodes within depth hops of that article
+        are kept (edges are followed in either direction, and a concept or
+        source node counts as a hop), with the edges among them. Paths are
+        relative to the project root, as stored.
+        """
+        nodes: dict[str, dict] = {}
+        for r in self.conn.execute(
+                "SELECT id, path, title, article_type, status FROM articles ORDER BY path"):
+            nodes[f"a{r['id']}"] = {
+                "id": f"a{r['id']}", "type": "article", "kind": r["article_type"],
+                "title": r["title"], "path": r["path"], "status": r["status"],
+            }
+        for c in self.list_concepts():
+            nodes[f"c{c['id']}"] = {
+                "id": f"c{c['id']}", "type": "concept", "name": c["name"],
+                "article_count": c["article_count"],
+            }
+
+        edges = []
+        for r in self.conn.execute(
+                "SELECT from_id, to_id FROM article_links ORDER BY from_id, to_id"):
+            edges.append({"source": f"a{r['from_id']}", "target": f"a{r['to_id']}",
+                          "type": "link"})
+        for r in self.conn.execute(
+                "SELECT article_id, concept_id FROM article_concepts"
+                " ORDER BY article_id, concept_id"):
+            edges.append({"source": f"a{r['article_id']}", "target": f"c{r['concept_id']}",
+                          "type": "concept"})
+        for r in self.conn.execute(
+                "SELECT source_id, derived_id FROM article_derivations"
+                " ORDER BY source_id, derived_id"):
+            edges.append({"source": f"a{r['source_id']}", "target": f"a{r['derived_id']}",
+                          "type": "derivation"})
+        if include_sources:
+            for s in self.conn.execute(
+                    "SELECT id, path, title, source_type, metadata FROM sources ORDER BY path"):
+                try:
+                    meta = json.loads(s["metadata"] or "{}")
+                except ValueError:
+                    meta = {}
+                key = meta.get("cite_key") if isinstance(meta, dict) else None
+                nodes[f"s{s['id']}"] = {
+                    "id": f"s{s['id']}", "type": "source", "title": s["title"],
+                    "path": s["path"], "source_type": s["source_type"],
+                    "key": str(key) if key else None,
+                }
+            for r in self.conn.execute(
+                    "SELECT source_id, article_id FROM article_sources"
+                    " ORDER BY source_id, article_id"):
+                edges.append({"source": f"s{r['source_id']}",
+                              "target": f"a{r['article_id']}", "type": "source"})
+        # An edge whose end is missing (a dangling row) is dropped.
+        edges = [e for e in edges if e["source"] in nodes and e["target"] in nodes]
+
+        if article_path is not None:
+            start = self.get_article_by_path(article_path)
+            if start is None:
+                raise ValueError(f"No article at {article_path}")
+            neighbours: dict[str, set[str]] = {}
+            for e in edges:
+                neighbours.setdefault(e["source"], set()).add(e["target"])
+                neighbours.setdefault(e["target"], set()).add(e["source"])
+            keep = {f"a{start['id']}"}
+            frontier = set(keep)
+            for _ in range(max(depth, 0)):
+                frontier = {n for f in frontier for n in neighbours.get(f, ())} - keep
+                if not frontier:
+                    break
+                keep |= frontier
+            nodes = {k: v for k, v in nodes.items() if k in keep}
+            edges = [e for e in edges if e["source"] in keep and e["target"] in keep]
+
+        return {"nodes": list(nodes.values()), "edges": edges}
+
     # -- Implied / computed relationships --
 
     def related(self, article_path: str) -> list[dict]:

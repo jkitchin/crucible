@@ -2847,12 +2847,50 @@ def related(article_path, json_output):
 @cli.command()
 @click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
               help="Output file (default: stdout)")
-def graph(output):
-    """Export the article link graph in DOT format."""
+@click.option("--article", "article_path", default=None,
+              help="JSON only: just the neighbourhood of this article")
+@click.option("--depth", default=1, show_default=True, type=click.IntRange(min=0),
+              help="Hops from --article to include (a concept or source node is a hop)")
+@click.option("--sources", "include_sources", is_flag=True,
+              help="JSON only: add source nodes and source-to-article edges")
+@json_option
+def graph(output, article_path, depth, include_sources, json_output):
+    """Export the knowledge graph: DOT (default) or JSON.
+
+    DOT holds only article-to-article links. --json gives the graph that
+    `crucible viz` draws: article and concept nodes, with "link",
+    "concept" and "derivation" edges (and, with --sources, source nodes
+    and "source" edges). Node ids are a<id>, c<id> and s<id>; paths are
+    relative to "root", the absolute project root, which is included.
+
+    --article (relative to the current directory, the project root,
+    .crucible/ or the wiki, or absolute) keeps only the nodes within
+    --depth hops of that article, following edges either way. Exits 1 if
+    no article has that path.
+    """
+    if not json_output and (article_path or include_sources):
+        raise click.UsageError("--article and --sources need --json")
     root = get_root()
     db = get_db(root)
-    dot = db.graph_dot()
-    db.close()
+    try:
+        if json_output:
+            if article_path is not None:
+                article_path = _resolve_article_arg(root, db, article_path)
+            data = {"root": str(root.resolve()),
+                    **db.graph_json(include_sources=include_sources,
+                                    article_path=article_path, depth=depth)}
+        else:
+            dot = db.graph_dot()
+    finally:
+        db.close()
+    if json_output:
+        if output:
+            _replace_file(output, json.dumps(data, indent=2, default=str) + "\n")
+            click.echo(f"Graph written to {output} ({len(data['nodes'])} nodes, "
+                       f"{len(data['edges'])} edges)")
+        else:
+            _emit_json(data)
+        return
     if output:
         output.write_text(dot)
         click.echo(f"Graph written to {output}")
