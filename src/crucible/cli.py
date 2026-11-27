@@ -16,7 +16,7 @@ import click
 
 from crucible import package_version
 from crucible import registry as registry_module
-from crucible.database import CrucibleDB, fts_joined
+from crucible.database import ARTICLE_TYPES, CrucibleDB, SearchFilter, filter_ids, fts_joined
 from crucible.embeddings import EmbeddingIndex
 from crucible.ingest import _source_metadata, ingest_source, read_bib_text, write_bib_text
 from crucible.orgparse import FILE_LINK_RE, parse_org_file
@@ -1256,9 +1256,6 @@ def _article_source_keys(value: str, index) -> list[str]:
     return keys
 
 
-ARTICLE_TYPES = ("concept", "summary", "comparison", "method")
-
-
 def _normalize_article_type(value: str | None) -> str:
     """An :ARTICLE_TYPE: value as stored: lowercase, defaulting to concept."""
     return (value or "").strip().lower() or "concept"
@@ -1335,6 +1332,7 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
         "unreadable": 0,
         "files": 0,
         "ambiguous_source_keys": 0,
+        "tag_pairs": 0,
     }
 
     try:
@@ -1525,8 +1523,32 @@ def _sync_wiki_to_db(root: Path, db: CrucibleDB, on_skip=None,
         # Tags dropped from files, or deleted articles, can leave concepts
         # that no article uses any more.
         db.prune_unused_concepts()
+        stats["tag_pairs"] = _sync_taxonomy(root, db)
 
     return stats
+
+
+def _sync_taxonomy(root: Path, db: CrucibleDB) -> int:
+    """Load the tag hierarchy of .crucible/taxonomy.org into the database.
+
+    Returns the number of (parent, child) pairs; a missing file clears the
+    hierarchy. Each problem in the file is reported on stderr.
+    """
+    from crucible.taxonomy import TAXONOMY_FILE, parse_taxonomy
+
+    path = cdir(root) / TAXONOMY_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    except (OSError, UnicodeDecodeError) as exc:
+        _warn(f"crucible: cannot read {path}: {exc}; tag hierarchy unchanged.")
+        return len(db.tag_hierarchy())
+    pairs, warnings = parse_taxonomy(text)
+    for w in warnings:
+        _warn(f"crucible: {TAXONOMY_FILE}: {w}")
+    db.set_tag_hierarchy(pairs)
+    return len(pairs)
 
 
 def _rebuild_db_from_wiki(root: Path, db: CrucibleDB) -> dict:
@@ -1599,6 +1621,8 @@ def _sync_project(root: Path) -> None:
         msg += f", {stats['skipped']} skipped (modified during sync)"
     if stats["unreadable"]:
         msg += f", {stats['unreadable']} unreadable (skipped)"
+    if stats["tag_pairs"]:
+        msg += f", {stats['tag_pairs']} tag hierarchy links"
     click.echo(msg)
     if stats["ambiguous_source_keys"]:
         click.echo(
@@ -2229,14 +2253,28 @@ def pull(names, pull_all):
 @click.option("--fts-weight", default=1.0, help="FTS weight for hybrid reranking")
 @click.option("--semantic-weight", default=1.0, help="Semantic weight for hybrid reranking")
 @click.option("--raw", is_flag=True, help="Skip dedup/quality filtering (return raw ranked results)")
+@click.option("--tag", "-t", "tags", multiple=True,
+              help="Only articles with this tag (repeat to require several)")
+@click.option("--type", "types", multiple=True,
+              type=click.Choice(ARTICLE_TYPES, case_sensitive=False),
+              help="Only articles of this type (repeat to allow several)")
+@click.option("--exact", is_flag=True,
+              help="Match --tag only itself, not the tags under it in the taxonomy")
 @json_option
 def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weight,
-           raw, json_output):
+           raw, tags, types, exact, json_output):
     """Search wiki articles.
 
     By default, returns deduplicated, quality-ranked results. Similar
     articles are clustered and the best representative is shown. Use
     --raw to disable this and see all raw hits.
+
+    --tag keeps only articles carrying every tag given (#+FILETAGS:,
+    matched as `crucible concept` matches names), and --type only
+    articles of one of the types given. A tag also matches the tags under
+    it in .crucible/taxonomy.org (org #+TAGS: group tags) unless --exact
+    is given. The filters apply before the limit, in every crucible
+    searched, each with its own taxonomy.
 
     Modes:
       auto      Hybrid if embeddings exist, FTS otherwise (default).
@@ -2252,6 +2290,7 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
 
     root = get_root()
     db = get_db(root)
+    flt = SearchFilter(tags=tags, types=types, exact=exact)
 
     # Resolve peers from global registry for --all. Every peer left out,
     # whatever the reason, is reported on stderr once the search is done.
@@ -2290,15 +2329,16 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
             try:
                 if effective_mode == "hybrid":
                     kwargs = dict(limit=limit, fts_weight=fts_weight,
-                                  semantic_weight=semantic_weight, raw=raw)
+                                  semantic_weight=semantic_weight, raw=raw,
+                                  filters=flt)
                     if search_all and peers:
                         results = idx.hybrid_search_all(query, peers=peers, **kwargs)
                     else:
                         results = idx.hybrid_search(query, **kwargs)
                 elif search_all and peers:
-                    results = idx.search_all(query, peers=peers, limit=limit)
+                    results = idx.search_all(query, peers=peers, limit=limit, filters=flt)
                 else:
-                    results = idx.search(query, limit=limit)
+                    results = idx.search(query, limit=limit, filters=flt)
             except EmbeddingError as e:
                 if mode != "auto":
                     raise click.ClickException(str(e))
@@ -2308,10 +2348,17 @@ def search(query, limit, search_all, mode, model, url, fts_weight, semantic_weig
 
         if effective_mode == "fts":
             if search_all:
-                results = db.search_all(query, limit=limit, peers=peers)
+                results = db.search_all(query, limit=limit, peers=peers, filters=flt)
                 peer_warnings.extend(db.peer_warnings)
             else:
-                results = db.search(query, limit=limit)
+                results = db.search(query, limit=limit, filters=flt)
+        # A tag no local article carries is most likely a typo; with --all
+        # a peer may still carry it.
+        if not search_all:
+            for tag in flt.tags:
+                if not filter_ids(db.conn, SearchFilter(tags=(tag,), exact=exact)):
+                    click.echo(f"Warning: no article is tagged '{tag}' "
+                               "(see `crucible concepts`).", err=True)
     finally:
         db.close()
     for w in dict.fromkeys(peer_warnings):
@@ -2627,11 +2674,31 @@ def sources(article_path, json_output):
 
 @cli.command()
 @click.option("--all", "query_all", is_flag=True, help="Include all registered crucibles")
+@click.option("--tree", is_flag=True,
+              help="Show the tag hierarchy of .crucible/taxonomy.org")
 @json_option
-def concepts(query_all, json_output):
-    """List all concepts with article counts."""
+def concepts(query_all, tree, json_output):
+    """List all concepts with article counts.
+
+    With --tree, concepts are shown in the hierarchy that the #+TAGS:
+    group tags of .crucible/taxonomy.org define. Each count includes the
+    articles of the tags under it; tags the taxonomy leaves out are
+    listed after the tree.
+    """
+    if tree and query_all:
+        raise click.UsageError("--tree shows one crucible; it cannot be combined with --all.")
     root = get_root()
     db = get_db(root)
+    if tree:
+        try:
+            result = db.concept_tree()
+        finally:
+            db.close()
+        if json_output:
+            _emit_json(result)
+        else:
+            _print_concept_tree(result)
+        return
     peer_warnings: list[str] = []
     if query_all:
         from crucible.registry import get_peers
@@ -2657,6 +2724,30 @@ def concepts(query_all, json_output):
     if from_peers:
         click.echo()
         click.echo(_PEER_NOTICE)
+
+
+def _print_concept_tree(result: dict) -> None:
+    def show(node: dict, depth: int) -> None:
+        n = node["article_count"]
+        click.echo(f"{'  ' * (depth + 1)}{node['name']} "
+                   f"({n} article{'' if n == 1 else 's'})")
+        for child in node["children"]:
+            show(child, depth + 1)
+
+    if not result["tree"] and not result["unplaced"]:
+        click.echo("No concepts yet.")
+        return
+    if not result["tree"]:
+        click.echo("No tag hierarchy: add #+TAGS: group tags to "
+                   ".crucible/taxonomy.org and run `crucible sync`.")
+    for node in result["tree"]:
+        show(node, 0)
+    if result["unplaced"]:
+        if result["tree"]:
+            click.echo()
+            click.echo("Not in the taxonomy:")
+        for node in result["unplaced"]:
+            show(node, 0)
 
 
 @cli.command()
@@ -5576,6 +5667,11 @@ Full-text search (FTS5 with porter stemming):
   crucible search "platinum catalysis" -n 5
   crucible search "zeolites" --all     Search every registered crucible
   crucible search "catal*"             A trailing * matches a word prefix
+  crucible search "barrier" --tag dft  Only articles tagged dft
+  crucible search "q" -t dft -t zeolite --type method
+                                       Tagged both, and of type method
+  crucible search "q" -t methods       Also finds tags under methods in
+                                       .crucible/taxonomy.org (--exact: not)
   Titles and article text are searched; words are matched literally (no
   AND/OR/NOT operators or quoting).
 
@@ -5585,6 +5681,7 @@ Semantic and hybrid search (after `crucible embed`, needs ollama):
 
 Structured queries:
   crucible concepts                    List all concepts with article counts
+  crucible concepts --tree             The tag hierarchy of .crucible/taxonomy.org
   crucible concept thermodynamics      Articles covering a concept
   crucible backlinks .crucible/wiki/concepts/x.org   What links here
   crucible sources .crucible/wiki/concepts/x.org     Primary sources

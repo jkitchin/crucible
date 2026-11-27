@@ -18,7 +18,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from crucible.database import CrucibleDB, fts_rows
+from crucible.database import ARTICLE_TYPES, CrucibleDB, SearchFilter, fts_rows
 
 CRUCIBLE_DIR = ".crucible"
 SNIPPET_CHARS = 300
@@ -58,6 +58,13 @@ def _snippet(row: dict) -> str:
     text = (row.get("abstract") or row.get("_fts_content") or "").strip()
     text = " ".join(text.split())
     return text[:SNIPPET_CHARS] + ("..." if len(text) > SNIPPET_CHARS else "")
+
+
+def _words(value: list[str] | str | None) -> list[str]:
+    """A list, or a space or comma separated string, as a list of words."""
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+    return [v.strip() for v in value or () if v and v.strip()]
 
 
 def _clamp(limit: int, default: int = 10) -> int:
@@ -211,18 +218,32 @@ class CrucibleService:
         return out
 
     def search(self, query: str, crucible: str | None = None, limit: int = 10,
-               mode: str = "auto") -> dict:
+               mode: str = "auto", tags: list[str] | str | None = None,
+               types: list[str] | str | None = None, exact: bool = False) -> dict:
         """Search the served crucibles; results from several are interleaved
-        by rank, since scores from different databases do not compare."""
+        by rank, since scores from different databases do not compare.
+
+        tags keeps articles carrying every tag (or a tag under it in the
+        crucible's taxonomy, unless exact); types, articles of any of the
+        types. Either may be a list or a space or comma separated string.
+        """
         if mode not in ("auto", "fts", "semantic", "hybrid"):
             raise ServeError(f"mode must be auto, fts, semantic or hybrid, not {mode!r}")
+        tags, types = _words(tags), [t.lower() for t in _words(types)]
+        bad = [t for t in types if t not in ARTICLE_TYPES]
+        if bad:
+            raise ServeError(f"article type must be one of {', '.join(ARTICLE_TYPES)},"
+                             f" not {bad[0]!r}")
+        filters = dict(filters=SearchFilter(tags=tuple(tags), types=tuple(types),
+                                            exact=exact) or None)
         limit = _clamp(limit)
         notes: list[str] = []
         per: list[list[dict]] = []
         for s in self._targets(crucible):
             db = self._open(s)
             try:
-                rows, used = self._search_one(db, query, limit, mode, notes, s)
+                rows, used = self._search_one(db, query, limit, mode, notes, s,
+                                              filters)
             finally:
                 db.close()
             per.append([dict(self._row(s, r), snippet=_snippet(r), mode=used)
@@ -232,26 +253,27 @@ class CrucibleService:
             merged += [p[i] for p in per if i < len(p)]
         return {"results": merged[:limit], "notes": notes}
 
-    def _search_one(self, db, query, limit, mode, notes, s) -> tuple[list[dict], str]:
+    def _search_one(self, db, query, limit, mode, notes, s,
+                    filters) -> tuple[list[dict], str]:
         has_table = db.conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
         ).fetchone() is not None
         if mode == "fts" or (mode == "auto" and not has_table):
-            return fts_rows(db.conn, query, limit), "fts"
+            return fts_rows(db.conn, query, limit, **filters), "fts"
         from crucible.embeddings import EmbeddingError, EmbeddingIndex
         idx = EmbeddingIndex(db.conn, url=self.ollama_url)
         embedded = idx.stats()["embedded_with_model"] if has_table else 0
         if embedded == 0:
             if mode != "auto":
                 notes.append(f"{s.name}: no embeddings; used keyword search")
-            return fts_rows(db.conn, query, limit), "fts"
+            return fts_rows(db.conn, query, limit, **filters), "fts"
         try:
             if mode == "semantic":
-                return idx.search(query, limit=limit), "semantic"
-            return idx.hybrid_search(query, limit=limit), "hybrid"
+                return idx.search(query, limit=limit, **filters), "semantic"
+            return idx.hybrid_search(query, limit=limit, **filters), "hybrid"
         except EmbeddingError as e:
             notes.append(f"{s.name}: {e}; used keyword search")
-            return fts_rows(db.conn, query, limit), "fts"
+            return fts_rows(db.conn, query, limit, **filters), "fts"
 
     def read_article(self, path: str, crucible: str | None = None) -> dict:
         s = self._get(crucible)
@@ -392,11 +414,18 @@ def build_server(service: CrucibleService, host: str = "127.0.0.1",
 
     @mcp.tool()
     def search(query: str, crucible: str = "", limit: int = 10,
-               mode: str = "auto") -> str:
+               mode: str = "auto", tags: str = "", article_type: str = "",
+               exact_tags: bool = False) -> str:
         """Search articles. mode: auto (hybrid when embeddings exist),
         fts (keywords; a trailing * is a prefix), semantic or hybrid.
-        Leave crucible empty to search every served crucible."""
-        return run(service.search, query, crucible or None, limit, mode)
+        Leave crucible empty to search every served crucible. tags (space
+        or comma separated, as list_concepts names them) keeps articles
+        carrying all of them, where a tag also matches the narrower tags
+        under it in the crucible's taxonomy unless exact_tags is true;
+        article_type (concept, summary, comparison, method; several
+        allowed) keeps articles of any of those types."""
+        return run(service.search, query, crucible or None, limit, mode,
+                   tags or None, article_type or None, exact_tags)
 
     @mcp.tool()
     def read_article(path: str, crucible: str = "") -> str:

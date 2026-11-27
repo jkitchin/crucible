@@ -17,8 +17,8 @@ from pathlib import Path
 
 import libsql
 
+from crucible.database import FILTER_SQL, DictConnection, filter_ids, fts_rows
 from crucible.orgparse import DRAWER_RE
-from crucible.database import DictConnection, fts_rows
 
 DEFAULT_MODEL = "nomic-embed-text"
 DEFAULT_URL = "http://localhost:11434/api/embed"
@@ -169,16 +169,25 @@ def _has_embeddings_table(conn) -> bool:
 _SEMANTIC_SQL = """
     SELECT a.*, vector_distance_cos(e.vector, ?) AS distance
     FROM embeddings e JOIN articles a ON a.id = e.article_id
-    WHERE e.model = ? AND e.dimensions = ? AND e.vector IS NOT NULL
+    WHERE e.model = ? AND e.dimensions = ? AND e.vector IS NOT NULL{where}
     ORDER BY distance ASC LIMIT ?
 """
 
 
 def _semantic_rows(conn, query_blob: bytes, model: str, dim: int,
-                   limit: int) -> list[dict]:
-    """Nearest articles to a query vector among one model's embeddings."""
+                   limit: int, filters=None) -> list[dict]:
+    """Nearest articles to a query vector among one model's embeddings,
+    among those a SearchFilter keeps (see filter_ids)."""
+    ids = filter_ids(conn, filters)
+    if ids is None:
+        sql, params = _SEMANTIC_SQL.format(where=""), (query_blob, model, dim, limit)
+    elif not ids:
+        return []
+    else:
+        sql = _SEMANTIC_SQL.format(where=FILTER_SQL)
+        params = (query_blob, model, dim, json.dumps(ids), limit)
     results = []
-    for row in conn.execute(_SEMANTIC_SQL, (query_blob, model, dim, limit)):
+    for row in conn.execute(sql, params):
         r = dict(row)
         r["similarity"] = 1.0 - r.pop("distance")
         results.append(r)
@@ -382,19 +391,22 @@ class EmbeddingIndex:
             count += len(batch)
         return count
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
+    def search(self, query: str, limit: int = 10,
+               filters=None) -> list[dict]:
         """Semantic search: a brute-force scan with vector_distance_cos."""
         query_blob, dim = self._embed_query(query)
-        return _semantic_rows(self.conn, query_blob, self.model, dim, limit)
+        return _semantic_rows(self.conn, query_blob, self.model, dim, limit,
+                              filters)
 
     @staticmethod
-    def _fts_rows(conn, query: str, limit: int) -> list[dict]:
-        return fts_rows(conn, query, limit)
+    def _fts_rows(conn, query: str, limit: int, filters=None) -> list[dict]:
+        return fts_rows(conn, query, limit, filters=filters)
 
     def hybrid_search(self, query: str, limit: int = 10,
                       fts_weight: float = 1.0,
                       semantic_weight: float = 1.0,
-                      k: int = 60, raw: bool = False) -> list[dict]:
+                      k: int = 60, raw: bool = False,
+                      filters=None) -> list[dict]:
         """Hybrid search combining FTS5 keyword and vector semantic results.
 
         Uses Reciprocal Rank Fusion (RRF) to merge two ranked lists,
@@ -408,12 +420,13 @@ class EmbeddingIndex:
             semantic_weight: weight for semantic results (default 1.0)
             k: RRF constant (default 60, standard value)
             raw: if True, skip dedup/quality filtering
+            filters: a SearchFilter of the articles to keep (see filter_ids)
         """
         query_blob, dim = self._embed_query(query)
         scores: dict = {}
-        fts_results = self._fts_rows(self.conn, query, limit * 3)
+        fts_results = self._fts_rows(self.conn, query, limit * 3, filters)
         semantic_results = _semantic_rows(self.conn, query_blob, self.model,
-                                          dim, limit * 3)
+                                          dim, limit * 3, filters)
         _rrf(scores, fts_results, semantic_results, None,
              fts_weight, semantic_weight, k)
         ranked = sorted(scores.values(), key=lambda x: x["rrf_score"], reverse=True)
@@ -491,12 +504,12 @@ class EmbeddingIndex:
         return selected
 
     def _peer_semantic(self, conn, peer_name: str, query_blob: bytes,
-                       dim: int, limit: int) -> list[dict]:
+                       dim: int, limit: int, filters=None) -> list[dict]:
         """A peer's semantic hits; [] with a warning when its embeddings
         are from another model or dimension than the query's."""
         if not _has_embeddings_table(conn):
             return []
-        rows = _semantic_rows(conn, query_blob, self.model, dim, limit)
+        rows = _semantic_rows(conn, query_blob, self.model, dim, limit, filters)
         if not rows:
             other = conn.execute(
                 "SELECT model, dimensions FROM embeddings"
@@ -511,11 +524,12 @@ class EmbeddingIndex:
         return rows
 
     def search_all(self, query: str, peers: list[dict],
-                   limit: int = 10) -> list[dict]:
+                   limit: int = 10, filters=None) -> list[dict]:
         """Semantic search across local and all peers."""
         query_blob, dim = self._embed_query(query)
         results = []
-        for r in _semantic_rows(self.conn, query_blob, self.model, dim, limit):
+        for r in _semantic_rows(self.conn, query_blob, self.model, dim, limit,
+                                filters):
             r["_crucible"] = "local"
             results.append(r)
 
@@ -530,7 +544,7 @@ class EmbeddingIndex:
                 conn = DictConnection(libsql.connect(peer_db))
                 try:
                     for r in self._peer_semantic(conn, peer["name"], query_blob,
-                                                 dim, limit):
+                                                 dim, limit, filters):
                         r["_crucible"] = peer["name"]
                         results.append(r)
                 finally:
@@ -545,7 +559,8 @@ class EmbeddingIndex:
                           limit: int = 10,
                           fts_weight: float = 1.0,
                           semantic_weight: float = 1.0,
-                          k: int = 60, raw: bool = False) -> list[dict]:
+                          k: int = 60, raw: bool = False,
+                          filters=None) -> list[dict]:
         """Hybrid search across local and all peers with RRF reranking.
 
         Results are deduplicated as in hybrid_search unless raw is set.
@@ -566,8 +581,9 @@ class EmbeddingIndex:
                     vectors[(scope, aid)] = v
 
         collect(self.conn, (False, "local"),
-                self._fts_rows(self.conn, query, limit * 3),
-                _semantic_rows(self.conn, query_blob, self.model, dim, limit * 3))
+                self._fts_rows(self.conn, query, limit * 3, filters),
+                _semantic_rows(self.conn, query_blob, self.model, dim, limit * 3,
+                               filters))
 
         for peer in peers:
             peer_db = _peer_db_path(peer)
@@ -581,9 +597,9 @@ class EmbeddingIndex:
                 conn = DictConnection(libsql.connect(peer_db))
                 try:
                     collect(conn, (True, name),
-                            self._fts_rows(conn, query, limit * 3),
+                            self._fts_rows(conn, query, limit * 3, filters),
                             self._peer_semantic(conn, name, query_blob, dim,
-                                                limit * 3))
+                                                limit * 3, filters))
                 finally:
                     conn.close()
             except Exception as e:

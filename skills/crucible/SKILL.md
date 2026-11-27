@@ -50,6 +50,8 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Seal older sources | `crucible seal [KEYS...]` |
 | Sync wiki to database | `crucible sync` |
 | Search articles | `crucible search "query"` |
+| Search within tags/types | `crucible search "query" --tag dft --type method` |
+| Tag hierarchy | `crucible concepts --tree` (from `#+TAGS:` groups in `.crucible/taxonomy.org`) |
 | List concepts | `crucible concepts` |
 | Articles for a concept | `crucible concept thermodynamics` |
 | Backlinks to article | `crucible backlinks .crucible/wiki/concepts/x.org` |

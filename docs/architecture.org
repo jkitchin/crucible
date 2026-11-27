@@ -18,8 +18,9 @@ maintaining the knowledge base.
 
 The wiki graph database (=.crucible/crucible.db=) models three entity
 types and their relationships. It holds nothing that is not in the
-committed files: it is rebuilt from the wiki articles and
-=.crucible/references.bib=, and a rebuild gives the same database.
+committed files: it is rebuilt from the wiki articles,
+=.crucible/references.bib= and =.crucible/taxonomy.org=, and a rebuild
+gives the same database.
 
 ** Entity Tables
 
@@ -96,6 +97,16 @@ Many-to-many: which sources an article was distilled from.
 *** article_concepts
 
 Many-to-many: which concepts an article covers.
+
+*** tag_hierarchy
+
+=(parent, child)= pairs of tag names from the =#+TAGS: [ parent : child
+... ]= group tags of =.crucible/taxonomy.org=, replaced on every sync.
+Names are compared by the same key as concepts (case, spaces,
+underscores and dashes ignored), so a group tag such as =methods= need
+not be any article's tag. Search filters expand a tag to the closure of
+its children in the database being searched, so a peer uses its own
+hierarchy; a peer database from before this table existed has none.
 
 *** article_links
 

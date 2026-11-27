@@ -142,6 +142,20 @@ crucible search "neural networks" --all
 The =--all= flag searches your local crucible and every other crucible in
 the global registry. Works with all search modes (FTS, semantic, hybrid).
 
+** Filtering by Tag and Type
+
+#+BEGIN_SRC bash
+crucible search "barrier height" --tag dft
+crucible search "barrier height" --tag dft --tag zeolite --type method
+#+END_SRC
+
+=--tag= keeps only the articles whose =#+FILETAGS:= include the tag, and
+=--type= only articles of that type. The filters are applied before the
+result limit, so =-n 5= still gives you five results, all of them
+tagged. Several =--tag= options must all match; several =--type= options
+allow any of them. When the crucible has a taxonomy (see [[*Organizing Tags
+into a Hierarchy]]), a tag also matches the narrower tags under it.
+
 * Navigating the Wiki
 
 ** Browsing Concepts
@@ -150,6 +164,62 @@ the global registry. Works with all search modes (FTS, semantic, hybrid).
 crucible concepts                       # list all topics
 crucible concept thermodynamics         # articles on a topic
 #+END_SRC
+
+** Organizing Tags into a Hierarchy
+
+Tags are flat by default: an article tagged =dft= knows nothing about
+electronic structure methods in general. A taxonomy groups tags under
+broader ones, so that searching for the broad tag finds everything
+beneath it. It lives in =.crucible/taxonomy.org= and uses org-mode's own
+group tag syntax, so Emacs reads the same hierarchy in tag searches and
+the agenda. For a catalysis wiki it might look like this:
+
+#+BEGIN_SRC org
+,#+TITLE: Taxonomy
+,#+TAGS: [ methods : electronic_structure molecular_dynamics microkinetics ]
+,#+TAGS: [ electronic_structure : dft coupled_cluster ]
+,#+TAGS: [ materials : porous metals oxides ]
+,#+TAGS: [ porous : zeolite mof ]
+,#+TAGS: [ catalysts : zeolite metals ]
+#+END_SRC
+
+Each =[ parent : children ]= group makes the children narrower tags of the
+parent. A child that is itself a group (=electronic_structure= here)
+nests the hierarchy another level, and a tag may sit under more than one
+parent: =zeolite= is both a porous material and a catalyst. Org's
+={ parent : children }= form works too. Regular expression members such as
+={P@.+}= are skipped with a warning, as are cycles.
+
+Run =crucible sync= after editing the file. Then searching for a broad
+tag finds the articles tagged with any tag under it:
+
+#+BEGIN_SRC bash
+crucible search "barrier" --tag electronic_structure   # dft and coupled_cluster articles
+crucible search "barrier" --tag methods --exact        # only articles tagged methods itself
+crucible concepts --tree
+#+END_SRC
+
+=crucible concepts --tree= prints the hierarchy with each tag's article
+count rolled up from the tags beneath it, then lists the tags your
+articles use that the taxonomy does not mention yet, which are the
+candidates for placing next:
+
+#+BEGIN_EXAMPLE
+  methods (14 articles)
+    electronic_structure (11 articles)
+      dft (9 articles)
+      coupled_cluster (2 articles)
+    molecular_dynamics (3 articles)
+    microkinetics (0 articles)
+  materials (8 articles)
+  ...
+
+Not in the taxonomy:
+  enzymes (2 articles)
+#+END_EXAMPLE
+
+The taxonomy is committed with the wiki, so a clone gets it too. With
+=--all=, each crucible expands tags with its own taxonomy.
 
 ** Following Links
 
