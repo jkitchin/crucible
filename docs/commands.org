@@ -323,6 +323,9 @@ crucible search QUERY [OPTIONS]
 | =--fts-weight= | FTS weight for hybrid RRF (default: 1.0) |
 | =--semantic-weight= | Semantic weight for hybrid RRF (default: 1.0) |
 | =--raw= | Skip dedup/quality filtering |
+| =-t=, =--tag TAG= | Only articles with this tag (or a tag under it in the taxonomy); repeat to require several |
+| =--exact= | Match =--tag= only itself, not the tags under it |
+| =--type TYPE= | Only articles of this type (concept, summary, comparison, method); repeat to allow several |
 | =-j=, =--json= | Output as JSON |
 
 Modes:
@@ -348,6 +351,26 @@ with a warning on stderr. So does any peer left out entirely: one with no
 database (a stale entry) or whose database cannot be read is named in a
 warning, rather than silently contributing nothing. =crucible concepts
 --all= warns the same way.
+
+=--tag= and =--type= restrict every mode to matching articles before the
+limit is applied, so =crucible search "barrier height" --tag dft -n 5=
+returns the five best hits among articles tagged =dft=, not the subset of
+the overall top five that happens to carry the tag. Tags are the
+=#+FILETAGS:= of an article and match as =crucible concept= matches
+names, ignoring case, spaces, underscores and dashes. Several =--tag=
+options require all of them (=--tag dft --tag zeolite=); several =--type=
+options allow any of them. With =--all= the filters apply in each
+crucible searched. A tag no local article carries gets a warning on
+stderr, since it is most likely a typo.
+
+When =.crucible/taxonomy.org= defines a tag hierarchy, a tag also
+matches every tag under it, so =--tag electronic_structure= finds
+articles tagged =dft=. =--exact= turns that off. The file uses org-mode
+group tags, =#+TAGS: [ parent : child1 child2 ]=; a child that is a group
+of its own nests the hierarchy, and a tag may have several parents. It is
+loaded by =crucible sync=, which warns about regular expression members
+(not supported) and cycles. With =--all= each crucible expands tags with
+its own taxonomy. See the tutorial for a worked example.
 
 Content from other crucibles is labelled as untrusted, since it was
 written by someone else and is often read by an agent. When any result
@@ -406,10 +429,16 @@ source matches.
 List all concepts with article counts.
 
 #+BEGIN_SRC bash
-crucible concepts [--all]
+crucible concepts [--all | --tree]
 #+END_SRC
 
-=--all= includes the concepts of every registered crucible.
+=--all= includes the concepts of every registered crucible. =--tree=
+shows the tag hierarchy of =.crucible/taxonomy.org= (see =crucible
+search=), each count including the articles of the tags under it, and
+then the tags the taxonomy leaves out. With =--json= it returns ={"tree":
+[...], "unplaced": [...]}=, each node having =name=, =article_count=
+(rolled up), =direct_count= and =children=. It shows one crucible, so it
+cannot be combined with =--all=.
 
 ** =crucible concept=
 
@@ -421,7 +450,8 @@ crucible concept thermodynamics
 
 Concepts come from =#+FILETAGS:=. The name is matched ignoring case, spaces,
 underscores, dashes and apostrophes, so =crucible concept "activation energy"= finds the tag
-=activation_energy=.
+=activation_energy=. Unlike =crucible search --tag=, it does not expand
+the taxonomy: it lists the articles tagged with that name only.
 
 ** =crucible related=
 

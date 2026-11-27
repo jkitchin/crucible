@@ -9,9 +9,12 @@ import json
 import re
 import unicodedata
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import libsql
+
+ARTICLE_TYPES = ("concept", "summary", "comparison", "method")
 
 
 def _concept_key(name: str) -> str:
@@ -160,6 +163,14 @@ CREATE TABLE IF NOT EXISTS article_concepts (
     article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
     concept_id INTEGER REFERENCES concepts(id) ON DELETE CASCADE,
     PRIMARY KEY (article_id, concept_id)
+);
+
+-- The tag hierarchy, from the #+TAGS: group tags of .crucible/taxonomy.org:
+-- searching for parent also finds the articles tagged child
+CREATE TABLE IF NOT EXISTS tag_hierarchy (
+    parent TEXT NOT NULL,
+    child TEXT NOT NULL,
+    PRIMARY KEY (parent, child)
 );
 
 -- Directed links between articles (the wiki graph)
@@ -387,7 +398,94 @@ def _fts_prefix_res(raw: str, joined: bool = False) -> list[list[re.Pattern]]:
     return patterns
 
 
-def fts_rows(conn, query: str, limit: int, tiers: bool = False) -> list[dict]:
+@dataclass(frozen=True)
+class SearchFilter:
+    """Which articles a search may return.
+
+    tags: an article must carry every one. A tag also matches the tags
+    under it in the crucible's taxonomy (.crucible/taxonomy.org), unless
+    exact is set. types: an article must be of one of them.
+    """
+    tags: tuple[str, ...] = ()
+    types: tuple[str, ...] = ()
+    exact: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(self, "tags", tuple(
+            t.strip() for t in self.tags if t and t.strip()))
+        object.__setattr__(self, "types", tuple(
+            t.strip().lower() for t in self.types if t and t.strip()))
+
+    def __bool__(self):
+        return bool(self.tags or self.types)
+
+
+def tag_children(conn) -> dict[str, set[str]]:
+    """The _concept_key of each tag's children in the taxonomy, by the key
+    of the tag. Empty for a database from before tag_hierarchy existed,
+    such as an older peer's."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                    " AND name = 'tag_hierarchy'").fetchone() is None:
+        return {}
+    children: dict[str, set[str]] = {}
+    for r in conn.execute("SELECT parent, child FROM tag_hierarchy"):
+        children.setdefault(_concept_key(r["parent"]), set()).add(_concept_key(r["child"]))
+    return children
+
+
+def tag_closure(key: str, children: dict[str, set[str]]) -> set[str]:
+    """KEY and the keys of every tag under it; a cycle ends the walk."""
+    found, todo = {key}, [key]
+    while todo:
+        for child in children.get(todo.pop(), ()):
+            if child not in found:
+                found.add(child)
+                todo.append(child)
+    return found
+
+
+def filter_ids(conn, filters: SearchFilter | None = None) -> list[int] | None:
+    """Ids of the articles a SearchFilter keeps, or None for no filter.
+
+    A tag is matched by _concept_key, so "activation energy" finds
+    ``activation_energy``, and with the tags under it in this database's
+    taxonomy unless filters.exact. A tag no article carries keeps nothing.
+    """
+    if not filters:
+        return None
+    keep: set[int] | None = None
+    if filters.tags:
+        by_key: dict[str, list[int]] = {}
+        for r in conn.execute("SELECT id, name FROM concepts"):
+            by_key.setdefault(_concept_key(r["name"]), []).append(r["id"])
+        children = {} if filters.exact else tag_children(conn)
+        for tag in filters.tags:
+            cids = [cid for key in tag_closure(_concept_key(tag), children)
+                    for cid in by_key.get(key, ())]
+            if not cids:
+                return []
+            marks = ",".join("?" * len(cids))
+            tagged = {r["article_id"] for r in conn.execute(
+                f"SELECT article_id FROM article_concepts"
+                f" WHERE concept_id IN ({marks})", tuple(cids))}
+            keep = tagged if keep is None else keep & tagged
+            if not keep:
+                return []
+    if filters.types:
+        marks = ",".join("?" * len(filters.types))
+        typed = {r["id"] for r in conn.execute(
+            f"SELECT id FROM articles WHERE article_type IN ({marks})", filters.types)}
+        keep = typed if keep is None else keep & typed
+    return sorted(keep)
+
+
+# Restricts a query over articles a to the ids of a JSON list, which has no
+# limit on its length as SQL parameters do.
+FILTER_SQL = " AND a.id IN (SELECT value FROM json_each(?))"
+
+
+def fts_rows(conn, query: str, limit: int, tiers: bool = False,
+             filters=None) -> list[dict]:
     """Rows of articles matching a raw search query, best first, at most limit.
 
     Each row is an article with its FTS rank. A prefix token is matched
@@ -399,17 +497,23 @@ def fts_rows(conn, query: str, limit: int, tiers: bool = False) -> list[dict]:
     With `tiers`, each row has "_fts_tier": 0 for a row article_fts finds,
     as it always has, and 1 for one only the joined subscripts find, so
     results from several crucibles can be merged with the tier-1 rows last.
+    `filters`, a SearchFilter, keeps only the articles filter_ids keeps.
     """
     match = _fts_query(query)
     if not match:
         return []
+    ids = filter_ids(conn, filters)
+    if ids is not None and not ids:
+        return []
+    where = "" if ids is None else FILTER_SQL
+    id_params = () if ids is None else (json.dumps(ids),)
     prefixes = _fts_prefix_res(query)
     joined_prefixes = _fts_prefix_res(query, joined=True)
     sql = """
         SELECT a.*, rank, fts.title AS _fts_title, fts.content AS _fts_content{extra}
         FROM {table} fts
         JOIN articles a ON a.id = fts.rowid
-        WHERE {table} MATCH ?
+        WHERE {table} MATCH ?{where}
         ORDER BY rank
     """
     # (table, match, tier): article_fts first, which finds and ranks rows
@@ -452,13 +556,15 @@ def fts_rows(conn, query: str, limit: int, tiers: bool = False) -> list[dict]:
             found = fetched[(table, query_match)]
         elif prefixes:
             found = fetched[(table, query_match)] = [dict(row) for row in conn.execute(
-                sql.format(table=table, extra=extra[table]), (query_match,))]
+                sql.format(table=table, extra=extra[table], where=where),
+                (query_match, *id_params))]
         else:
             fetched[(table, query_match)] = None
             # The FTS match is exact, so SQL can stop at limit, past the
             # rows already found.
-            found = conn.execute(sql.format(table=table, extra=extra[table]) + " LIMIT ?",
-                                 (query_match, limit + len(seen)))
+            found = conn.execute(
+                sql.format(table=table, extra=extra[table], where=where) + " LIMIT ?",
+                (query_match, *id_params, limit + len(seen)))
         for row in found:
             r = dict(row)
             title, content = r.pop("_fts_title") or "", r.pop("_fts_content") or ""
@@ -627,10 +733,12 @@ class CrucibleDB:
         return db
 
     def search_all(self, query: str, limit: int = 20,
-                   peers: list[dict] | None = None) -> list[dict]:
+                   peers: list[dict] | None = None,
+                   filters=None) -> list[dict]:
         """FTS search across this crucible and peers.
 
         peers: list of dicts with 'name' and 'path' keys (from registry).
+        filters: a SearchFilter, applied in each crucible (see filter_ids).
         """
         if peers is None:
             peers = []
@@ -640,7 +748,8 @@ class CrucibleDB:
             return []
         results = []
         # Local
-        for r in fts_rows(self.conn, query, limit, tiers=True):
+        for r in fts_rows(self.conn, query, limit, tiers=True,
+                          filters=filters):
             r["_crucible"] = "local"
             results.append(r)
         # Peers (separate connections, since FTS5 MATCH doesn't work via ATTACH)
@@ -651,7 +760,8 @@ class CrucibleDB:
             name = peer["name"]
 
             def do_search(conn, _name=name):
-                rows = fts_rows(conn, query, limit, tiers=True)
+                rows = fts_rows(conn, query, limit, tiers=True,
+                                filters=filters)
                 for r in rows:
                     r["_crucible"] = _name
                 return rows
@@ -1008,6 +1118,73 @@ class CrucibleDB:
             self.conn.execute(sql, (article_id,))
         self.conn.commit()
 
+    def set_tag_hierarchy(self, pairs):
+        """Replace the tag hierarchy with these (parent, child) pairs."""
+        self.conn.execute("DELETE FROM tag_hierarchy")
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO tag_hierarchy (parent, child) VALUES (?, ?)",
+            list(pairs))
+
+    def tag_hierarchy(self) -> list[dict]:
+        """The (parent, child) pairs of the tag hierarchy, in file order."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT parent, child FROM tag_hierarchy ORDER BY rowid")]
+
+    def concept_tree(self) -> dict:
+        """The tag hierarchy with article counts rolled up from below.
+
+        Returns {"tree": [node, ...], "unplaced": [node, ...]}. A node is
+        {"name", "article_count", "direct_count", "children"}: article_count
+        counts the distinct articles tagged with the tag or any tag under
+        it, direct_count those tagged with it alone. The tree's roots are
+        the taxonomy's tags with no parent; a tag with several parents
+        appears under each, and a cycle is cut where it would repeat.
+        "unplaced" lists the tags articles use that the taxonomy leaves
+        out, most used first.
+        """
+        names: dict[str, str] = {}
+        parents: dict[str, set[str]] = {}
+        children: dict[str, list[str]] = {}
+        for r in self.tag_hierarchy():
+            pk, ck = _concept_key(r["parent"]), _concept_key(r["child"])
+            names.setdefault(pk, r["parent"])
+            names.setdefault(ck, r["child"])
+            if ck not in children.setdefault(pk, []):
+                children[pk].append(ck)
+            parents.setdefault(ck, set()).add(pk)
+        tagged: dict[str, set[int]] = {}
+        for r in self.conn.execute(
+                "SELECT c.name, ac.article_id FROM concepts c"
+                " JOIN article_concepts ac ON ac.concept_id = c.id"):
+            key = _concept_key(r["name"])
+            names.setdefault(key, r["name"])
+            tagged.setdefault(key, set()).add(r["article_id"])
+        in_taxonomy = set(children) | set(parents)
+        child_sets = {k: set(v) for k, v in children.items()}
+
+        def node(key: str, path: frozenset) -> dict:
+            below = [node(c, path | {key}) for c in children.get(key, ()) if c not in path]
+            articles: set[int] = set()
+            for k in tag_closure(key, child_sets):
+                articles |= tagged.get(k, set())
+            return {"name": names[key], "article_count": len(articles),
+                    "direct_count": len(tagged.get(key, ())), "children": below}
+
+        roots = [k for k in names if k in in_taxonomy and not parents.get(k)]
+        reached: set[str] = set()
+        for k in roots:
+            reached |= tag_closure(k, child_sets)
+        # Tags only a cycle leads to have no root above them: the first of
+        # them, in file order, roots the rest.
+        for k in names:
+            if k in in_taxonomy and k not in reached:
+                roots.append(k)
+                reached |= tag_closure(k, child_sets)
+        unplaced = sorted((k for k in tagged if k not in in_taxonomy),
+                          key=lambda k: (-len(tagged[k]), names[k]))
+        return {"tree": [node(k, frozenset()) for k in roots],
+                "unplaced": [node(k, frozenset()) for k in unplaced]}
+
     def prune_unused_concepts(self):
         """Delete concepts that no article is tagged with.
 
@@ -1026,9 +1203,11 @@ class CrucibleDB:
 
     # -- Queries --
 
-    def search(self, query: str, limit: int = 20) -> list[dict]:
-        """Full-text search over article content."""
-        return fts_rows(self.conn, query, limit)
+    def search(self, query: str, limit: int = 20,
+               filters=None) -> list[dict]:
+        """Full-text search over article content, optionally restricted by
+        a SearchFilter (see filter_ids)."""
+        return fts_rows(self.conn, query, limit, filters=filters)
 
     def backlinks(self, article_path: str) -> list[dict]:
         """Articles that link TO the given article."""
