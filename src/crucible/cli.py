@@ -2935,15 +2935,9 @@ def viz(output, open_browser):
 
 
 
-@cli.command()
-@click.option("--port", "-p", default=8088, type=int, help="Port number (default: 8088)")
-@click.option("--no-open", is_flag=True, help="Don't open browser automatically")
-def browse(port, no_open):
-    """Browse the wiki in your web browser.
-
-    Starts a local HTTP server that renders org-mode articles as HTML
-    with working inter-file links, search, and sidebar navigation.
-    """
+def _serve_wiki(port: int, no_open: bool, page: str = "",
+                ollama_url: str | None = None) -> None:
+    """Serve the wiki browser on port, opening it at page, until Ctrl+C."""
     import subprocess
     import webbrowser
 
@@ -2993,17 +2987,18 @@ def browse(port, no_open):
     try:
         server = start_server(wiki_dir, db_path, articles, port=port,
                               project_name=project_name,
-                              github_url=github_url)
+                              github_url=github_url, ollama_url=ollama_url)
     except OSError as e:
         raise click.ClickException(
             f"Cannot serve on port {port}: {e.strerror or e}. "
             "Is another server using it? Pick another with --port."
         )
-    url = f"http://localhost:{port}"
+    # The port actually bound (it differs from --port 0).
+    url = f"http://localhost:{server.server_address[1]}"
     click.echo(f"Serving {project_name} wiki at {url}  (Ctrl+C to stop)")
 
     if not no_open:
-        webbrowser.open(url)
+        webbrowser.open(url + page)
 
     try:
         server.serve_forever()
@@ -3011,6 +3006,58 @@ def browse(port, no_open):
         click.echo("\nStopped.")
         server.server_close()
 
+
+
+@cli.command()
+@click.option("--port", "-p", default=8088, type=int, help="Port number (default: 8088)")
+@click.option("--no-open", is_flag=True, help="Don't open browser automatically")
+def browse(port, no_open):
+    """Browse the wiki in your web browser.
+
+    Starts a local HTTP server that renders org-mode articles as HTML
+    with working inter-file links, search, and sidebar navigation.
+    """
+    _serve_wiki(port, no_open)
+
+
+@cli.command()
+@click.option("--port", "-p", default=8088, type=int, help="Port number (default: 8088)")
+@click.option("--no-open", is_flag=True, help="Don't open browser automatically")
+@click.option("--interval", default=5.0, show_default=True,
+              type=click.FloatRange(1, 120), help="Seconds between updates")
+@click.option("--window", default=60.0, show_default=True,
+              type=click.FloatRange(10, 600),
+              help="Seconds of recent speech searched on each update")
+@click.option("--lang", default=None,
+              help="Speech language, a BCP 47 tag such as en-US "
+                   "(default: the browser's language)")
+@click.option("--url", envvar="CRUCIBLE_OLLAMA_URL",
+              default="http://localhost:11434/api/embed", show_envvar=True,
+              help="Ollama embed API URL")
+def listen(port, no_open, interval, window, lang, url):
+    """Listen to a meeting or conversation and show related articles live.
+
+    Opens the wiki browser's Listen page, which transcribes speech from
+    the microphone in the browser (the Web Speech API: Chrome, Edge or
+    Safari) and every few seconds shows the articles most related to the
+    last stretch of talk. An article appears once it has stayed relevant
+    over a few updates and fades as the conversation moves on. Articles
+    open in a new tab so listening continues, and "Save session" downloads
+    an org file of the articles shown and the transcript.
+
+    Speech is matched by its salient keywords and, when the wiki has
+    embeddings (`crucible embed`), by semantic similarity too.
+
+    Chrome and Edge send the audio to their vendor's speech service;
+    Safari can transcribe on the device. Only the microphone is heard,
+    so with headphones on, remote meeting participants are not.
+    """
+    import urllib.parse
+    query = {"interval": f"{interval:g}", "window": f"{window:g}"}
+    if lang:
+        query["lang"] = lang
+    _serve_wiki(port, no_open, page="/_listen?" + urllib.parse.urlencode(query),
+                ollama_url=url)
 
 @cli.command()
 @click.argument("file", required=False, default=None)
@@ -5599,6 +5646,7 @@ TYPICAL WORKFLOW
 
 6. Browse the wiki:
      crucible browse           # open in browser (localhost:8088)
+     crucible listen           # show related articles as a meeting goes
      crucible viz --open       # interactive knowledge graph
 
 7. Install skill for Claude Code:

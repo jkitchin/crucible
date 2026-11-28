@@ -74,6 +74,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Where registered crucibles come from | `crucible registry list` (shows `origin:`) |
 | Delete an article or source | `crucible delete PATH [--file] [-y]` |
 | Browse the wiki in a browser | `crucible browse [-p PORT] [--no-open]` |
+| Show related articles live during a meeting | `crucible listen [--interval S] [--window S] [--lang TAG]` |
 | Interactive knowledge graph | `crucible viz [-o FILE] [--open]` |
 | Install skill + point ~/.claude/CLAUDE.md here | `crucible install` |
 | Apply migrations, refresh skill after upgrading | `crucible update` |
