@@ -61,6 +61,7 @@ The wiki is your domain. The user rarely edits it directly. You read sources, yo
 | Derivation history | `crucible history .crucible/wiki/comparisons/x.org` |
 | Orphan articles | `crucible orphans` |
 | Undigested sources | `crucible undigested` |
+| Distill sources unattended with an agent | `crucible distill KEY... \| --all [--agent claude\|codex\|gemini\|CMD]` |
 | Regenerate index | `crucible index` |
 | Check wiki health | `crucible lint` |
 | Get suggestions | `crucible suggest` |
@@ -164,6 +165,12 @@ claude -p "ingest and distill this URL" \
    - **Citation keys**: how to reference this source
 
 Wait for user approval before proceeding.
+
+The exception is a run started by `crucible distill`, whose prompt says it
+is non-interactive: there, make the plan and carry it out without waiting,
+and mark new articles `:STATUS: draft`. In an interactive session, distill
+the source yourself rather than running `crucible distill`, which would
+start a second agent.
 
 **Write phase** - After approval:
 
