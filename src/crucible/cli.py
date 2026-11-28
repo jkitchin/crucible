@@ -14,6 +14,7 @@ from typing import NoReturn
 
 import click
 
+from crucible import completion as _complete
 from crucible import package_version
 from crucible import registry as registry_module
 from crucible.database import ARTICLE_TYPES, CrucibleDB, SearchFilter, filter_ids, fts_joined
@@ -995,7 +996,7 @@ def record(source, title, author, amends, json_output):
 
 
 @cli.command()
-@click.argument("keys", nargs=-1)
+@click.argument("keys", nargs=-1, shell_complete=_complete.source_keys)
 @json_option
 def seal(keys, json_output):
     """Seal sources ingested before sealing existed.
@@ -1799,7 +1800,7 @@ def registry_add(name, path, description, origin):
 
 
 @registry.command("remove")
-@click.argument("name")
+@click.argument("name", shell_complete=_complete.registered_names)
 def registry_remove(name):
     """Remove a crucible from the global registry."""
     from crucible.registry import RegistryError, unregister
@@ -2110,7 +2111,7 @@ def _served_crucibles(names, warn):
 
 
 @cli.command("mcp")
-@click.argument("names", nargs=-1)
+@click.argument("names", nargs=-1, shell_complete=_complete.registered_names)
 @click.option("--http", "use_http", is_flag=True,
               help="Serve over streamable HTTP instead of stdio")
 @click.option("--host", default="127.0.0.1", show_default=True,
@@ -2212,7 +2213,7 @@ def mcp_command(names, use_http, host, port, token_env, no_token,
 
 
 @cli.command()
-@click.argument("names", nargs=-1)
+@click.argument("names", nargs=-1, shell_complete=_complete.registered_names)
 @click.option("--all", "pull_all", is_flag=True,
               help="Pull every crucible made by `crucible clone`")
 def pull(names, pull_all):
@@ -2519,7 +2520,7 @@ def _resolve_article_arg(root: Path, db: CrucibleDB, article_path: str) -> str:
 
 
 @cli.command()
-@click.argument("article_path")
+@click.argument("article_path", shell_complete=_complete.article_paths)
 @json_option
 def history(article_path, json_output):
     """Show the derivation history of an article.
@@ -2565,7 +2566,7 @@ def history(article_path, json_output):
 
 
 @cli.command()
-@click.argument("article_path")
+@click.argument("article_path", shell_complete=_complete.article_paths)
 @json_option
 def backlinks(article_path, json_output):
     """Show articles that link to the given article.
@@ -2638,7 +2639,7 @@ def _source_key(src: dict) -> str:
 
 
 @cli.command("source")
-@click.argument("source_path")
+@click.argument("source_path", shell_complete=_complete.source_keys)
 @json_option
 def source_info(source_path, json_output):
     """Show everything known about a source.
@@ -2753,7 +2754,7 @@ def _run_distill(root: Path, sources: list[dict], agent: str, dry_run: bool,
 
 
 @cli.command()
-@click.argument("sources", nargs=-1)
+@click.argument("sources", nargs=-1, shell_complete=_complete.source_keys)
 @click.option("--all", "all_undigested", is_flag=True,
               help="Distill every source no article cites yet")
 @click.option("--agent", envvar="CRUCIBLE_AGENT", default="claude",
@@ -2856,7 +2857,7 @@ def distill(sources, all_undigested, agent, dry_run, yes, timeout):
 
 
 @cli.command()
-@click.argument("article_path")
+@click.argument("article_path", shell_complete=_complete.article_paths)
 @json_option
 def sources(article_path, json_output):
     """Show primary sources for an article.
@@ -2966,7 +2967,7 @@ def _print_concept_tree(result: dict) -> None:
 
 
 @cli.command()
-@click.argument("name")
+@click.argument("name", shell_complete=_complete.concept_names)
 @json_option
 def concept(name, json_output):
     """Show articles covering a concept.
@@ -3025,7 +3026,7 @@ def undigested(json_output):
 
 
 @cli.command()
-@click.argument("article_path")
+@click.argument("article_path", shell_complete=_complete.article_paths)
 @json_option
 def related(article_path, json_output):
     """Show articles related through implied links.
@@ -5792,8 +5793,70 @@ def _commands_reference() -> str:
     return "\n".join(lines)
 
 
+@cli.command("completion")
+@click.argument("shell", required=False,
+                type=click.Choice(_complete.SHELLS))
+@click.option("--install", is_flag=True,
+              help="Save the script and load it from your shell's startup file")
+def completion_cmd(shell, install):
+    """Set up tab completion for crucible in bash, zsh or fish.
+
+    Completes commands, options, and the values arguments take: source
+    cite keys (distill, source, seal), article paths, concept names,
+    registered crucibles and help topics, read from the crucible you are
+    in. SHELL defaults to the one $SHELL names.
+
+    Without --install, prints the script, to load by hand:
+
+    \b
+      crucible completion bash > ~/.crucible/completion.bash
+      echo '. ~/.crucible/completion.bash' >> ~/.bashrc
+
+    --install does that for you: bash and zsh get the script saved under
+    ~/.crucible/ and one line in ~/.bashrc (~/.bash_profile when that
+    does not load ~/.bashrc) or ~/.zshrc; fish gets
+    ~/.config/fish/completions/crucible.fish. Running it again refreshes
+    the script and leaves the startup file alone. Open a new shell after.
+    The bash script works with macOS's bash 3.2.
+    """
+    shell = shell or _complete.detect_shell()
+    if shell is None:
+        raise click.UsageError(
+            "Cannot tell your shell from $SHELL; name it: "
+            "crucible completion bash|zsh|fish")
+    text = _complete.script(cli, shell)
+    if not install:
+        click.echo(text, nl=False)
+        return
+
+    home = Path.home()
+    target, rc = _complete.install_targets(shell, home)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    except OSError as e:
+        raise click.ClickException(f"Cannot write {target}: {_os_error_text(e, target)}")
+    click.echo(f"Wrote the {shell} completion script to {target}")
+    if rc is not None:
+        try:
+            current = rc.read_text(encoding="utf-8", errors="replace") if rc.exists() else ""
+        except OSError as e:
+            raise click.ClickException(f"Cannot read {rc}: {_os_error_text(e, rc)}")
+        if _complete.RC_MARKER in current:
+            click.echo(f"{rc} already loads it.")
+        else:
+            sep = "" if not current or current.endswith("\n") else "\n"
+            try:
+                with rc.open("a", encoding="utf-8") as f:
+                    f.write(sep + "\n" + _complete.rc_line(target, home))
+            except OSError as e:
+                raise click.ClickException(f"Cannot update {rc}: {_os_error_text(e, rc)}")
+            click.echo(f"Added a line to {rc} that loads it.")
+    click.echo("Open a new shell (or source the startup file) to use it.")
+
+
 @cli.command("help")
-@click.argument("topic", default="overview")
+@click.argument("topic", default="overview", shell_complete=_complete.help_topics)
 def help_cmd(topic):
     """Show detailed help for agents and humans.
 
@@ -5871,6 +5934,9 @@ TYPICAL WORKFLOW
 
 7. Install skill for Claude Code:
      crucible install          # copies skill to ~/.claude/skills/crucible/
+
+8. Tab completion for your shell:
+     crucible completion --install
 """,
         "ingest": """
 INGEST COMMAND

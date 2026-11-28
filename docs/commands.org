@@ -1020,6 +1020,34 @@ call taken on headphones the remote participants are not transcribed.
 
 * Meta Commands
 
+** =crucible completion=
+
+Set up tab completion in bash, zsh or fish.
+
+#+BEGIN_SRC bash
+crucible completion [bash|zsh|fish] [--install]
+#+END_SRC
+
+Tab then completes commands and options, and the values arguments take:
+source cite keys (=distill=, =source=, =seal=), article paths (=related=,
+=backlinks= and the like, relative to the wiki as =concepts/x.org=, or from
+the project root when the path typed starts with =.=), concept names,
+registered crucibles (=pull=, =mcp=, =registry remove=) and help topics.
+The values come from the crucible you are in, read without changing it.
+
+Without =--install= the script is printed, to load however you like. With
+it, bash and zsh get the script saved as =~/.crucible/completion.SHELL= and
+a line in =~/.bashrc= or =~/.zshrc= that loads it (=~/.bash_profile= when
+that file does not load =~/.bashrc=, since a macOS Terminal starts a login
+shell), and fish gets =~/.config/fish/completions/crucible.fish=. Running
+it again refreshes the script, as after an upgrade adds commands, and
+leaves the startup file alone. The shell defaults to the one =$SHELL=
+names. The bash script works with the bash 3.2 macOS ships as =/bin/bash=.
+
+#+BEGIN_SRC bash
+crucible completion --install
+#+END_SRC
+
 ** =crucible about=
 
 Show the crucible version and schema version, the current project (its
