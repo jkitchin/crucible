@@ -95,6 +95,8 @@ SOURCE is a file path, URL, glob pattern, or =-= for stdin.
 | =--bibtex TEXT= | Full BibTeX entry, or =@file.bib= to read one from a file |
 | =--restore= | The file is the missing stored copy of the source with its name |
 | =-f=, =--filename TEXT= | Filename for stdin input |
+| =--distill= | Then distill the new sources (see =crucible distill=) |
+| =--agent TEXT= | The agent =--distill= runs (default: claude, or =$CRUCIBLE_AGENT=) |
 
 Examples:
 
@@ -198,6 +200,56 @@ no =sha256= yet. An entry that is already sealed is never resealed, so a
 changed file stays reported; to accept a change deliberately, remove the
 entry's =sha256= field by hand and seal it again. A key not in
 =references.bib= is an error (exit 1).
+
+** =crucible distill=
+
+Distill sources into wiki articles by running an LLM agent.
+
+#+BEGIN_SRC bash
+crucible distill [SOURCES...] [--all] [--agent AGENT] [-n] [-y] [--timeout SECONDS]
+#+END_SRC
+
+| Option | Description |
+|----------------+------------------------------------------------|
+| =--all= | Every source =crucible undigested= lists |
+| =--agent TEXT= | =claude=, =codex=, =gemini= or a command template (default: claude, or =$CRUCIBLE_AGENT=) |
+| =-n=, =--dry-run= | Show the sources and prompts without running the agent |
+| =-y=, =--yes= | Don't ask before distilling several sources |
+| =--timeout= | Give up on a source after this many seconds |
+
+Crucible has no model client of its own: distilling is the agent's
+work, guided by the crucible skill. This command runs an agent
+non-interactively in the project root, once per source, with a prompt
+that names the source's cite key, stored file and extracted text, and
+tells the agent to check what the wiki already covers, write a summary
+and concept articles (=:STATUS: draft=), touch only =.crucible/wiki/=,
+and run =crucible sync= and =crucible lint=. SOURCES are cite keys, paths
+or fragments, as for =crucible source=. After each run the database is
+synced and the source is reported distilled only if an article now
+cites it; the command exits 1 if any source was not.
+
+The agents:
+
+| Agent | Command |
+|--------+---------------------------------------------------------|
+| =claude= | =claude -p PROMPT --allowedTools 'Bash(crucible *)' Read Write Edit Glob Grep= |
+| =codex= | =codex exec --full-auto PROMPT= |
+| =gemini= | =gemini --yolo -p PROMPT= |
+
+Any other value is a command template, split as a shell would but run
+without one: the token ={prompt}= is replaced by the prompt as a single
+argument, and a template without it gets the prompt on stdin.
+
+#+BEGIN_SRC bash
+crucible distill smith2024
+crucible distill --all -y --agent codex
+export CRUCIBLE_AGENT='my-agent run --task {prompt}'
+crucible ingest paper.pdf --distill
+#+END_SRC
+
+An unattended run skips the plan-and-approve step of an interactive
+session, which is why its articles are drafts: review them afterwards
+(=crucible source KEY= lists them; git shows the changes).
 
 * Database Commands
 

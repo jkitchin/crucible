@@ -519,8 +519,12 @@ def init(root):
                    "Pass a path with --bibtex @file.bib to read from a file.")
 @click.option("--filename", "-f", default=None,
               help="Filename for stdin input (default: derived from title or timestamp)")
+@click.option("--distill", "then_distill", is_flag=True,
+              help="Then distill the new sources with an agent (see `crucible distill`)")
+@click.option("--agent", envvar="CRUCIBLE_AGENT", default="claude",
+              show_envvar=True, help="The agent --distill runs (default: claude)")
 def ingest(source, title, source_type, shareable, url, date, author, doi, restore,
-           bibtex, filename):
+           bibtex, filename, then_distill, agent):
     """Ingest a source into Crucible.
 
     SOURCE is a file path, URL, glob pattern, or - for stdin.
@@ -536,6 +540,8 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
       crucible ingest "notebooks/**/*.org" --type notebook
 
       cat notes.org | crucible ingest - --type notebook -t "Lab Notes 2026-04-03"
+
+      crucible ingest paper.pdf --distill
     """
     import glob as globmod
     import sys
@@ -570,8 +576,22 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
                 "pass exactly one entry per ingested source"
             )
 
+    if then_distill:
+        from crucible.distill import describe_agent
+        try:
+            describe_agent(agent)
+        except ValueError as e:
+            raise click.BadParameter(str(e), param_hint="'--agent'")
+
     root = get_root()
     db = get_db(root)
+    # Cite keys of the sources this run added, for --distill.
+    new_keys: list[str] = []
+
+    def noted(result: dict) -> dict:
+        if not result.get("duplicate"):
+            new_keys.append(result["cite_key"])
+        return result
 
     def run_ingest(path: Path, **overrides) -> dict:
         kwargs = dict(
@@ -582,7 +602,7 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
         )
         kwargs.update(overrides)
         try:
-            return ingest_source(**kwargs)
+            return noted(ingest_source(**kwargs))
         except ValueError as e:
             raise click.ClickException(str(e))
         except OSError as e:
@@ -651,12 +671,12 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
             click.echo(f"Ingesting {len(paths)} files...")
             for p in paths:
                 try:
-                    result = ingest_source(
+                    result = noted(ingest_source(
                         root=root, db=db, source_path=p,
                         title=None, source_type=source_type, shareable=shareable,
                         url=None, date=date, authors=list(author) if author else None,
                         restore=restore,
-                    )
+                    ))
                     for warning in result.get("warnings", ()):
                         click.echo(f"  Warning: {p}: {warning}", err=True)
                     if result.get("duplicate"):
@@ -665,7 +685,9 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
                         click.echo(f"  [{result['source_id']}] {result['title']} ({result['source_type']})")
                 except Exception as e:
                     click.echo(f"  SKIP {p}: {e}", err=True)
-            click.echo(f"\nDone. Run `crucible undigested` to see what needs distilling.")
+            if not then_distill:
+                click.echo("\nDone. Run `crucible distill --all` to distill them, "
+                           "or `crucible undigested` to see what needs distilling.")
         else:
             source_path = Path(source)
             if not source_path.exists():
@@ -679,6 +701,15 @@ def ingest(source, title, source_type, shareable, url, date, author, doi, restor
             _print_ingest_result(result)
 
     db.close()
+
+    if then_distill:
+        if not new_keys:
+            click.echo("Nothing new to distill.")
+            return
+        click.echo()
+        click.get_current_context().invoke(
+            distill, sources=tuple(new_keys), all_undigested=False, agent=agent,
+            dry_run=False, yes=True, timeout=None)
 
 
 def _read_bibtex_export(path: Path) -> str:
@@ -794,6 +825,9 @@ def _print_ingest_result(result: dict):
         click.echo("  Warning: no text extracted")
     click.echo()
     click.echo("Ready for distillation. Use citep:{} in articles.".format(result['cite_key']))
+    if not click.get_current_context().params.get("then_distill"):
+        click.echo("Next: `crucible distill {}`, or ask your agent to distill it."
+                   .format(result['cite_key']))
 
 
 _ORG_KEYWORD_RE = r"^[ \t]*#\+{}:[ \t]*(.*?)[ \t]*$"
@@ -2573,6 +2607,36 @@ def _source_cite_key(src: dict) -> str | None:
     return str(key) if key else None
 
 
+def _find_source(root: Path, db, source_path: str) -> dict:
+    """The source SOURCE_PATH names, as `crucible source` documents.
+
+    Exact path, then cite key, then a fragment that must match exactly
+    one source (as for delete): never the first of several by row order.
+    Raises a ClickException when none or several match.
+    """
+    src = _lookup_project_path(root, source_path, db.get_source_by_path)
+    if not src:
+        src = _source_by_cite_key(db, source_path)
+    if not src:
+        found = [s for s in db.list_sources()
+                 if source_path in s["path"] or source_path in (s["title"] or "")]
+        if len(found) > 1:
+            lines = [f"  {s['path']} ({s['title']})" for s in found]
+            raise click.ClickException(
+                f"'{source_path}' matches {len(found)} sources. Give the exact "
+                "path or cite key of one:\n" + "\n".join(lines))
+        src = found[0] if found else None
+    if not src:
+        raise click.ClickException(f"Source not found: {source_path}")
+    return src
+
+
+def _source_key(src: dict) -> str:
+    """The key articles cite src by. Ingest and the disk scan both store
+    one in its metadata; a row without one falls back to its file's stem."""
+    return _source_cite_key(src) or Path(src["path"]).stem
+
+
 @cli.command("source")
 @click.argument("source_path")
 @json_option
@@ -2589,28 +2653,11 @@ def source_info(source_path, json_output):
     """
     root = get_root()
     db = get_db(root)
-
-    # Exact path, then cite key, then a fragment that must match exactly
-    # one source (as for delete): never the first of several by row order.
     try:
-        src = _lookup_project_path(root, source_path, db.get_source_by_path)
-        if not src:
-            src = _source_by_cite_key(db, source_path)
-        if not src:
-            found = [s for s in db.list_sources()
-                     if source_path in s["path"] or source_path in (s["title"] or "")]
-            if len(found) > 1:
-                lines = [f"  {s['path']} ({s['title']})" for s in found]
-                raise click.ClickException(
-                    f"'{source_path}' matches {len(found)} sources. Give the exact "
-                    "path or cite key of one:\n" + "\n".join(lines))
-            src = found[0] if found else None
+        src = _find_source(root, db, source_path)
     except click.ClickException:
         db.close()
         raise
-    if not src:
-        db.close()
-        raise click.ClickException(f"Source not found: {source_path}")
 
     if json_output:
         articles = db.source_articles(src["id"])
@@ -2638,6 +2685,174 @@ def source_info(source_path, json_output):
         click.echo("\n  Not yet distilled.")
 
     db.close()
+
+
+def _run_distill(root: Path, sources: list[dict], agent: str, dry_run: bool,
+                 timeout: float | None) -> list[tuple[str, str]]:
+    """Run the agent on each source in turn; (key, outcome) for each.
+
+    The outcome is "ok", "dry-run", or a reason the source is still
+    undistilled. The database is synced after each run, whatever the
+    agent did, so the next run sees the articles this one wrote.
+    """
+    import subprocess
+
+    from crucible.distill import agent_argv, build_prompt
+    from crucible.ingest import _sidecar_path
+
+    skill = _skill_dest() / "SKILL.md"
+    if not skill.exists():
+        skill = _skill_source() / "SKILL.md"
+    ctx = click.get_current_context()
+    outcomes = []
+    for n, src in enumerate(sources, 1):
+        key = _source_key(src)
+        prompt = build_prompt(root, src, key, _sidecar_path(root / src["path"]), skill)
+        argv, stdin = agent_argv(agent, prompt)
+        click.echo(f"[{n}/{len(sources)}] {key}: {src['title']}")
+        if dry_run:
+            click.echo(f"  Would run the agent in {root} with this prompt"
+                       + (" on stdin:" if stdin is not None else ":"))
+            click.echo("\n".join("    " + line for line in prompt.splitlines()))
+            outcomes.append((key, "dry-run"))
+            continue
+        try:
+            proc = subprocess.run(argv, cwd=root, input=stdin, text=True,
+                                  timeout=timeout)
+            failure = None if proc.returncode == 0 else f"agent exited with {proc.returncode}"
+        except FileNotFoundError:
+            raise click.ClickException(
+                f"Agent command not found: {argv[0]}. Install it, or choose "
+                "another with --agent or $CRUCIBLE_AGENT.")
+        except subprocess.TimeoutExpired:
+            failure = f"agent timed out after {timeout:g} s"
+        except KeyboardInterrupt:
+            click.echo("\nInterrupted.", err=True)
+            failure = "interrupted"
+        click.echo()
+        try:
+            ctx.invoke(sync)
+        except click.ClickException as e:
+            failure = failure or f"sync failed: {e.format_message()}"
+        db = get_db(root)
+        try:
+            row = db.get_source_by_path(src["path"])
+            articles = db.source_articles(row["id"]) if row else []
+        finally:
+            db.close()
+        if not articles:
+            failure = failure or "no article cites it yet"
+        outcomes.append((key, failure or "ok"))
+        if failure:
+            click.echo(f"  Not distilled: {failure}", err=True)
+        else:
+            click.echo(f"  Distilled into {len(articles)} article(s).")
+        if failure == "interrupted":
+            break
+    return outcomes
+
+
+@cli.command()
+@click.argument("sources", nargs=-1)
+@click.option("--all", "all_undigested", is_flag=True,
+              help="Distill every source no article cites yet")
+@click.option("--agent", envvar="CRUCIBLE_AGENT", default="claude",
+              show_default=True, show_envvar=True,
+              help="claude, codex, gemini, or a command template "
+                   "(see Agents above)")
+@click.option("--dry-run", "-n", is_flag=True,
+              help="Show the sources and prompts without running the agent")
+@click.option("--yes", "-y", is_flag=True,
+              help="Don't ask before distilling several sources")
+@click.option("--timeout", type=click.FloatRange(min=1), default=None,
+              help="Give up on a source after this many seconds")
+def distill(sources, all_undigested, agent, dry_run, yes, timeout):
+    """Distill sources into wiki articles by running an LLM agent.
+
+    SOURCES are cite keys, paths or fragments, as for `crucible source`;
+    --all takes every source `crucible undigested` lists. For each, the
+    agent is run in the project root with a prompt to distill it
+    following the crucible skill: check what the wiki already covers,
+    write a summary and concept articles (STATUS draft), and run
+    `crucible sync` and `crucible lint`. Sources are distilled one at a
+    time, each seeing the articles the last one wrote.
+
+    The run is non-interactive, so the plan-and-approve step of an
+    interactive session is skipped. Review the draft articles afterwards
+    (`crucible source KEY` lists them, and git shows the changes).
+
+    \b
+    Agents:
+      claude   claude -p PROMPT --allowedTools 'Bash(crucible *)' Read
+               Write Edit Glob Grep (the default)
+      codex    codex exec --full-auto PROMPT
+      gemini   gemini --yolo -p PROMPT
+    Anything else is a command template: {prompt} is replaced by the
+    prompt as one argument, and without it the prompt goes to stdin.
+    No shell is involved.
+
+    \b
+    Examples:
+      crucible distill smith2024
+      crucible distill --all --agent codex
+      crucible distill smith2024 --agent 'llm-agent --task {prompt}'
+
+    Exits 1 if any source was not distilled.
+    """
+    from crucible.distill import describe_agent
+
+    if not sources and not all_undigested:
+        raise click.UsageError("Name the sources to distill, or pass --all.")
+    try:
+        shown_agent = describe_agent(agent)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="'--agent'")
+
+    root = get_root()
+    db = get_db(root)
+    try:
+        chosen: list[dict] = []
+        seen: set[int] = set()
+        if all_undigested:
+            pool = db.undigested()
+        else:
+            pool = [_find_source(root, db, s) for s in sources]
+        for src in pool:
+            if src["id"] not in seen:
+                seen.add(src["id"])
+                chosen.append(src)
+        cited = {src["id"]: bool(db.source_articles(src["id"])) for src in chosen}
+    finally:
+        db.close()
+
+    if not chosen:
+        click.echo("All sources have been distilled.")
+        return
+    for src in chosen:
+        if cited[src["id"]]:
+            click.echo(f"Note: {_source_key(src)} already has articles; "
+                       "the agent will update them.", err=True)
+
+    click.echo(f"Agent: {shown_agent}")
+    if len(chosen) > 1 and not (yes or dry_run):
+        for src in chosen:
+            click.echo(f"  {_source_key(src)}: {src['title']}")
+        if not click.confirm(f"Distill these {len(chosen)} sources?", default=True):
+            click.echo("Cancelled.")
+            return
+
+    outcomes = _run_distill(root, chosen, agent, dry_run, timeout)
+    if dry_run:
+        return
+    failed = [(k, why) for k, why in outcomes if why != "ok"]
+    done = len(outcomes) - len(failed)
+    click.echo(f"\nDistilled {done} of {len(chosen)} source(s).")
+    if failed:
+        for k, why in failed:
+            click.echo(f"  {k}: {why}", err=True)
+        raise SystemExit(1)
+    click.echo("The new articles are drafts: review them, then `crucible embed` "
+               "if you use semantic search.")
 
 
 @cli.command()
@@ -5626,6 +5841,11 @@ TYPICAL WORKFLOW
    .crucible/wiki/. Use the two-step process:
    a) Plan: identify concepts, propose articles, note cross-links
    b) Write: create/update org files in .crucible/wiki/ with proper metadata
+   Interactively, ask your agent to distill it. Unattended, run an agent
+   on it (plan approval is skipped; the articles are drafts):
+     crucible distill KEY                # claude -p by default
+     crucible distill --all --agent codex
+     crucible ingest paper.pdf --distill
 
 3. Sync the database:
      crucible sync
@@ -5776,6 +5996,7 @@ Structured queries:
   crucible source SOURCE_PATH          Everything known about one source
   crucible orphans                     Articles with no incoming links
   crucible undigested                  Sources not yet distilled
+  crucible distill KEY... | --all      Distill sources by running an agent
 
   Article and source paths may be relative to the project root (as
   shown), to the current directory, to .crucible/ (wiki/concepts/x.org),
