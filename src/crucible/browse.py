@@ -874,6 +874,7 @@ def _build_nav_html(articles: list[dict]) -> str:
         '<a href="/_topics">Topics</a>',
         '<a href="/_references">References</a>',
         '<a href="/_graph">Graph</a>',
+        '<a href="/_listen">Listen</a>',
         '<a href="/_about">About</a>',
         "</div>",
     ]
@@ -1110,6 +1111,7 @@ def _build_about_html(wiki_dir: Path, db_path: Path, articles: list[dict],
 
 
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "[::1]")
+_MAX_POST_BYTES = 64 * 1024
 
 
 def _host_allowed(host: str | None) -> bool:
@@ -1136,6 +1138,7 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
     bib: dict[str, dict[str, str]]
     project_name: str
     github_url: str
+    ollama_url: str | None = None  # for the embeddings /_api/related uses
     # mtimes of the database files and references.bib when articles, nav
     # and bib were last loaded; see _refresh.
     _state_stamp: tuple = ()
@@ -1199,6 +1202,55 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:  # always answer, never drop the connection
             self._send_error(500, f"Internal error: {type(e).__name__}: {e}")
 
+    def do_POST(self):  # noqa: N802
+        if not _host_allowed(self.headers.get("Host")):
+            self._send_json(403, {"error": "unexpected Host header"})
+            return
+        # A page on another site may post here (a form needs no CORS
+        # preflight) though it cannot read the answer; refuse it anyway.
+        origin = self.headers.get("Origin")
+        if origin and not _host_allowed(urllib.parse.urlparse(origin).netloc):
+            self._send_json(403, {"error": "cross-origin request"})
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/_api/related":
+            self._send_json(404, {"error": f"no such endpoint: {path}"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= _MAX_POST_BYTES:
+            self._send_json(413, {"error": "request body missing or too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+            text = body.get("text", "") if isinstance(body, dict) else ""
+            if not isinstance(text, str):
+                raise ValueError("text must be a string")
+        except ValueError as e:
+            self._send_json(400, {"error": f"bad request: {e}"})
+            return
+        try:
+            self._send_json(200, self._related(text))
+        except Exception as e:  # a locked database, say
+            self._send_json(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def _related(self, text: str) -> dict:
+        from crucible.listen import related_from_db
+        data = related_from_db(self.db_path, text, ollama_url=self.ollama_url)
+        root = self.wiki_dir.parent.parent
+        for r in data["results"]:
+            url_path = _url_path(r["path"])
+            r["url"] = "/" + urllib.parse.quote(url_path.lstrip("/"))
+            r["file"] = str(root / r["path"])
+        return data
+
+    def _send_json(self, code: int, data: dict):
+        self._send_response(code, "application/json; charset=utf-8",
+                            json.dumps(data).encode("utf-8"),
+                            {"Cache-Control": "no-store"})
+
     def _route(self):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
@@ -1253,6 +1305,9 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._send_response(200, "text/html; charset=utf-8",
                                 body.encode("utf-8"))
+        elif path == "/_listen":
+            from crucible.listen import LISTEN_HTML
+            self._serve_page("Listen", LISTEN_HTML)
         elif path == "/_static/style.css":
             self._send_response(200, "text/css", _BROWSE_CSS.encode("utf-8"))
         else:
@@ -1359,7 +1414,8 @@ class CrucibleHandler(http.server.BaseHTTPRequestHandler):
 def start_server(wiki_dir: Path, db_path: Path, articles: list[dict],
                  port: int = 8088,
                  project_name: str = "",
-                 github_url: str = "") -> http.server.HTTPServer:
+                 github_url: str = "",
+                 ollama_url: str | None = None) -> http.server.HTTPServer:
     """Create and return the HTTP server (does not start serving).
 
     articles is the initial article list; it, the sidebar and the
@@ -1371,6 +1427,7 @@ def start_server(wiki_dir: Path, db_path: Path, articles: list[dict],
     CrucibleHandler.db_path = db_path
     CrucibleHandler.project_name = project_name
     CrucibleHandler.github_url = github_url
+    CrucibleHandler.ollama_url = ollama_url
     CrucibleHandler.nav_html = _build_nav_html(articles)
     # Load references.bib now; later requests reload it, the articles and
     # the sidebar when the database or the bib file changes.

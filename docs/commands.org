@@ -931,6 +931,41 @@ and references reload when the database or =references.bib= changes, so
 articles synced while the server runs appear without a restart. The
 knowledge graph is generated first if =viz.html= does not exist.
 
+** =crucible listen=
+
+Listen to a meeting or conversation and show related articles as it goes.
+
+#+BEGIN_SRC bash
+crucible listen [-p PORT] [--no-open] [--interval SECONDS] [--window SECONDS] [--lang TAG]
+#+END_SRC
+
+| Option | Description |
+|---------------+------------------------------------|
+| =-p=, =--port= | Port number (default: 8088) |
+| =--no-open= | Don't open the browser automatically |
+| =--interval= | Seconds between updates (default: 5) |
+| =--window= | Seconds of recent speech searched on each update (default: 60) |
+| =--lang= | Speech language, such as =en-US= (default: the browser's) |
+| =--url= | Ollama embed API URL (or =$CRUCIBLE_OLLAMA_URL=) |
+
+Starts the same server as =crucible browse= and opens its Listen page
+(also reachable from the sidebar). Press /Start listening/ and the browser
+transcribes the microphone with the Web Speech API (Chrome, Edge or
+Safari; Firefox has none, but the page's text box can be typed into
+instead). Every =--interval= seconds the page sends the last =--window=
+seconds of transcript to the server, which reduces it to its most salient
+words, searches each, and, when the wiki has embeddings, fuses that with a
+semantic search over the whole window. Each article keeps a score that
+decays between updates, so one appears only after it has stayed relevant
+for a moment and fades as the talk moves on. Articles open in a new tab so
+listening continues. /Save session/ downloads an org file with the articles
+shown (linked by absolute path, with the words that matched) and the
+timestamped transcript.
+
+Chrome and Edge send the audio to their vendor's speech service; Safari
+can recognize speech on the device. Only the microphone is heard, so in a
+call taken on headphones the remote participants are not transcribed.
+
 * Meta Commands
 
 ** =crucible about=
